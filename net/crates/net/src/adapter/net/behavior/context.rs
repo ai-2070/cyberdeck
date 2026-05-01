@@ -17,19 +17,19 @@ use super::NodeId;
 
 /// Generate random bytes using getrandom.
 ///
-/// CR-21 / BUG #150: aborts on `getrandom` failure rather than
-/// panic-unwinding through the FFI boundary. Trace IDs are not
-/// directly auth-bearing, but this function is reachable from
-/// hot paths called by `extern "C"` FFI consumers (Python /
-/// Node / Go bindings) — a `getrandom` failure (kernel rng
-/// exhaustion, container-restricted /dev/urandom) would otherwise
-/// unwind across the C ABI = undefined behaviour. `process::abort`
-/// is `extern "C"`-safe (terminates rather than unwinds) and
+/// Aborts on `getrandom` failure rather than panic-unwinding
+/// through the FFI boundary. Trace IDs are not directly
+/// auth-bearing, but this function is reachable from hot paths
+/// called by `extern "C"` FFI consumers (Python / Node / Go
+/// bindings) — a `getrandom` failure (kernel rng exhaustion,
+/// container-restricted /dev/urandom) that unwound across the C
+/// ABI would be undefined behaviour. `process::abort` is
+/// `extern "C"`-safe (terminates rather than unwinds) and
 /// loss-of-availability is the only safe response when the
 /// system can't produce randomness.
 ///
-/// Cubic P2: the diagnostic uses a fallible `writeln!` rather
-/// than `eprintln!` because the latter panics if the underlying
+/// The diagnostic uses a fallible `writeln!` rather than
+/// `eprintln!` because the latter panics if the underlying
 /// stderr write fails (closed fd, sandboxed process). A panic
 /// here would defeat the whole point of the abort path —
 /// unwinding across the FFI boundary that we're trying to
@@ -821,13 +821,13 @@ pub struct ContextStore {
     sampled_count: AtomicU64,
     dropped_count: AtomicU64,
     expired_count: AtomicU64,
-    /// BUG #136: an authoritative atomic counter so the "is the
-    /// store full?" check can be a CAS-with-cap rather than a
+    /// Authoritative atomic counter so the "is the store full?"
+    /// check can be a CAS-with-cap rather than a
     /// `dashmap.len() >= max` racy probe. Bumped on insert via
     /// `try_reserve_slot` (CAS), decremented on eviction
-    /// (`cleanup_expired`, explicit removal). DashMap's own `len()`
-    /// is the source of truth for queries; this counter exists
-    /// only to gate admission atomically.
+    /// (`cleanup_expired`, explicit removal). DashMap's own
+    /// `len()` is the source of truth for queries; this counter
+    /// exists only to gate admission atomically.
     active_count: std::sync::atomic::AtomicUsize,
 }
 
@@ -849,20 +849,19 @@ impl ContextStore {
 
     /// Atomically reserve a slot if `active_count < max_traces`.
     ///
-    /// CR-14: returns an [`Option<SlotReservation<'_>>`]; the
-    /// `Some` arm carries an RAII guard whose `Drop` releases the
-    /// reservation automatically. The success-path caller MUST
-    /// invoke [`SlotReservation::commit`] to keep the slot once the
+    /// Returns an [`Option<SlotReservation<'_>>`]; the `Some` arm
+    /// carries an RAII guard whose `Drop` releases the reservation
+    /// automatically. The success-path caller MUST invoke
+    /// [`SlotReservation::commit`] to keep the slot once the
     /// matching insert lands. Any other exit (early return, error,
     /// panic between reserve and insert) drops the guard, which
-    /// undoes the reservation atomically. Pre-CR-14 the bookkeeping
-    /// was a `bool` return and a manual `release_slot` call on each
-    /// failure path — easy to miss, leaking a slot permanently
-    /// across an `active_count` underflow guard.
+    /// undoes the reservation atomically. A `bool` return with a
+    /// manual `release_slot` call on every failure path would be
+    /// easy to miss and would leak a slot permanently across an
+    /// `active_count` underflow guard.
     ///
-    /// This is the BUG #136 admission gate — pre-#136 the check
-    /// was `dashmap.len() >= max`, which lost the race against
-    /// concurrent inserters.
+    /// This is the admission gate. A `dashmap.len() >= max` probe
+    /// would lose the race against concurrent inserters.
     fn try_reserve_slot(&self) -> Option<SlotReservation<'_>> {
         use std::sync::atomic::Ordering;
         // Fetch-update CAS loop: only commit if `cur < max`.
@@ -899,7 +898,7 @@ impl ContextStore {
     }
 }
 
-/// CR-14: RAII guard returned by [`ContextStore::try_reserve_slot`].
+/// RAII guard returned by [`ContextStore::try_reserve_slot`].
 /// The Drop impl decrements `active_count` UNLESS [`Self::commit`]
 /// was called first (which `mem::forget`-equivalent the guard, so
 /// no decrement runs).
@@ -913,9 +912,8 @@ impl ContextStore {
 /// ```
 ///
 /// On any non-commit exit (panic, error, early return) the slot
-/// reservation is rolled back automatically — the BUG #136
-/// admission cap stays accurate even when the matching insert
-/// never lands.
+/// reservation is rolled back automatically — the admission cap
+/// stays accurate even when the matching insert never lands.
 pub(super) struct SlotReservation<'a> {
     store: &'a ContextStore,
 }
@@ -950,17 +948,17 @@ impl ContextStore {
 
     /// Create a new context and register it
     ///
-    /// BUG #136: capacity admission goes through the atomic
-    /// `try_reserve_slot` CAS instead of the racy
-    /// `contexts.len() >= max` probe. Pre-fix two threads inserting
-    /// at exactly capacity could both observe `len < max` after a
+    /// Capacity admission goes through the atomic
+    /// `try_reserve_slot` CAS rather than a `contexts.len() >= max`
+    /// probe. Two threads inserting at exactly capacity could
+    /// otherwise both observe `len < max` after a
     /// `cleanup_expired` and both insert, growing the map past
-    /// `max_traces`. Now the slot is reserved atomically before
-    /// the insert; if the reserve fails after a `cleanup_expired`
+    /// `max_traces`. The slot is reserved atomically before the
+    /// insert; if the reserve fails after a `cleanup_expired`
     /// retry, we surface `CapacityExceeded`.
     pub fn create_context(&self, origin_node: NodeId) -> Result<Context, ContextError> {
-        // CR-14: hold the reservation as a RAII guard. Any path
-        // out before `guard.commit()` (early return, panic in
+        // Hold the reservation as a RAII guard. Any path out
+        // before `guard.commit()` (early return, panic in
         // `Context::new` / `should_sample`, future refactor that
         // adds another fallible step) drops the guard and the
         // slot is released automatically.
@@ -1024,8 +1022,8 @@ impl ContextStore {
             return Ok(ctx);
         }
 
-        // CR-14 / BUG #136: RAII reserve. Drop releases on any
-        // non-commit exit (sampling-skip, panic, error).
+        // RAII reserve. Drop releases on any non-commit exit
+        // (sampling-skip, panic, error).
         let guard = match self.try_reserve_slot() {
             Some(g) => g,
             None => {
@@ -1107,7 +1105,7 @@ impl ContextStore {
 
     /// Complete a trace and return all spans
     ///
-    /// BUG #136: also releases the `active_count` slot so the
+    /// Also releases the `active_count` slot so the
     /// `try_reserve_slot` admission gate can re-admit.
     pub fn complete_trace(&self, trace_id: &TraceId) -> Option<(Context, Vec<Span>)> {
         let removed = self
@@ -1122,9 +1120,9 @@ impl ContextStore {
 
     /// Cleanup expired traces
     ///
-    /// BUG #136: every successful removal also releases an
-    /// `active_count` slot so the `try_reserve_slot` admission gate
-    /// can re-admit work as soon as expired entries are reclaimed.
+    /// Every successful removal also releases an `active_count`
+    /// slot so the `try_reserve_slot` admission gate can re-admit
+    /// work as soon as expired entries are reclaimed.
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
         let mut expired = Vec::new();

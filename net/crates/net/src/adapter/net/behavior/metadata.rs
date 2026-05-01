@@ -383,33 +383,31 @@ impl NodeStatus {
 /// `NodeMetadata` (`name`, `description`, `owner`, individual tag /
 /// role / `custom` keys and values). 1 KiB is far past any
 /// realistic operator-supplied label and bounds the per-string
-/// memory cost (BUG #124).
+/// memory cost.
 pub const MAX_METADATA_STRING_LEN: usize = 1024;
 
 /// Maximum number of tags or roles in `NodeMetadata`. 256 is far
 /// past real usage (typical deployments use a handful of
-/// scope/tier/region tags); pre-fix a peer could ship millions and
-/// turn one announcement into millions of `by_tag` index entries
-/// (BUG #124).
+/// scope/tier/region tags); without this cap a peer could ship
+/// millions and turn one announcement into millions of `by_tag`
+/// index entries.
 pub const MAX_METADATA_TAGS: usize = 256;
 
 /// Maximum number of entries in the `custom` key-value map. Same
-/// pattern as tags — bounds the per-announcement footprint (BUG
-/// #124).
+/// pattern as tags — bounds the per-announcement footprint.
 pub const MAX_METADATA_CUSTOM_ENTRIES: usize = 256;
 
 /// Maximum number of `preferred_peers` in `TopologyHints`. Each
 /// entry is a 32-byte `NodeId`; a 4096-cap bounds the wire/heap
 /// cost while staying well above any realistic peering preference
-/// list (BUG #124).
+/// list.
 pub const MAX_PREFERRED_PEERS: usize = 4096;
 
-/// Maximum number of `hop_distances` entries in `TopologyHints`
-/// (BUG #124).
+/// Maximum number of `hop_distances` entries in `TopologyHints`.
 pub const MAX_HOP_DISTANCES: usize = 4096;
 
 /// Maximum number of `public_addresses` (multi-homed nodes
-/// typically advertise <16; 256 is generous) (BUG #124).
+/// typically advertise <16; 256 is generous).
 pub const MAX_PUBLIC_ADDRESSES: usize = 256;
 
 /// Complete node metadata
@@ -448,11 +446,11 @@ impl NodeMetadata {
     /// boundedness caps (string lengths, tag/role/custom counts,
     /// preferred-peers / hop-distances / public-addresses sizes).
     ///
-    /// BUG #124: pre-fix the deserialize path was unbounded —
-    /// every `Vec` / `HashMap` / `String` accepted whatever the
-    /// peer shipped, and `MetadataStore::upsert` happily indexed
-    /// millions of attacker-supplied tags into the per-tag
-    /// inverted-index DashMap. Now `upsert` (and
+    /// Without these caps the deserialize path is unbounded —
+    /// every `Vec` / `HashMap` / `String` would accept whatever
+    /// the peer shipped, and `MetadataStore::upsert` would
+    /// happily index millions of attacker-supplied tags into the
+    /// per-tag inverted-index DashMap. `upsert` (and
     /// `update_versioned`) call `validate_bounds` before touching
     /// the indexes; oversized metadata surfaces as
     /// `MetadataError::Invalid(...)`.
@@ -541,8 +539,8 @@ impl NodeMetadata {
                 MAX_HOP_DISTANCES
             )));
         }
-        // Cubic-ai P2: hop_distances keys are unbounded `String`s.
-        // Without a per-key length check a peer could ship a single
+        // hop_distances keys are unbounded `String`s. Without a
+        // per-key length check a peer could ship a single
         // multi-megabyte key inside a perfectly-counted map and
         // smuggle the bound past validate_bounds.
         for k in self.topology.hop_distances.keys() {
@@ -559,11 +557,11 @@ impl NodeMetadata {
                 MAX_PUBLIC_ADDRESSES
             )));
         }
-        // Cubic-ai P2: nested LocationInfo strings (`zone`, `provider`,
-        // `datacenter`, `country_code`, `city`) were never length-
-        // checked. validate_bounds capped the top-level fields and
-        // collection counts, but a peer could pin oversized strings
-        // inside `location` and slip past every existing guard.
+        // Nested LocationInfo strings (`zone`, `provider`,
+        // `datacenter`, `country_code`, `city`) MUST be length-
+        // checked. The top-level fields and collection counts
+        // alone wouldn't catch oversized strings pinned inside
+        // `location`.
         if let Some(loc) = &self.location {
             for (label, field) in [
                 ("location.zone", &loc.zone),
@@ -998,28 +996,28 @@ impl MetadataStore {
 
     /// Insert or update node metadata
     ///
-    /// BUG #123: pre-fix this was a 5-step sequence with no
-    /// overarching lock — (1) capacity check, (2) `nodes.get(&id)`,
-    /// (3) `remove_from_indexes(&old)`, (4) `add_to_indexes(&new)`,
-    /// (5) `nodes.insert`. Two threads upserting the same node
-    /// concurrently could both observe the same `old` at step 2,
-    /// both remove its index entries at step 3 (second a no-op),
-    /// and both add to indexes at step 4 — into DIFFERENT buckets
-    /// if the metadata differed. Whichever `nodes.insert` landed
-    /// second won, but the loser's index entries were never
-    /// removed, producing permanent index drift (queries return
-    /// the node under the wrong filter; stats over-count). Now
-    /// the entire (read-old, remove-from-indexes, add-to-indexes,
-    /// insert) sequence runs inside `DashMap::entry`'s shard
-    /// write lock, serializing all concurrent upserts on the same
-    /// node_id.
+    /// The entire (read-old, remove-from-indexes,
+    /// add-to-indexes, insert) sequence runs inside
+    /// `DashMap::entry`'s shard write lock, serializing all
+    /// concurrent upserts on the same node_id. Splitting this into
+    /// a 5-step sequence without an overarching lock — (1) capacity
+    /// check, (2) `nodes.get(&id)`, (3) `remove_from_indexes(&old)`,
+    /// (4) `add_to_indexes(&new)`, (5) `nodes.insert` — would let
+    /// two concurrent upserts on the same node both observe the
+    /// same `old` at step 2, both remove its index entries at step
+    /// 3 (second a no-op), and both add to indexes at step 4 into
+    /// DIFFERENT buckets if the metadata differed. Whichever
+    /// `nodes.insert` landed second would win, but the loser's
+    /// index entries would never be removed, producing permanent
+    /// index drift (queries return the node under the wrong
+    /// filter; stats over-count).
     pub fn upsert(&self, metadata: NodeMetadata) -> Result<(), MetadataError> {
-        // BUG #124: bound peer-supplied metadata before touching
-        // the indexes — without this, one peer could ship a single
-        // announcement carrying millions of unique tags and turn it
-        // into millions of `by_tag` DashMap entries. Validation
-        // runs first so we don't even pay the index-clear cost on a
-        // bad input.
+        // Bound peer-supplied metadata before touching the
+        // indexes — without this, one peer could ship a single
+        // announcement carrying millions of unique tags and turn
+        // it into millions of `by_tag` DashMap entries. Validation
+        // runs first so we don't even pay the index-clear cost on
+        // a bad input.
         metadata.validate_bounds()?;
 
         let node_id = metadata.node_id;
@@ -1031,23 +1029,22 @@ impl MetadataStore {
         // between this check and the entry-acquire below) is
         // acceptable: the cap is best-effort, mirroring the
         // pattern used by `TokenCache::insert_unchecked` and
-        // `ContextStore::create_context` after BUG #136.
+        // `ContextStore::create_context`.
         if let Some(max) = self.max_capacity {
             if !self.nodes.contains_key(&node_id) && self.nodes.len() >= max {
                 return Err(MetadataError::CapacityExceeded);
             }
         }
 
-        // BUG #123: take the per-shard write lock on the node_id
-        // entry FIRST. Holding it serializes all concurrent
-        // upserts on this id, so the (remove_from_indexes,
-        // add_to_indexes, insert) sequence is observed by other
-        // upserts as a single atomic transition. Pre-fix the read-
-        // old at step 2 happened OUTSIDE any lock, so two threads
-        // could both observe the same `old`, both
+        // Take the per-shard write lock on the node_id entry
+        // FIRST. Holding it serializes all concurrent upserts on
+        // this id, so the (remove_from_indexes, add_to_indexes,
+        // insert) sequence is observed by other upserts as a
+        // single atomic transition. A read-old outside any lock
+        // would let two threads both observe the same `old`, both
         // `remove_from_indexes(&old)`, both `add_to_indexes` into
-        // different buckets, and the loser's entries leaked into
-        // permanent index drift.
+        // different buckets, and the loser's entries would leak
+        // into permanent index drift.
         //
         // `add_to_indexes` / `remove_from_indexes` write to
         // OTHER DashMap instances (`by_status`, `by_tag`, etc.).
@@ -1192,15 +1189,14 @@ impl MetadataStore {
             })
             .collect();
 
-        // BUG #145: pre-fix used `partial_cmp(...).unwrap_or(Equal)`,
-        // which on NaN produces a non-total order — `sort_by`
-        // permutes arbitrarily and `truncate(limit)` then drops
-        // random items. `LocationInfo::distance_to` computes
-        // `(...).asin()` for near-antipodal points where FP
-        // rounding can push the asin argument > 1.0 → NaN.
-        // `total_cmp` on a NaN-sentinel score (or `f64::INFINITY`
-        // here so NaN distances sink to the end) gives a
-        // deterministic total order.
+        // `partial_cmp(...).unwrap_or(Equal)` on NaN produces a
+        // non-total order — `sort_by` would permute arbitrarily
+        // and `truncate(limit)` would then drop random items.
+        // `LocationInfo::distance_to` computes `(...).asin()` for
+        // near-antipodal points where FP rounding can push the
+        // asin argument > 1.0 → NaN. `total_cmp` on a
+        // NaN-sentinel score (`f64::INFINITY` so NaN distances
+        // sink to the end) gives a deterministic total order.
         results.sort_by(|a, b| {
             let a_dist = if a.1.is_nan() { f64::INFINITY } else { a.1 };
             let b_dist = if b.1.is_nan() { f64::INFINITY } else { b.1 };
@@ -1226,9 +1222,9 @@ impl MetadataStore {
             })
             .collect();
 
-        // BUG #145: same hazard as `find_nearby` above. Sort
-        // descending with `total_cmp`; NaN scores sink to the
-        // end (treated as `f64::NEG_INFINITY` for descending).
+        // Same hazard as `find_nearby` above. Sort descending
+        // with `total_cmp`; NaN scores sink to the end (treated
+        // as `f64::NEG_INFINITY` for descending).
         results.sort_by(|a, b| {
             let a_score = if a.1.is_nan() { f64::NEG_INFINITY } else { a.1 };
             let b_score = if b.1.is_nan() { f64::NEG_INFINITY } else { b.1 };
@@ -1283,28 +1279,28 @@ impl MetadataStore {
 
     /// Clear all nodes
     ///
-    /// BUG #139: pre-fix this called `nodes.clear()` first, then
-    /// six index `clear()`s in sequence. A concurrent `upsert`
-    /// landing between any two of those clears could observe
-    /// `nodes.get(&id) → None` (skipping `remove_from_indexes`),
-    /// then `add_to_indexes` (writing into the SAME index maps
-    /// `clear` was about to wipe), then `nodes.insert(...)` — the
-    /// final state was a node in `nodes` with NO index entries,
-    /// invisible to every indexed query and only retrievable via
-    /// the full-scan branch.
-    ///
-    /// Now we drain `nodes` FIRST and route every drained metadata
+    /// Drains `nodes` FIRST and routes every drained metadata
     /// through `remove_from_indexes` — making the intermediate
     /// state consistent (nodes exist alongside their indexes
-    /// throughout the drain). Any concurrent `upsert` landing
-    /// during the drain either races BEFORE this function reads
-    /// its key (the upsert wins; we drain its entry afterward) or
-    /// AFTER (the upsert observes a cleared `nodes` and proceeds
-    /// normally — no index drift, since `remove_from_indexes`
-    /// only touches keys that exist in `nodes`). The final
-    /// `clear`s on the index maps catch any residual entries
-    /// the per-key path missed (defense-in-depth; should be
-    /// no-ops on the happy path).
+    /// throughout the drain). A naive `nodes.clear()` followed by
+    /// six index `clear()`s in sequence would let a concurrent
+    /// `upsert` landing between any two of those clears observe
+    /// `nodes.get(&id) → None` (skipping `remove_from_indexes`),
+    /// then `add_to_indexes` (writing into the SAME index maps
+    /// `clear` is about to wipe), then `nodes.insert(...)` — the
+    /// final state would be a node in `nodes` with NO index
+    /// entries, invisible to every indexed query and only
+    /// retrievable via the full-scan branch.
+    ///
+    /// With the drain-first ordering, any concurrent `upsert`
+    /// landing during the drain either races BEFORE this function
+    /// reads its key (the upsert wins; we drain its entry
+    /// afterward) or AFTER (the upsert observes a cleared `nodes`
+    /// and proceeds normally — no index drift, since
+    /// `remove_from_indexes` only touches keys that exist in
+    /// `nodes`). The final `clear`s on the index maps catch any
+    /// residual entries the per-key path missed
+    /// (defense-in-depth; should be no-ops on the happy path).
     pub fn clear(&self) {
         // `dashmap::DashMap` doesn't have a `drain()` that takes
         // ownership of every entry; use a remove-on-iter pattern.

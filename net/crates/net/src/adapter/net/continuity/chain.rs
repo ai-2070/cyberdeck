@@ -73,25 +73,22 @@ pub const CONTINUITY_PROOF_SIZE: usize = 36; // 4 + 8 + 8 + 8 + 8
 /// cap, a peer could ship a proof spanning `[0, u64::MAX]` and force
 /// the verifier into a multi-billion-event walk on every dispatch.
 ///
-/// CR-13: tightened from 1M to 100K. At ~100ns per event for the
-/// xxh3-over-(link + payload) hash recomputation, 100K events ≈
-/// 10ms of synchronous CPU per call — bounded enough that a peer
-/// who fires verify-requests at line rate cannot exhaust the
-/// verifier's CPU budget before backpressure kicks in. 1M was an
-/// unintentional 100ms-CPU-per-call attack surface; the new value
-/// is still well past any realistic single-proof span (snapshots
-/// prune the chain to a small replay tail, and long-lived chains
-/// use snapshot-anchored proofs that span far less than 100K events).
+/// At ~100 ns per event for the xxh3-over-(link + payload) hash
+/// recomputation, 100K events ≈ 10 ms of synchronous CPU per
+/// call — bounded enough that a peer who fires verify-requests at
+/// line rate cannot exhaust the verifier's CPU budget before
+/// backpressure kicks in. The cap is well past any realistic
+/// single-proof span: snapshots prune the chain to a small replay
+/// tail, and long-lived chains use snapshot-anchored proofs that
+/// span far less than 100K events.
 ///
-/// **Caller contract (CR-13):** `verify_against` is itself bounded
-/// at this cap, but a peer can still trigger up to ~10ms of CPU
-/// per call. Production callers MUST rate-limit verify-requests
-/// per remote peer (e.g. token-bucket on inbound continuity-proof
+/// **Caller contract:** `verify_against` is itself bounded at
+/// this cap, but a peer can still trigger up to ~10 ms of CPU per
+/// call. Production callers MUST rate-limit verify-requests per
+/// remote peer (e.g. token-bucket on inbound continuity-proof
 /// frames) to prevent N peers × line-rate from saturating the
 /// verifier. The structural cap below bounds per-call cost; the
 /// per-peer rate limit bounds aggregate cost.
-///
-/// (BUG #98 + CR-13)
 pub const MAX_PROOF_VERIFY_SPAN: u64 = 100_000;
 
 impl ContinuityProof {
@@ -131,18 +128,17 @@ impl ContinuityProof {
     /// hashes (`from_hash` / `to_hash`) are also verified against
     /// the local log.
     ///
-    /// BUG #98: pre-fix this only checked the two endpoint events
-    /// and never iterated the events between them — a malicious
-    /// intermediary holding events 0 and 999 could ship a proof
-    /// spanning `[0, 999]` with the correct two endpoint hashes
-    /// and `verify_against` accepted it, even though events 1..998
-    /// could be missing or fabricated. That defeated the whole
-    /// point of the proof. There was also no `from_seq <= to_seq`
-    /// check (reversed bounds were accepted) and no upper bound on
-    /// the walk — a peer could force a multi-billion-event scan.
-    /// Now: reject reversed bounds, cap the span at
-    /// [`MAX_PROOF_VERIFY_SPAN`], walk every event in range, and
-    /// validate each consecutive `parent_hash` link.
+    /// Rejects reversed bounds, caps the span at
+    /// [`MAX_PROOF_VERIFY_SPAN`], walks every event in range, and
+    /// validates each consecutive `parent_hash` link. Checking
+    /// only the two endpoint events would let a malicious
+    /// intermediary holding events 0 and 999 ship a proof spanning
+    /// `[0, 999]` with the correct two endpoint hashes that
+    /// `verify_against` would accept — even though events 1..998
+    /// could be missing or fabricated, defeating the whole point
+    /// of the proof. The span cap also prevents a peer from
+    /// forcing a multi-billion-event scan via reversed or wide
+    /// bounds.
     pub fn verify_against(&self, log: &EntityLog) -> Result<(), ProofError> {
         if self.origin_hash != log.origin_hash() {
             return Err(ProofError::OriginMismatch);
@@ -153,9 +149,9 @@ impl ContinuityProof {
                 to_seq: self.to_seq,
             });
         }
-        // BUG #98: bound the walk. `to_seq - from_seq` is the
-        // *count - 1*; reject any span that would exceed
-        // MAX_PROOF_VERIFY_SPAN events (well past realistic).
+        // Bound the walk. `to_seq - from_seq` is the *count - 1*;
+        // reject any span that would exceed MAX_PROOF_VERIFY_SPAN
+        // events (well past realistic).
         let span = self.to_seq.saturating_sub(self.from_seq);
         if span >= MAX_PROOF_VERIFY_SPAN {
             return Err(ProofError::SpanTooLarge {
@@ -260,7 +256,7 @@ impl ContinuityProof {
 /// Walks the log and validates every consecutive pair. Returns the
 /// first problem found, or `Continuous` if the chain is intact.
 ///
-/// # Genesis / snapshot anchoring (BUG #114, cubic-ai P1)
+/// # Genesis / snapshot anchoring
 ///
 /// Pair-wise linkage alone is not enough: after `prune_through(N)`,
 /// a log only contains events with `seq > N`, and a corrupt restore
@@ -307,8 +303,8 @@ pub fn assess_continuity(log: &EntityLog, snapshot: Option<&StateSnapshot>) -> C
         };
     }
 
-    // BUG #114: anchor check. A pair-wise-consistent chain is not
-    // continuous if it doesn't start at genesis (seq 1, post-genesis
+    // Anchor check. A pair-wise-consistent chain is not continuous
+    // if it doesn't start at genesis (seq 1, post-genesis
     // successor) or at a verified snapshot boundary.
     let first = &events[0];
     let first_seq = first.link.sequence;
@@ -322,20 +318,16 @@ pub fn assess_continuity(log: &EntityLog, snapshot: Option<&StateSnapshot>) -> C
             &[],
         ))
     } else if let Some(s) = snapshot {
-        // Cubic-ai P2: `checked_add` so a snapshot at `u64::MAX`
-        // (impossible in practice — would require 2^64 events
-        // under one origin — but cheap to be safe) doesn't
-        // saturate to `u64::MAX` and falsely anchor an event
-        // claiming `first_seq == u64::MAX`. `None` from
-        // `checked_add` propagates as "not anchored," surfacing
-        // as `Unverifiable` below.
+        // `checked_add` so a snapshot at `u64::MAX` (impossible in
+        // practice — would require 2^64 events under one origin —
+        // but cheap to be safe) doesn't saturate to `u64::MAX` and
+        // falsely anchor an event claiming `first_seq == u64::MAX`.
+        // `None` from `checked_add` propagates as "not anchored,"
+        // surfacing as `Unverifiable` below.
         if s.through_seq.checked_add(1) == Some(first_seq) {
-            // CR-34: a snapshot with `head_payload` empty for a
-            // non-genesis (`chain_link.sequence > 0`) snapshot has
-            // CR-34 + Cubic P2: distinguish "missing payload
-            // context" from "real chain divergence."
-            // `head_payload` is `Option<Bytes>` post-Cubic-P2 so
-            // `None` is the unambiguous "caller didn't populate"
+            // Distinguish "missing payload context" from "real
+            // chain divergence." `head_payload` is `Option<Bytes>`
+            // so `None` is the unambiguous "caller didn't populate"
             // sentinel — a `Some(Bytes::new())` for a legitimate
             // empty-payload event is a different case and goes
             // through the normal hash path.
@@ -366,9 +358,9 @@ pub fn assess_continuity(log: &EntityLog, snapshot: Option<&StateSnapshot>) -> C
             gap_start: 0,
         };
     };
-    // Cubic-ai P1: even at the right sequence slot, a forged first
-    // event with a non-matching `parent_hash` is divergence at the
-    // anchor — not a continuous chain.
+    // Even at the right sequence slot, a forged first event with
+    // a non-matching `parent_hash` is divergence at the anchor —
+    // not a continuous chain.
     if first.link.parent_hash != expected_anchor_hash {
         return ContinuityStatus::Forked {
             fork_point: first_seq,
@@ -429,14 +421,14 @@ pub enum ProofError {
     },
     /// Event at the given sequence is missing from the local log.
     MissingEvent(u64),
-    /// Proof has `from_seq > to_seq` — reversed bounds (BUG #98).
+    /// Proof has `from_seq > to_seq` — reversed bounds.
     InvalidRange {
         /// Lower bound declared by the proof.
         from_seq: u64,
         /// Upper bound declared by the proof.
         to_seq: u64,
     },
-    /// Proof span exceeds [`MAX_PROOF_VERIFY_SPAN`] (BUG #98) —
+    /// Proof span exceeds [`MAX_PROOF_VERIFY_SPAN`] —
     /// `to_seq - from_seq` is too large to walk safely.
     SpanTooLarge {
         /// Lower bound declared by the proof.

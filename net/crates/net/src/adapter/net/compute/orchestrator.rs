@@ -877,11 +877,10 @@ pub struct MigrationOrchestrator {
     /// registration, `is_migrating(origin)` returns false and
     /// `DaemonRegistry::deliver` keeps mutating the source daemon's
     /// state past the snapshot's `seq_through`, so events arriving
-    /// between snapshot capture and cutover are silently lost
-    /// (BUG #104). Tests that don't exercise the local-source path
-    /// can leave this as `None` (the fallback is the pre-fix
-    /// direct-snapshot behavior, with a `tracing::warn!` flagging
-    /// the gap).
+    /// between snapshot capture and cutover would be silently lost.
+    /// Tests that don't exercise the local-source path can leave
+    /// this as `None`; the fallback is direct-snapshot behavior
+    /// with a `tracing::warn!` flagging the gap.
     source_handler: Option<Arc<MigrationSourceHandler>>,
 }
 
@@ -891,7 +890,7 @@ impl MigrationOrchestrator {
     /// The source-side handler defaults to `None`. Production
     /// callers should chain [`Self::with_source_handler`] to wire
     /// the orchestrator to the dispatcher's source handler — see
-    /// the field doc for why that matters (BUG #104).
+    /// the field doc for why that matters.
     pub fn new(daemon_registry: Arc<DaemonRegistry>, local_node_id: u64) -> Self {
         Self {
             migrations: DashMap::new(),
@@ -902,7 +901,7 @@ impl MigrationOrchestrator {
     }
 
     /// Builder: install the source-side migration handler. Required
-    /// for correct local-source migration behavior (BUG #104).
+    /// for correct local-source migration behavior.
     /// `MigrationDispatcher::new` already calls this; tests that
     /// exercise the local-source code path must call it explicitly.
     pub fn with_source_handler(mut self, source_handler: Arc<MigrationSourceHandler>) -> Self {
@@ -941,15 +940,16 @@ impl MigrationOrchestrator {
 
         // If we are the source, take snapshot locally.
         if source_node == self.local_node_id {
-            // BUG #104: the snapshot MUST be routed through the
-            // source-side handler so it gets registered for the
-            // migration; otherwise `source_handler.is_migrating(origin)`
+            // The snapshot MUST be routed through the source-side
+            // handler so it gets registered for the migration;
+            // otherwise `source_handler.is_migrating(origin)`
             // returns false and `DaemonRegistry::deliver` keeps
             // routing post-snapshot events into the live source
             // daemon's state, losing them at cutover. The remote-
-            // source path goes through `source_handler.start_snapshot`
-            // via the dispatcher (`migration_handler.rs:310-312`); we
-            // mirror that here.
+            // source path goes through
+            // `source_handler.start_snapshot` via the dispatcher
+            // (`migration_handler.rs:310-312`); we mirror that
+            // here.
             //
             // `orchestrator_node` is `local_node_id` here — for a
             // self-initiated local migration the orchestrator IS this
@@ -960,26 +960,26 @@ impl MigrationOrchestrator {
                     handler.start_snapshot(daemon_origin, target_node, self.local_node_id)?
                 }
                 None => {
-                    // CR-32: surface the unwired-source-handler
-                    // path loudly. Production wiring
+                    // Surface the unwired-source-handler path
+                    // loudly. Production wiring
                     // (`MigrationDispatcher::new`) always sets the
                     // handler, so this branch is only reached by
                     // tests / direct orchestrator construction.
-                    // The earlier attempt to gate this with
-                    // `cfg(not(test))` and Err in production broke
-                    // integration tests because they link against
-                    // the library compiled WITHOUT `cfg(test)`.
-                    // Warn-loud is the actionable signal:
-                    // operators running under tracing see the
-                    // missing-handler condition without the cfg
-                    // mismatch silently breaking integration
-                    // tests that intentionally exercise the
-                    // orchestrator without a dispatcher.
+                    // Gating this with `cfg(not(test))` and Err in
+                    // production would break integration tests
+                    // that link against the library compiled
+                    // WITHOUT `cfg(test)`. Warn-loud is the
+                    // actionable signal: operators running under
+                    // tracing see the missing-handler condition
+                    // without the cfg mismatch silently breaking
+                    // integration tests that intentionally
+                    // exercise the orchestrator without a
+                    // dispatcher.
                     tracing::warn!(
                         daemon_origin = format_args!("{:#x}", daemon_origin),
                         "MigrationOrchestrator::start_migration on local source without \
                          a source_handler installed — events arriving between snapshot \
-                         capture and cutover may be silently lost (BUG #104 / CR-32). \
+                         capture and cutover may be silently lost. \
                          Production callers wire the handler via \
                          `MigrationDispatcher::new`. Direct orchestrator construction \
                          should call `MigrationOrchestrator::with_source_handler`."
@@ -995,7 +995,7 @@ impl MigrationOrchestrator {
                 }
             };
 
-            // BUG #128: surface oversized-snapshot errors as a
+            // Surface oversized-snapshot errors as a
             // MigrationError instead of a panic that would crash the
             // dispatch task without releasing locks.
             let snapshot_bytes = snapshot
@@ -1242,20 +1242,18 @@ impl MigrationOrchestrator {
         if record.state.phase() == MigrationPhase::Cutover {
             record.state.cutover_complete()?;
         }
-        // BUG #112: also resolve `SuperpositionState`, mirroring
-        // `on_cutover_acknowledged`. Pre-fix only the local
-        // (source-collocated-orchestrator) path called
-        // `superposition.advance(Complete) + resolve()`; on a
-        // remote orchestrator `on_cutover_acknowledged` is a no-op
-        // (operates on the source's local orchestrator, which has
-        // no record for this daemon), so the remote path was the
-        // ONLY authoritative one and it left `SuperpositionState`
-        // stuck mid-collapse. Operator dashboards / readiness
-        // probes / SDK handles keyed on superposition state never
-        // observed resolution until `on_activate_ack` removed the
-        // record entirely. The advance/resolve is idempotent —
-        // safe to run on the local-orchestrator path too if both
-        // signals arrive on the same node.
+        // Also resolve `SuperpositionState` here, mirroring
+        // `on_cutover_acknowledged`. On a remote orchestrator
+        // `on_cutover_acknowledged` is a no-op (operates on the
+        // source's local orchestrator, which has no record for
+        // this daemon), so this path is the ONLY authoritative
+        // one. Without the resolve, `SuperpositionState` would be
+        // stuck mid-collapse and operator dashboards / readiness
+        // probes / SDK handles keyed on superposition state
+        // wouldn't observe resolution until `on_activate_ack`
+        // removed the record entirely. The advance/resolve is
+        // idempotent — safe to run on the local-orchestrator path
+        // too if both signals arrive on the same node.
         record.superposition.advance(MigrationPhase::Complete);
         record.superposition.resolve();
         Ok(MigrationMessage::ActivateTarget { daemon_origin })

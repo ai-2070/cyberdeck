@@ -41,12 +41,11 @@ pub const SNAPSHOT_VERSION: u8 = 1;
 
 /// Errors from snapshot serialization.
 ///
-/// BUG #128: previously `StateSnapshot::to_bytes` panicked via
-/// `expect("...exceeds 4 GiB")` whenever `state.len()` or
-/// `bindings_bytes.len()` overflowed the `u32` length-prefix field.
-/// `to_bytes` is on the migration / snapshot-send path, so a panic
-/// crashes the dispatch task without releasing locks. The
-/// fallible counterpart is now [`StateSnapshot::try_to_bytes`].
+/// `to_bytes` is on the migration / snapshot-send path, so a
+/// panic on `u32` length-prefix overflow (`state.len()` or
+/// `bindings_bytes.len()` exceeding 4 GiB) would crash the
+/// dispatch task without releasing locks. The fallible
+/// counterpart is [`StateSnapshot::try_to_bytes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotError {
     /// The snapshot's `state` or `bindings_bytes` exceeds the
@@ -125,16 +124,15 @@ pub struct StateSnapshot {
     /// event through the migration message itself, paired with the
     /// snapshot bytes.
     ///
-    /// Cubic P2: changed from `Bytes` to `Option<Bytes>` so the
-    /// "no head_payload context attached" case is structurally
-    /// distinct from "head event genuinely had an empty payload."
-    /// Pre-Cubic-P2 the empty-Bytes sentinel conflated both:
-    /// `assess_continuity` rejected legitimate non-genesis
-    /// snapshots whose head event happened to carry an empty
-    /// payload as if they were missing-context. With the Option,
-    /// `Some(Bytes::new())` is "head event payload is empty"
-    /// (legitimate) and `None` is "caller hasn't populated this
-    /// field" (verification can't proceed).
+    /// `Option<Bytes>` so the "no head_payload context attached"
+    /// case is structurally distinct from "head event genuinely
+    /// had an empty payload." An empty-Bytes sentinel would
+    /// conflate both: `assess_continuity` would reject legitimate
+    /// non-genesis snapshots whose head event happens to carry an
+    /// empty payload as if they were missing-context. With the
+    /// Option, `Some(Bytes::new())` is "head event payload is
+    /// empty" (legitimate) and `None` is "caller hasn't populated
+    /// this field" (verification can't proceed).
     ///
     /// Default for snapshots deserialized from wire bytes is
     /// `None`; callers populate it from the head event via
@@ -216,7 +214,7 @@ impl StateSnapshot {
         match &self.identity_envelope {
             None => Ok(None),
             Some(env) => {
-                // BUG #127: pass the snapshot's `entity_id` as
+                // Pass the snapshot's `entity_id` as
                 // `expected_signer_pub` so a substituted envelope
                 // (built by an attacker with the correct
                 // `target_static_pub` but a different signer
@@ -253,7 +251,7 @@ impl StateSnapshot {
     /// version:           1 byte  (SNAPSHOT_VERSION)
     /// entity_id:        32 bytes
     /// through_seq:       8 bytes
-    /// chain_link:       CAUSAL_LINK_SIZE bytes (28 since BUG #130)
+    /// chain_link:       CAUSAL_LINK_SIZE bytes (28)
     /// created_at:        8 bytes
     /// state_len:         4 bytes (u32)
     /// state:             state_len bytes
@@ -274,7 +272,7 @@ impl StateSnapshot {
         // surfaces as a `MigrationError::StateFailed(...)` rather than a
         // panic that unwinds across the dispatch task.
         self.try_to_bytes().expect(
-            "StateSnapshot::to_bytes — call try_to_bytes for fallible serialization (BUG #128)",
+            "StateSnapshot::to_bytes — call try_to_bytes for fallible serialization",
         )
     }
 
@@ -286,17 +284,15 @@ impl StateSnapshot {
     /// each as a `u32` length prefix; a payload that overflows
     /// would be permanently un-decodable.
     ///
-    /// BUG #128: pre-fix `to_bytes` called
-    /// `u32::try_from(...).expect("...exceeds 4 GiB")` which
-    /// panicked. `to_bytes` is on the migration / snapshot-send
-    /// path, where a panic crashes the dispatch task without
-    /// releasing locks. `state` is opaque caller-supplied bytes
-    /// (compute orchestrator, FFI clients) and `bindings_bytes` is
-    /// opaque externally-controlled migration metadata, so the
-    /// `>4 GiB` case is reachable from outside-controlled inputs.
-    /// Production callers should use `try_to_bytes` and surface
-    /// the error; the legacy `to_bytes` wrapper is kept for
-    /// well-known-bounded test callers.
+    /// `to_bytes` is on the migration / snapshot-send path, where
+    /// a panic on `u32` length-prefix overflow would crash the
+    /// dispatch task without releasing locks. `state` is opaque
+    /// caller-supplied bytes (compute orchestrator, FFI clients)
+    /// and `bindings_bytes` is opaque externally-controlled
+    /// migration metadata, so the `>4 GiB` case is reachable from
+    /// outside-controlled inputs. Production callers should use
+    /// `try_to_bytes` and surface the error; the legacy `to_bytes`
+    /// wrapper is kept for well-known-bounded test callers.
     pub fn try_to_bytes(&self) -> Result<Vec<u8>, SnapshotError> {
         // Validate state and bindings sizes BEFORE allocating the
         // output buffer — a 4+ GiB heap allocation on a known-bad
@@ -555,18 +551,17 @@ impl SnapshotStore {
     /// `through_seq` blocked the write — i.e. an older / replayed
     /// snapshot tried to overwrite a fresher one.
     ///
-    /// BUG #122: pre-fix this method called
-    /// `self.snapshots.insert(key, snapshot)` unconditionally, with
-    /// no comparison against the existing entry's `through_seq`. A
-    /// reordered or replayed snapshot delivery silently rewrote
-    /// state at sequence N over an existing one at N+M — and
-    /// concurrent stores raced (whichever DashMap insert landed
-    /// last won regardless of freshness). Now uses
-    /// `DashMap::entry` to make the read-compare-write atomic per
-    /// shard. Equal `through_seq` is also rejected so a re-
-    /// emission of the *same* snapshot from a stale producer doesn't
-    /// thrash the entry (refresh-with-equal must explicitly
-    /// `remove` first if intentional).
+    /// Uses `DashMap::entry` to make the read-compare-write
+    /// atomic per shard. An unconditional
+    /// `self.snapshots.insert(key, snapshot)` would let a
+    /// reordered or replayed snapshot delivery silently rewrite
+    /// state at sequence N over an existing one at N+M, and
+    /// concurrent stores would race (whichever DashMap insert
+    /// landed last would win regardless of freshness). Equal
+    /// `through_seq` is also rejected so a re-emission of the
+    /// *same* snapshot from a stale producer doesn't thrash the
+    /// entry (refresh-with-equal must explicitly `remove` first if
+    /// intentional).
     pub fn store(&self, snapshot: StateSnapshot) -> bool {
         use dashmap::mapref::entry::Entry;
         let key = *snapshot.entity_id.as_bytes();

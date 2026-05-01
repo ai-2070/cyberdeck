@@ -150,7 +150,7 @@ impl PermissionToken {
     /// public-only keypair must use [`Self::try_issue`] instead;
     /// `issue` is preserved as a convenience wrapper for callers
     /// (notably tests) that own a freshly-generated keypair and
-    /// know it has its signing half (BUG #121).
+    /// know it has its signing half.
     pub fn issue(
         issuer_keypair: &EntityKeypair,
         subject: EntityId,
@@ -168,7 +168,7 @@ impl PermissionToken {
             delegation_depth,
         )
         .expect(
-            "PermissionToken::issue called with a public-only keypair — use try_issue (BUG #121)",
+            "PermissionToken::issue called with a public-only keypair — use try_issue",
         )
     }
 
@@ -176,7 +176,7 @@ impl PermissionToken {
     /// [`TokenError::ReadOnly`] when the issuer keypair lacks its
     /// signing half (post-migration / public-only keypair) instead
     /// of panicking. The FFI bindings route through this function
-    /// (BUG #121) so a panic doesn't unwind across `extern "C"` into
+    /// so a panic doesn't unwind across `extern "C"` into
     /// C/Go-cgo/NAPI/PyO3 callers — undefined behaviour.
     pub fn try_issue(
         issuer_keypair: &EntityKeypair,
@@ -187,7 +187,7 @@ impl PermissionToken {
         delegation_depth: u8,
     ) -> Result<Self, TokenError> {
         let now = current_timestamp();
-        // BUG #150: abort on `getrandom` failure rather than
+        // Abort on `getrandom` failure rather than
         // panic-unwinding through the FFI boundary. Token nonces
         // need uniqueness (replay-distinct re-issues), and a
         // predictable nonce + signed payload would let an attacker
@@ -215,8 +215,8 @@ impl PermissionToken {
         };
 
         let payload = token.signed_payload();
-        // BUG #121: use `try_sign` to surface a public-only keypair
-        // as `TokenError::ReadOnly` instead of panicking.
+        // Use `try_sign` to surface a public-only keypair as
+        // `TokenError::ReadOnly` instead of panicking.
         let sig = issuer_keypair
             .try_sign(&payload)
             .map_err(|_| TokenError::ReadOnly)?;
@@ -344,7 +344,7 @@ impl PermissionToken {
         // clock read instead of two. Avoids the near-zero-lifetime
         // bug when the parent is near expiry.
         let now = current_timestamp();
-        // BUG #150: abort on `getrandom` failure rather than
+        // Abort on `getrandom` failure rather than
         // panic-unwinding through the FFI boundary. Token nonces
         // need uniqueness (replay-distinct re-issues), and a
         // predictable nonce + signed payload would let an attacker
@@ -371,9 +371,9 @@ impl PermissionToken {
             signature: [0u8; 64],
         };
         let payload = child.signed_payload();
-        // BUG #121: use `try_sign` so a public-only `signer` (post-
-        // migration zeroize) surfaces as `TokenError::ReadOnly`
-        // instead of panicking — same hazard / fix as `try_issue`.
+        // Use `try_sign` so a public-only `signer` (post-migration
+        // zeroize) surfaces as `TokenError::ReadOnly` instead of
+        // panicking — same shape as `try_issue`.
         // The `delegate` signature already returns
         // `Result<Self, TokenError>`, so callers naturally observe
         // the new variant without an API change.
@@ -474,7 +474,7 @@ pub const MAX_TOKEN_SLOTS: usize = 65_536;
 /// bitfield, so up to 2^32 distinct values are theoretically
 /// possible — in practice issuers compose from a small set of
 /// {PUBLISH, SUBSCRIBE, ADMIN, DELEGATE, WILDCARD}, so 32 is far
-/// past real usage while bounding within-slot growth (BUG #146).
+/// past real usage while bounding within-slot growth.
 pub const MAX_TOKENS_PER_SLOT: usize = 32;
 
 /// Fast permission lookup cache.
@@ -493,8 +493,7 @@ pub const MAX_TOKENS_PER_SLOT: usize = 32;
 /// on a cadence.
 ///
 /// Capacity is bounded by [`MAX_TOKEN_SLOTS`] (slot count) and
-/// [`MAX_TOKENS_PER_SLOT`] (tokens-with-distinct-scope per slot)
-/// (BUG #146).
+/// [`MAX_TOKENS_PER_SLOT`] (tokens-with-distinct-scope per slot).
 pub struct TokenCache {
     tokens: DashMap<([u8; 32], u16), Vec<PermissionToken>>,
 }
@@ -533,7 +532,7 @@ impl TokenCache {
     /// for a cross-channel fallback. Non-wildcard tokens live in
     /// their exact `channel_hash` slot.
     ///
-    /// BUG #146: bounded by [`MAX_TOKEN_SLOTS`] and
+    /// Bounded by [`MAX_TOKEN_SLOTS`] and
     /// [`MAX_TOKENS_PER_SLOT`]. When the slot cap is hit, novel
     /// keys are silently dropped (existing slot keys still
     /// refresh); when the within-slot cap is hit, novel scope
@@ -548,9 +547,9 @@ impl TokenCache {
         };
         let key = (*token.subject.as_bytes(), slot_channel);
 
-        // BUG #146 slot cap: only refuse NOVEL keys at the cap so
-        // existing peers' token refreshes still work under flood
-        // pressure. The cap is read from the DashMap atomically
+        // Slot cap: only refuse NOVEL keys at the cap so existing
+        // peers' token refreshes still work under flood pressure.
+        // The cap is read from the DashMap atomically
         // per shard; the `contains_key` + `len` race is benign for
         // a soft cap (overshoot by O(shards) is tolerable).
         if !self.tokens.contains_key(&key) && self.tokens.len() >= MAX_TOKEN_SLOTS {
@@ -563,9 +562,9 @@ impl TokenCache {
         if let Some(slot) = entry.iter_mut().find(|t| t.scope == token.scope) {
             *slot = token;
         } else if entry.len() < MAX_TOKENS_PER_SLOT {
-            // BUG #146 within-slot cap: drop novel-scope tokens
-            // when the slot is already at capacity. Refresh of an
-            // existing scope still hits the branch above, so this
+            // Within-slot cap: drop novel-scope tokens when the
+            // slot is already at capacity. Refresh of an existing
+            // scope still hits the branch above, so this
             // only fires on attempts to stack a new scope.
             entry.push(token);
         }
@@ -697,7 +696,7 @@ pub enum TokenError {
     InvalidFormat,
     /// Issuer/signer keypair is public-only (post-migration zeroize
     /// or other read-only construction). The caller's signing
-    /// operation is not possible. (BUG #121.)
+    /// operation is not possible.
     ReadOnly,
 }
 

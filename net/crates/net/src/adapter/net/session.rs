@@ -16,9 +16,8 @@ use std::time::Instant;
 use crate::event::StoredEvent;
 
 use super::crypto::{PacketCipher, SessionKeys};
-// BUG #106: `SharedPacketPool` import dropped — the field has
-// been removed from `NetSession`. Only `SharedLocalPool` is
-// used now (single TX-side AEAD source).
+// `SharedPacketPool` is intentionally absent — `NetSession` uses
+// only `SharedLocalPool` as the single TX-side AEAD source.
 use super::pool::SharedLocalPool;
 use super::reliability::{create_reliability_mode, ReliabilityMode};
 use super::stream::DEFAULT_STREAM_WINDOW_BYTES;
@@ -45,24 +44,22 @@ pub struct NetSession {
     peer_addr: SocketAddr,
     /// RX cipher (ChaCha20-Poly1305 with counter-based nonces)
     rx_cipher: PacketCipher,
-    // CR-12: `tx_key: [u8; 32]` field REMOVED along with the
-    // public `tx_key()` accessor. The field had zero readers
-    // outside of construction (it was passed straight into
-    // `thread_local_pool`'s constructor, then never read) — it
-    // was inert storage that only existed as a back-channel for
-    // the dead public accessor. Removing the field hardens the
-    // BUG #106 invariant: `thread_local_pool` is now the only
-    // surface that holds the TX key on a live `NetSession`,
-    // making the cross-pool nonce-reuse hazard structurally
-    // impossible to reintroduce by accident.
+    // No `tx_key` field: `thread_local_pool` is the only surface
+    // that holds the TX key on a live `NetSession`. Storing an
+    // extra copy here would re-open a cross-pool nonce-reuse
+    // hazard — independent counters under the same ChaCha20-
+    // Poly1305 key — and would only be read back through a
+    // `tx_key()` accessor whose only consumers are misuses (e.g.
+    // a fresh `PacketBuilder::new` that bypasses the
+    // thread-local pool's nonce sequencing).
     /// Per-stream state
     streams: DashMap<u64, StreamState>,
     /// Last activity timestamp (for session timeout)
     last_activity: AtomicU64,
     /// Thread-local pool for zero-contention hot path. The single
     /// authoritative source of TX-side AEAD encryptions for this
-    /// session — see the `tx_key` doc-comment for BUG #106
-    /// rationale.
+    /// session — see the `tx_key` comment above for the
+    /// cross-pool nonce-reuse rationale.
     thread_local_pool: SharedLocalPool,
     /// Default reliability mode for new streams
     default_reliable: bool,
@@ -109,18 +106,19 @@ impl NetSession {
     ) -> Self {
         let rx_cipher = PacketCipher::new(&keys.rx_key, keys.session_id);
 
-        // BUG #106: only `thread_local_pool` is constructed with
-        // the TX key. Pre-fix we also constructed `tx_cipher` and
+        // Only `thread_local_pool` is constructed with the TX key.
+        // Independently constructing a `tx_cipher` and a
         // `packet_pool` with the same key but independent counters
-        // — see the `tx_key` doc-comment for the cross-pool nonce-
-        // reuse hazard. The data path uses `thread_local_pool`
-        // exclusively.
+        // would re-open a cross-pool nonce-reuse hazard — see the
+        // `tx_key` comment above. The data path uses
+        // `thread_local_pool` exclusively.
         let thread_local_pool =
             super::pool::shared_local_pool(pool_size, &keys.tx_key, keys.session_id);
 
-        // CR-12: `tx_key` is consumed only by `shared_local_pool` above.
-        // The previous extra copy into a struct field was dead storage
-        // and a cross-pool footgun (see BUG #106).
+        // `tx_key` is consumed only by `shared_local_pool` above.
+        // Copying it into a struct field would be dead storage and
+        // a cross-pool footgun (see the `tx_key` comment on the
+        // struct above).
         Self {
             session_id: keys.session_id,
             peer_addr,
@@ -167,16 +165,13 @@ impl NetSession {
         self.peer_addr
     }
 
-    // CR-12: `tx_key()` accessor was REMOVED. It was a public
-    // footgun with zero in-tree callers — any caller using
+    // No `tx_key()` accessor exists — it would be a public
+    // footgun with no legitimate callers. Any caller using
     // `session.tx_key()` to construct a fresh `PacketBuilder`
-    // would re-introduce the BUG #97/#106 cross-pool nonce-reuse
-    // hazard (independent counters under the same ChaCha20-
-    // Poly1305 key). All TX-side AEAD operations now flow through
-    // `thread_local_pool` via `build_heartbeat` and the normal
-    // `send_*` paths. The `tx_key` FIELD is preserved (private)
-    // because `thread_local_pool` is constructed from it; nothing
-    // outside the session module reads it directly.
+    // would re-introduce a cross-pool nonce-reuse hazard
+    // (independent counters under the same ChaCha20-Poly1305 key).
+    // All TX-side AEAD operations flow through `thread_local_pool`
+    // via `build_heartbeat` and the normal `send_*` paths.
 
     /// Get the RX cipher
     #[inline]
@@ -570,21 +565,19 @@ impl NetSession {
             }
         }
 
-        // BUG #105: pre-fix, `recently_closed` only got
-        // garbage-collected by `is_grant_quarantined`, which is
-        // called from `mesh.rs:2770` only when an inbound
-        // `StreamWindow` grant arrives for that exact
+        // Piggyback on this idle-stream sweep: drop any
+        // `recently_closed` entry whose insertion time is past
+        // `GRANT_QUARANTINE_WINDOW`. Without this sweep,
+        // `recently_closed` would only get GC'd by
+        // `is_grant_quarantined`, which is called only when an
+        // inbound `StreamWindow` grant arrives for that exact
         // `stream_id`. A long-lived peer that opens/closes many
         // distinct stream IDs (e.g., one short-lived stream per
         // RPC) and never receives a late grant for each closed
         // stream would accumulate one entry per closed stream
-        // forever — N streams/sec → ~N*T entries after T seconds,
-        // unbounded.
-        //
-        // Piggyback on this idle-stream sweep: drop any entry
-        // whose insertion time is past `GRANT_QUARANTINE_WINDOW`.
-        // The sweep itself is bounded by the existing eviction
-        // cadence so there's no extra wakeup cost.
+        // forever — N streams/sec → ~N×T entries after T seconds,
+        // unbounded. The sweep itself is bounded by the existing
+        // eviction cadence so there's no extra wakeup cost.
         self.recently_closed
             .retain(|_, inserted_at| inserted_at.elapsed() < GRANT_QUARANTINE_WINDOW);
 
@@ -612,13 +605,13 @@ impl NetSession {
     /// interleave cleanly on the wire, and the receiver's replay
     /// window admits them in either order.
     ///
-    /// Closes BUG #97: pre-fix, callers built heartbeats with a
-    /// fresh `PacketBuilder::new(&[0u8; 32], session_id)`, which
-    /// (a) used the wrong key so the receiver's AEAD verify
-    /// rejected every heartbeat, and (b) reused counter=0 across
-    /// successive heartbeats so the replay window rejected every
-    /// heartbeat after the first. Wrapping the construction in this
-    /// method removes the surface that admitted both errors.
+    /// Wrapping heartbeat construction in this method removes the
+    /// surface that would otherwise let callers build heartbeats
+    /// with a fresh `PacketBuilder::new(&[0u8; 32], session_id)`,
+    /// which (a) would use the wrong key so the receiver's AEAD
+    /// verify would reject every heartbeat, and (b) would reuse
+    /// counter=0 across successive heartbeats so the replay window
+    /// would reject every heartbeat after the first.
     #[inline]
     pub fn build_heartbeat(&self) -> Bytes {
         self.thread_local_pool.get().build_heartbeat()
@@ -640,11 +633,12 @@ impl NetSession {
     /// responsibility — those policies vary by adapter and don't
     /// belong inside the helper.
     ///
-    /// Closes BUG #85: pre-fix, the mesh dispatch loop fast-pathed
-    /// `is_heartbeat()` packets through to `failure_detector.heartbeat`
-    /// and `session.touch()` without ever decrypting the tag, letting
-    /// an off-path attacker who observed the cleartext `session_id`
-    /// and source UDP address spoof heartbeats indefinitely.
+    /// Heartbeats MUST decrypt the AEAD tag rather than be fast-
+    /// pathed through to `failure_detector.heartbeat` and
+    /// `session.touch()` based on `is_heartbeat()` alone — without
+    /// the decrypt step, an off-path attacker who observed the
+    /// cleartext `session_id` and source UDP address could spoof
+    /// heartbeats indefinitely.
     pub fn verify_and_touch_heartbeat(&self, parsed: &ParsedPacket) -> bool {
         let aad = parsed.header.aad();
         let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
@@ -797,9 +791,9 @@ pub struct StreamState {
 /// Tracks how much credit this receiver has extended to the sender
 /// vs how much it has "consumed" (accepted off the wire).
 ///
-/// **Accounting cadence** (BUG #84 resolution): this is
-/// receive-time accounting, NOT application-drain accounting.
-/// Every accepted packet calls [`Self::on_bytes_consumed`] from
+/// **Accounting cadence:** this is receive-time accounting, NOT
+/// application-drain accounting. Every accepted packet calls
+/// [`Self::on_bytes_consumed`] from
 /// the dispatch loop (`mesh.rs::process_local_packet`), which
 /// bumps both `consumed` and `granted` by the on-wire byte
 /// count. The "outstanding" credit (`granted - consumed`)
@@ -899,27 +893,19 @@ impl RxCreditState {
         if self.window_bytes == 0 {
             return None;
         }
-        // BUG #84 (revised resolution): the original audit framing
-        // claimed the auto-grant defeated backpressure. Closer
-        // inspection showed the v2 design intentionally accounts
-        // at receive time (not application-drain time) — see
-        // `mesh.rs:3110-3135` ("Accounting runs at receive time
-        // (not drain time); this closes the v1 gap where a single
-        // serial sender ran `Transport(io::Error)` into a full
-        // kernel buffer"). The credit window is for kernel-buffer
-        // protection, not application-side throttling; the latter
-        // is provided by per-shard queue-depth limits.
+        // The v2 design intentionally accounts at receive time
+        // (not application-drain time) — see `mesh.rs:3110-3135`
+        // ("Accounting runs at receive time (not drain time); this
+        // closes the v1 gap where a single serial sender ran
+        // `Transport(io::Error)` into a full kernel buffer"). The
+        // credit window is for kernel-buffer protection, not
+        // application-side throttling; the latter is provided by
+        // per-shard queue-depth limits.
         //
-        // The docstring on `RxCreditState` previously promised a
-        // threshold-emit pattern that didn't match the
-        // implementation; this discrepancy was the actual bug.
-        // The docstring has been updated to describe the
-        // receive-time-accounting design as documented in the
-        // mesh dispatcher comment. The implementation is left
-        // alone — every call mints a matching grant of `bytes`,
-        // returning the running cumulative consumed count for
-        // the caller to ship as `total_consumed` in an
-        // authoritative `StreamWindow` packet.
+        // Every call mints a matching grant of `bytes`, returning
+        // the running cumulative consumed count for the caller to
+        // ship as `total_consumed` in an authoritative
+        // `StreamWindow` packet.
         let new_consumed = self.consumed.fetch_add(bytes, Ordering::AcqRel) + bytes;
         self.granted.fetch_add(bytes, Ordering::AcqRel);
         Some(new_consumed)

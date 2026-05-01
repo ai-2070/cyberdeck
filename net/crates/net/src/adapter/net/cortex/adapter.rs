@@ -35,12 +35,12 @@ const CHANGES_BROADCAST_CAP: usize = 64;
 
 /// Item type yielded by [`CortexAdapter::changes_with_lag`].
 ///
-/// Pre-fix the `changes()` stream used `filter_map(|r| r.ok())`
-/// which silently dropped `BroadcastStream::Lagged(n)` errors —
-/// downstream telemetry consumers had no way to surface "you
+/// The plain `changes()` stream uses `filter_map(|r| r.ok())`
+/// which silently drops `BroadcastStream::Lagged(n)` errors —
+/// downstream telemetry consumers have no way to surface "you
 /// missed N changes." This enum exposes both shapes; subscribers
 /// who need only the latest sequence can stay on
-/// [`CortexAdapter::changes`] (BUG #144).
+/// [`CortexAdapter::changes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeEvent {
     /// A successful fold apply produced this RedEX sequence.
@@ -191,8 +191,6 @@ impl<State> CortexAdapter<State> {
     /// reflects past those n events, so the subscriber can react
     /// (re-read state, log lag, apply backpressure) without
     /// missing data.
-    ///
-    /// BUG #144.
     pub fn changes_with_lag(&self) -> impl Stream<Item = ChangeEvent> + Send + 'static {
         use futures::StreamExt;
         BroadcastStream::new(self.inner.changes_tx.subscribe()).map(|r| match r {
@@ -236,11 +234,11 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
     where
         F: RedexFold<State> + Send + 'static,
     {
-        // BUG #134: positions that skip a non-empty event prefix
-        // require externally-rehydrated state — the watermark
-        // would otherwise advance past events the adapter never
-        // saw, making `wait_for_seq(k)` return immediately for
-        // skipped k while `state` has never observed those events.
+        // Positions that skip a non-empty event prefix require
+        // externally-rehydrated state — the watermark would
+        // otherwise advance past events the adapter never saw,
+        // making `wait_for_seq(k)` return immediately for skipped
+        // k while `state` has never observed those events.
         // Callers using these positions must use
         // `open_from_snapshot` (which carries the matching
         // `last_seq` + serialized state) and routes through
@@ -265,10 +263,10 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
         )
     }
 
-    /// Internal open path that bypasses the BUG #134 start-position
+    /// Internal open path that bypasses the start-position
     /// guard. Used by `open_from_snapshot`, where the externally-
-    /// rehydrated state is the legitimate reason to skip the event
-    /// prefix.
+    /// rehydrated state is the legitimate reason to skip the
+    /// event prefix.
     fn open_unchecked<F>(
         redex: &Redex,
         name: &ChannelName,
@@ -434,8 +432,8 @@ where
             start,
             on_fold_error: adapter_config.on_fold_error,
         };
-        // BUG #134: route through `open_unchecked` so the
-        // externally-rehydrated state can skip its event prefix.
+        // Route through `open_unchecked` so the externally-
+        // rehydrated state can skip its event prefix.
         Self::open_unchecked(redex, name, redex_config, config, fold, initial_state)
     }
 }
@@ -479,15 +477,15 @@ where
     let result = {
         let mut state = inner.state.write();
         let r = fold.apply(event, &mut state);
-        // BUG #141: under `Stop` policy, a per-event recoverable
-        // decode failure (postcard error, EventMeta shape
-        // mismatch — anything `RedexError::is_recoverable_decode`
-        // flags) is treated as skip-and-continue rather than
-        // halting. Pre-fix a single bad event (disk corruption
-        // past the #135 32-bit checksum, or a deliberately-
-        // crafted matching-collision tail) wedged the fold task
-        // permanently — DoS vector against multi-tenant cortex
-        // instances via one bad event. Stream-level errors
+        // Under `Stop` policy, a per-event recoverable decode
+        // failure (postcard error, EventMeta shape mismatch —
+        // anything `RedexError::is_recoverable_decode` flags) is
+        // treated as skip-and-continue rather than halting. Halting
+        // on every such failure would let a single bad event (disk
+        // corruption past the 32-bit checksum, or a
+        // deliberately-crafted matching-collision tail) wedge the
+        // fold task permanently — a DoS vector against multi-tenant
+        // cortex instances via one bad event. Stream-level errors
         // (`Io`, `Closed`, `Lagged`) and authorization /
         // configuration errors still halt under `Stop` as
         // documented.
@@ -511,9 +509,9 @@ where
         Err(err) => {
             inner.fold_errors.fetch_add(1, Ordering::AcqRel);
             tracing::warn!(seq = seq, error = %err, "cortex fold error");
-            // BUG #141: per-event decode errors always skip-and-
-            // continue; only stream-level / configuration errors
-            // halt under `Stop`.
+            // Per-event decode errors always skip-and-continue;
+            // only stream-level / configuration errors halt under
+            // `Stop`.
             let recoverable_decode = err.is_recoverable_decode();
             match policy {
                 FoldErrorPolicy::Stop if !recoverable_decode => true,

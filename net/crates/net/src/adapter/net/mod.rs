@@ -107,11 +107,11 @@ pub use identity::{
 pub use mesh::{MeshNode, MeshNodeConfig, PartitionFilter};
 #[cfg(feature = "netdb")]
 pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};
-// BUG #106: `SharedPacketPool` removed from re-exports — see
-// `pool.rs` for the audit rationale (cross-pool nonce-reuse
-// hazard). `PacketPool` itself stays exposed because tests
-// reference it; only the `Arc<PacketPool>` wrapper alias and
-// its constructor were dropped.
+// `SharedPacketPool` is intentionally not re-exported — see
+// `pool.rs` for the cross-pool nonce-reuse rationale.
+// `PacketPool` itself stays exposed because tests reference it;
+// only the `Arc<PacketPool>` wrapper alias and its constructor
+// are absent.
 pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, ThreadLocalPool};
 pub use protocol::{
     EventFrame, NackPayload, NetHeader, PacketFlags, HEADER_SIZE, NONCE_SIZE, TAG_SIZE,
@@ -179,16 +179,16 @@ pub use routing::{route_to_shard, stream_id_from_bytes, stream_id_from_key};
 /// Shared utility — avoids duplicating this across `causal.rs`, `snapshot.rs`,
 /// `observation.rs`, `migration.rs`, `session.rs`, and `token.rs`.
 ///
-/// BUG #118: pre-fix, `as u64` silently truncated the `u128`
-/// returned by `Duration::as_nanos()`. Practical wraparound
-/// from monotonic flow doesn't happen until ~year 2554, but a
-/// system whose clock was misconfigured to a far-future date
-/// produced a tiny truncated timestamp — immediately tripping
-/// `is_timed_out` everywhere. `unwrap_or_default()` returning
-/// `Duration::ZERO` for a pre-epoch clock also produced
-/// identical timestamps that broke ordering. Saturate via
-/// `try_from` so future-dated clocks land at `u64::MAX`
-/// instead of wrapping near 0.
+/// Saturates via `try_from` so future-dated clocks land at
+/// `u64::MAX` instead of wrapping near 0. A bare `as u64` would
+/// silently truncate the `u128` returned by
+/// `Duration::as_nanos()`. Practical wraparound from monotonic
+/// flow doesn't happen until ~year 2554, but a system whose clock
+/// was misconfigured to a far-future date would produce a tiny
+/// truncated timestamp — immediately tripping `is_timed_out`
+/// everywhere. `unwrap_or_default()` returning `Duration::ZERO`
+/// for a pre-epoch clock would also produce identical timestamps
+/// that break ordering.
 #[inline]
 pub(crate) fn current_timestamp() -> u64 {
     let elapsed = std::time::SystemTime::now()
@@ -660,7 +660,7 @@ impl NetAdapter {
         // The verify+touch sequence lives inside
         // `NetSession::verify_and_touch_heartbeat` so callers can't
         // touch a session whose heartbeat failed verify, and can't
-        // forget to touch on success. See BUG #85 / #97.
+        // forget to touch on success.
         if parsed.header.flags.is_heartbeat() {
             if source == session.peer_addr() {
                 session.verify_and_touch_heartbeat(&parsed);
@@ -842,24 +842,19 @@ impl NetAdapter {
                             break;
                         }
 
-                        // BUG #97 / #97-followup: this previously
-                        // used `PacketBuilder::new(&[0u8; 32],
-                        // session.session_id())` — fresh builder,
-                        // all-zero key, fresh counter starting at
-                        // 0 each tick. Two problems compounded
-                        // once the receiver started AEAD-verifying
-                        // heartbeats (BUG #85): (a) the all-zero
-                        // key didn't match the session's RX key;
-                        // (b) successive heartbeats reused
-                        // counter=0, so the receiver's replay
-                        // window rejected every heartbeat after
-                        // the first.
-                        //
                         // `Session::build_heartbeat` routes through
                         // `thread_local_pool` (same pool the data
                         // path uses) so heartbeats share a single
                         // TX counter with data and interleave
-                        // correctly on the wire.
+                        // correctly on the wire. Constructing a
+                        // bespoke `PacketBuilder::new(&[0u8; 32],
+                        // session.session_id())` per tick would
+                        // (a) use the wrong key so the receiver's
+                        // AEAD verify would reject every heartbeat,
+                        // and (b) reuse counter=0 across successive
+                        // heartbeats so the receiver's replay
+                        // window would reject every heartbeat
+                        // after the first.
                         let packet = session.build_heartbeat();
 
                         if let Err(e) = socket.send_to(&packet, peer_addr).await {

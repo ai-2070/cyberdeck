@@ -376,18 +376,16 @@ impl IdentityEnvelope {
                 // we're only retrying the AEAD with a DIFFERENT
                 // associated data binding. Any envelope that
                 // succeeds under v0 AAD also passed the v1
-                // attestation, so it's a legitimate pre-#127
+                // attestation, so it's a legitimate legacy
                 // envelope from a rolling-upgrade peer.
                 //
-                // Cubic P2: on the fallback's decrypt failure
-                // path, scrub the derived AEAD `key` BEFORE
-                // returning Err. Pre-fix the early return via
-                // `?` left the key (a function of the shared
-                // DH output — sensitive material) on the stack
-                // until natural drop, which `[u8; 32]`'s
-                // default Drop does NOT zeroize. The other
-                // failure paths in this function already do
-                // this; the v0-fallback path was missed.
+                // On the fallback's decrypt failure path we scrub
+                // the derived AEAD `key` BEFORE returning Err so
+                // the key (a function of the shared DH output —
+                // sensitive material) doesn't sit on the stack
+                // until natural drop. `[u8; 32]`'s default Drop
+                // does NOT zeroize, so an early return via `?`
+                // would leak it.
                 match aead.decrypt((&nonce).into(), Payload { msg: ct, aad: &[] }) {
                     Ok(v) => v,
                     Err(_) => {
@@ -476,10 +474,8 @@ impl IdentityEnvelope {
 /// Transcript bytes signed by the source and verified by the target:
 /// `target_static_pub (32) || chain_link.to_bytes() (CAUSAL_LINK_SIZE)`.
 ///
-/// Width follows `CAUSAL_LINK_SIZE` so a wire-format change to the
-/// causal link (e.g. BUG #130 widening `horizon_encoded` to u64,
-/// which took the link from 24 → 28 bytes) doesn't require a
-/// hand-edited length here.
+/// Width follows `CAUSAL_LINK_SIZE` so a wire-format change to
+/// the causal link doesn't require a hand-edited length here.
 fn attestation_transcript(
     target_static_pub: &[u8; 32],
     chain_link: &CausalLink,

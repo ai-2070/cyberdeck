@@ -63,10 +63,10 @@ pub struct MemoriesAdapter {
     origin_hash: u32,
     /// Monotonic per-origin counter for `EventMeta::seq_or_ts`.
     /// Shared with the inner `WatermarkingFold` wrapper around
-    /// [`MemoriesFold`] (BUG #148): the fold task advances this
-    /// counter via `fetch_max(seq_or_ts + 1)` for every replayed
-    /// event whose `origin_hash` matches ours, so `ingest_typed`
-    /// after open can never collide with an already-stored event.
+    /// [`MemoriesFold`]: the fold task advances this counter via
+    /// `fetch_max(seq_or_ts + 1)` for every replayed event whose
+    /// `origin_hash` matches ours, so `ingest_typed` after open
+    /// can never collide with an already-stored event.
     app_seq: Arc<AtomicU64>,
 }
 
@@ -76,12 +76,12 @@ impl MemoriesAdapter {
     /// Uses [`MEMORIES_CHANNEL`] (`"cortex/memories"`). Replays the
     /// full history into state on open.
     ///
-    /// `async` because the constructor awaits the fold task's catch-up
-    /// before returning (BUG #148): the inner `WatermarkingFold`
+    /// `async` because the constructor awaits the fold task's
+    /// catch-up before returning: the inner `WatermarkingFold`
     /// observes every replayed event's `EventMeta` and advances
-    /// `app_seq` past any pre-existing same-origin `seq_or_ts`, so
-    /// the first `ingest_typed` after `open` cannot collide with an
-    /// already-stored event.
+    /// `app_seq` past any pre-existing same-origin `seq_or_ts`,
+    /// so the first `ingest_typed` after `open` cannot collide
+    /// with an already-stored event.
     pub async fn open(redex: &Redex, origin_hash: u32) -> Result<Self, CortexAdapterError> {
         Self::open_with_config(redex, origin_hash, RedexFileConfig::default()).await
     }
@@ -227,13 +227,13 @@ impl MemoriesAdapter {
             let guard = state.read();
             watcher.spec_for_snapshot().execute(&guard)
         };
-        // BUG #143: pre-fix used the sticky `skip_while`, which
-        // starves consumers under (A → B → A) state oscillations
-        // collapsed by the single-slot `tokio::sync::watch` — see
+        // Skip ONLY the first emission if it still equals the
+        // snapshot, forward everything after that. A sticky
+        // `skip_while` would starve consumers under (A → B → A)
+        // state oscillations collapsed by the single-slot
+        // `tokio::sync::watch` — see
         // `tasks/adapter.rs::snapshot_and_watch` for the full
-        // rationale. The fix here is identical: skip ONLY the first
-        // emission if it still equals the snapshot, forward
-        // everything after that.
+        // rationale.
         let initial_for_stream = initial.clone();
         let stream = watcher
             .stream()
@@ -298,11 +298,11 @@ impl MemoriesAdapter {
         let name = ChannelName::new(MEMORIES_CHANNEL)
             .map_err(|e| CortexAdapterError::Redex(RedexError::Channel(e.to_string())))?;
 
-        // Pre-load the snapshot's persisted counter into the shared
-        // atomic. The wrapper fold then advances it via fetch_max as
-        // it catches up over the post-`last_seq` tail — replacing
-        // the synchronous `read_range` walk that pre-fix doubled
-        // startup IO/CPU on large logs (BUG #148).
+        // Pre-load the snapshot's persisted counter into the
+        // shared atomic. The wrapper fold then advances it via
+        // fetch_max as it catches up over the post-`last_seq`
+        // tail. A separate synchronous `read_range` walk would
+        // double startup IO/CPU on large logs.
         let app_seq = Arc::new(AtomicU64::new(payload.app_seq));
         let fold = WatermarkingFold::new(MemoriesFold, app_seq.clone(), origin_hash);
         let inner = CortexAdapter::open_from_snapshot(
@@ -328,13 +328,13 @@ impl MemoriesAdapter {
         })
     }
 
-    /// BUG #126: see `tasks/adapter.rs::ingest_typed` for the full
+    /// See `tasks/adapter.rs::ingest_typed` for the full
     /// rationale. Same shape as the tasks adapter: a single
     /// `fetch_add` reserves the next `app_seq` atomically before
     /// ingest; on `inner.ingest` failure we leave a small gap in
     /// the per-origin sequence space, which is harmless because
-    /// `WatermarkingFold` (BUG #148) advances via `fetch_max`
-    /// against events that actually landed in the log.
+    /// `WatermarkingFold` advances via `fetch_max` against events
+    /// that actually landed in the log.
     fn ingest_typed<T: serde::Serialize>(
         &self,
         dispatch: u8,

@@ -347,11 +347,12 @@ impl MigrationSubprotocolHandler {
 
                 // Chunk the snapshot for transport
                 //
-                // BUG #128: oversized state/bindings now surfaces as a
-                // `MigrationFailed` reply (StateFailed) rather than a
-                // panic in the dispatch task. The orchestrator
-                // consumes the reply and retry semantics kick in, the
-                // same shape as `maybe_seal_envelope` failure above.
+                // Oversized state/bindings surfaces as a
+                // `MigrationFailed` reply (StateFailed) rather than
+                // a panic in the dispatch task. The orchestrator
+                // consumes the reply and retry semantics kick in,
+                // the same shape as `maybe_seal_envelope` failure
+                // above.
                 let snapshot_bytes = match snapshot.try_to_bytes() {
                     Ok(b) => b,
                     Err(e) => {
@@ -672,36 +673,26 @@ impl MigrationSubprotocolHandler {
                 let _ = self
                     .orchestrator
                     .abort_migration_with_reason(daemon_origin, reason);
-                // BUG #111: also drop any partial reassembler we
-                // accumulated as the target. Pre-fix only the
-                // local-source-failure path (`fail_migration_with_reason`,
-                // line ~1061) cleared this, so an inbound
-                // `MigrationFailed` after the target had received
-                // some snapshot chunks left ~`chunk_size *
+                // Also drop any partial reassembler we accumulated
+                // as the target. The local-source-failure path
+                // (`fail_migration_with_reason`, line ~1061)
+                // already clears this; an inbound `MigrationFailed`
+                // after the target had received some snapshot
+                // chunks would otherwise leave ~`chunk_size *
                 // chunks_received` bytes pinned in the DashMap
                 // forever (or until the same origin migrated again
                 // with a higher `seq_through`). With many ephemeral
-                // daemons this was an unbounded leak.
+                // daemons this would be an unbounded leak.
                 self.reassemblers.remove(&daemon_origin);
 
-                // CR-24: cleanup completeness audit (2026-05-01).
-                //
-                // The original review flagged StandbyGroup and
-                // CapabilityIndex as candidates for additional
-                // teardown here, on the theory that "if the
-                // failed migration had a standby promotion
-                // mid-flight (StandbyGroup was about to receive
-                // the new active), or if the source had advertised
-                // a capability tied to the migrating daemon, those
-                // entries are not torn down here."
-                //
-                // Investigation shows neither subsystem holds
-                // per-daemon migration-coupled state today:
+                // Cleanup completeness: neither `StandbyGroup` nor
+                // `CapabilityIndex` holds per-daemon
+                // migration-coupled state today.
                 //
                 //   * `StandbyGroup::promote` is synchronous —
-                //     either succeeds or rolls back atomically
-                //     (BUG #103). There is no "promotion in
-                //     flight across migration phases" state.
+                //     either succeeds or rolls back atomically.
+                //     There is no "promotion in flight across
+                //     migration phases" state.
                 //   * `CapabilityIndex` indexes by `node_id`, not
                 //     by `daemon_origin` (verified by `grep -rn
                 //     daemon_origin src/adapter/net/behavior/
@@ -710,11 +701,11 @@ impl MigrationSubprotocolHandler {
                 //     specific daemon's migration doesn't change
                 //     what the source node is advertising.
                 //
-                // So no additional teardown is needed today.
-                // Pinned by `cr24_no_per_daemon_migration_state`
-                // — if a future change adds per-daemon coupling
-                // in either subsystem, the test fires loudly and
-                // the maintainer must wire teardown HERE.
+                // So no additional teardown is needed today. If a
+                // future change adds per-daemon coupling in either
+                // subsystem, the regression test for this invariant
+                // fires loudly and the maintainer must wire
+                // teardown HERE.
             }
 
             MigrationMessage::BufferedEvents {

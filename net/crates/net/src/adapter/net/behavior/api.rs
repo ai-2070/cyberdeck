@@ -60,22 +60,22 @@ impl ApiMethod {
 
 /// Maximum recursion depth permitted by [`SchemaType::validate`].
 ///
-/// Closes BUG #109 — `SchemaType` is `#[derive(Deserialize)]`
-/// and contains recursive variants (`Array { items: Box<SchemaType> }`,
+/// `SchemaType` is `#[derive(Deserialize)]` and contains
+/// recursive variants (`Array { items: Box<SchemaType> }`,
 /// `Object { properties: HashMap<_, SchemaType> }`,
 /// `AnyOf { schemas: Vec<SchemaType> }`). An attacker who can
-/// ship a schema (announcements broadcast over the mesh, or
-/// any caller that parses untrusted JSON into `SchemaType`)
-/// could submit a deeply-nested schema and crash the validator
-/// (and the whole process) via stack overflow when validate
-/// recursed without a bound. 128 is generous for realistic
-/// schemas (typical JSON Schemas rarely exceed depth 10) and
-/// well clear of the typical default 8 MB Linux stack.
+/// ship a schema (announcements broadcast over the mesh, or any
+/// caller that parses untrusted JSON into `SchemaType`) could
+/// otherwise submit a deeply-nested schema and crash the
+/// validator (and the whole process) via stack overflow on an
+/// unbounded recursive `validate`. 128 is generous for realistic
+/// schemas (typical JSON Schemas rarely exceed depth 10) and well
+/// clear of the typical default 8 MB Linux stack.
 pub const MAX_SCHEMA_DEPTH: usize = 128;
 
-/// CR-9: scan the byte stream of a JSON document and reject if
-/// nesting depth (the deepest stack of `{` and `[` after balancing)
-/// exceeds `max_depth`.
+/// Scan the byte stream of a JSON document and reject if
+/// nesting depth (the deepest stack of `{` and `[` after
+/// balancing) exceeds `max_depth`.
 ///
 /// This is the deserialize-side defence for [`SchemaType`]: an
 /// adversarial schema with thousands of nested `{"type":"array",
@@ -266,8 +266,8 @@ impl SchemaType {
     /// Deserialize a `SchemaType` from JSON bytes with an explicit
     /// nesting-depth cap.
     ///
-    /// CR-9: callers that deserialize peer-supplied / untrusted
-    /// JSON into `SchemaType` MUST use this entry point. The
+    /// Callers that deserialize peer-supplied / untrusted JSON
+    /// into `SchemaType` MUST use this entry point. The
     /// derive-`Deserialize` path inherits `serde_json`'s built-in
     /// 128-frame recursion limit, but that's tied to a transitive
     /// dependency and may shift across versions; we pin a local
@@ -410,17 +410,16 @@ impl SchemaType {
 
     /// Validate a JSON value against this schema.
     ///
-    /// BUG #109: pre-fix, recursive variants (`Array`, `Object`,
-    /// `AnyOf`) called `validate` recursively with no depth
-    /// bound. An attacker who could ship a `SchemaType`
-    /// (announcements broadcast over the mesh, or any caller
-    /// that parses untrusted JSON into `SchemaType`) submitted
-    /// a deeply-nested schema and crashed the validator — and
-    /// the whole process — via stack overflow when a request
-    /// got validated against it. Now the recursion is bounded
-    /// by [`MAX_SCHEMA_DEPTH`]; exceeding it returns
-    /// [`ValidationError::RecursionLimitExceeded`] instead of
-    /// blowing the stack.
+    /// The recursion is bounded by [`MAX_SCHEMA_DEPTH`]; exceeding
+    /// it returns [`ValidationError::RecursionLimitExceeded`]
+    /// instead of blowing the stack. Recursive variants (`Array`,
+    /// `Object`, `AnyOf`) call `validate` recursively, so an
+    /// attacker who could ship a `SchemaType` (announcements
+    /// broadcast over the mesh, or any caller that parses
+    /// untrusted JSON into `SchemaType`) could otherwise submit a
+    /// deeply-nested schema and crash the validator — and the
+    /// whole process — via stack overflow when a request got
+    /// validated against it.
     pub fn validate(&self, value: &serde_json::Value) -> Result<(), ValidationError> {
         self.validate_with_depth(value, 0)
     }
@@ -802,8 +801,8 @@ pub enum ValidationError {
     ///
     /// Returned by [`SchemaType::validate`] when the recursive
     /// walk through nested `Array`/`Object`/`AnyOf` variants
-    /// exceeds [`MAX_SCHEMA_DEPTH`]. Closes BUG #109 — pre-fix
-    /// an attacker who could ship a `SchemaType` (announcements
+    /// exceeds [`MAX_SCHEMA_DEPTH`]. Without this cap, an
+    /// attacker who could ship a `SchemaType` (announcements
     /// broadcast over the mesh, or any caller parsing untrusted
     /// JSON) could submit a deeply nested schema and crash the
     /// validator (and the process) via stack overflow.

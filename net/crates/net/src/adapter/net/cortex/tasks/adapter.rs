@@ -61,13 +61,13 @@ pub struct TasksAdapter {
     origin_hash: u32,
     /// Monotonic per-origin counter for `EventMeta::seq_or_ts`.
     /// Shared with the inner `WatermarkingFold` wrapper around
-    /// [`TasksFold`] (BUG #148): the fold task advances this counter
-    /// via `fetch_max(seq_or_ts + 1)` for every replayed event whose
-    /// `origin_hash` matches ours, so reopening against a Redex with
-    /// pre-existing same-origin events produces a counter that's
-    /// already past every assigned `seq_or_ts` by the time the
-    /// constructor returns. `ingest_typed` then load-and-CAS-commits
-    /// against the same atomic.
+    /// [`TasksFold`]: the fold task advances this counter via
+    /// `fetch_max(seq_or_ts + 1)` for every replayed event whose
+    /// `origin_hash` matches ours, so reopening against a Redex
+    /// with pre-existing same-origin events produces a counter
+    /// that's already past every assigned `seq_or_ts` by the time
+    /// the constructor returns. `ingest_typed` then
+    /// load-and-CAS-commits against the same atomic.
     app_seq: Arc<AtomicU64>,
 }
 
@@ -78,12 +78,12 @@ impl TasksAdapter {
     /// history into state on open; subsequent events are appended to
     /// the same channel.
     ///
-    /// `async` because the constructor awaits the fold task's catch-up
-    /// before returning (BUG #148): the inner `WatermarkingFold`
+    /// `async` because the constructor awaits the fold task's
+    /// catch-up before returning: the inner `WatermarkingFold`
     /// observes every replayed event's `EventMeta` and advances
-    /// `app_seq` past any pre-existing same-origin `seq_or_ts`, so
-    /// the first `ingest_typed` after `open` cannot collide with an
-    /// already-stored event.
+    /// `app_seq` past any pre-existing same-origin `seq_or_ts`,
+    /// so the first `ingest_typed` after `open` cannot collide
+    /// with an already-stored event.
     pub async fn open(redex: &Redex, origin_hash: u32) -> Result<Self, CortexAdapterError> {
         Self::open_with_config(redex, origin_hash, RedexFileConfig::default()).await
     }
@@ -229,21 +229,18 @@ impl TasksAdapter {
             let guard = state.read();
             watcher.spec_for_snapshot().execute(&guard)
         };
-        // BUG #143: pre-fix this used
-        // `skip_while(|c| c == &initial)`, which is "sticky" — once
-        // the predicate evaluates `false` it never re-skips. That
-        // handled the snapshot-vs-watcher race (state changes
-        // between snapshot read and `watcher.stream()` start, so
-        // the watcher's first emission ≠ snapshot — we want to
-        // forward it) but introduced a starvation hazard: under an
+        // Skip ONLY the first emission, and only if it equals the
+        // snapshot. Subsequent emissions always forward. A sticky
+        // `skip_while(|c| c == &initial)` would handle the
+        // snapshot-vs-watcher race (state changes between
+        // snapshot read and `watcher.stream()` start, so the
+        // watcher's first emission ≠ snapshot — we want to forward
+        // it) but introduces a starvation hazard: under an
         // (A → B → A) state oscillation that the single-slot
         // `tokio::sync::watch` collapses into final A, the
-        // surviving A equals `initial` so it's skipped — the
-        // consumer is silent until state diverges from A.
-        //
-        // The fix: skip ONLY the first emission, and only if it
-        // equals the snapshot. Subsequent emissions always
-        // forward. This handles both cases:
+        // surviving A equals `initial` so it would be skipped —
+        // the consumer would be silent until state diverged from
+        // A. The first-only filter handles both cases:
         //   - leading match (no state change since snapshot): skip
         //     the first emission → consumer sees no duplicate
         //   - leading divergence (state changed during the race):
@@ -318,12 +315,12 @@ impl TasksAdapter {
         let name = ChannelName::new(TASKS_CHANNEL)
             .map_err(|e| CortexAdapterError::Redex(RedexError::Channel(e.to_string())))?;
 
-        // Pre-load the snapshot's persisted counter into the shared
-        // atomic. Pre-fix the typed adapter then walked the post-
-        // `last_seq` tail synchronously to bump the counter past any
-        // events written between snapshot capture and close. Now the
-        // wrapper fold does that work as part of its replay pass,
-        // avoiding the doubled IO/CPU (BUG #148).
+        // Pre-load the snapshot's persisted counter into the
+        // shared atomic. The wrapper fold then advances the
+        // counter past any events written between snapshot capture
+        // and close as part of its replay pass. A separate
+        // synchronous post-`last_seq` tail walk would double IO/CPU
+        // on large logs.
         let app_seq = Arc::new(AtomicU64::new(payload.app_seq));
         let fold = WatermarkingFold::new(TasksFold, app_seq.clone(), origin_hash);
         let inner = CortexAdapter::open_from_snapshot(
@@ -356,46 +353,42 @@ impl TasksAdapter {
     /// Build the `EventEnvelope` + ingest. Keeps postcard serialization
     /// and `EventMeta` assembly in one place.
     ///
-    /// BUG #126: pre-fix this called `app_seq.fetch_add(1, ...)`
-    /// FIRST, then `inner.ingest`. If `inner.ingest` failed (closed
-    /// adapter, RedEX append error, fold error under `Stop` policy),
-    /// the local counter was permanently advanced past a `seq_or_ts`
-    /// that never made it to the log. The next snapshot persisted
-    /// the higher counter; on restore, future ingests picked up at
-    /// the inflated value, leaving a permanent gap (and producing
-    /// `seq_or_ts` collisions when a second adapter sharing the
-    /// same `origin_hash` recovered via on-disk scan).
-    ///
-    /// Now: load the current counter, build the envelope at that
-    /// BUG #126 + dual-model regression fix.
-    ///
     /// `app_seq` is reserved with a single atomic `fetch_add`
     /// before constructing the `EventEnvelope`. `inner.ingest`
     /// then commits the envelope to the Redex log. If the ingest
     /// fails, the reserved seq is "lost" — i.e. the per-origin
     /// `seq_or_ts` space has a one-unit gap — which is harmless:
     ///
-    ///   * `WatermarkingFold` (BUG #148) advances via `fetch_max`
-    ///     against events that actually landed in the log. The
-    ///     gap from a failed ingest is invisible to the watermark.
+    ///   * `WatermarkingFold` advances via `fetch_max` against
+    ///     events that actually landed in the log. The gap from
+    ///     a failed ingest is invisible to the watermark.
     ///   * The next successful ingest gets a strictly-larger seq,
     ///     so no duplicate is ever stamped.
     ///   * `seq_or_ts` is not required to be contiguous — it's a
     ///     monotonic per-origin tag, nothing more.
     ///
-    /// **Why not load + ingest + CAS-commit?** That shape was the
-    /// pre-regression BUG #126 fix, but it races against the
-    /// `WatermarkingFold` task: when the fold processes the
-    /// just-ingested event before the foreground thread's CAS
-    /// runs, the watermark advances to the expected post-CAS
-    /// value, the CAS observes the now-stale `app_seq` mismatch,
-    /// and surfaces a phantom `concurrent ingest_typed produced
-    /// duplicate app_seq` error even though no actual duplicate
-    /// happened. Single-adapter timing usually had the foreground
-    /// CAS running first; dual-adapter timing (memories + tasks
-    /// under one NetDb) gave the fold task enough head-room to
-    /// land first and the bug surfaced deterministically. The
-    /// race is in the protocol: `fetch_add` sidesteps it.
+    /// **Why not load + ingest + CAS-commit?** That shape races
+    /// against the `WatermarkingFold` task: when the fold
+    /// processes the just-ingested event before the foreground
+    /// thread's CAS runs, the watermark advances to the expected
+    /// post-CAS value, the CAS observes the now-stale `app_seq`
+    /// mismatch, and surfaces a phantom "concurrent ingest_typed
+    /// produced duplicate app_seq" error even though no actual
+    /// duplicate happened. Single-adapter timing usually has the
+    /// foreground CAS running first; dual-adapter timing (memories
+    /// + tasks under one NetDb) gives the fold task enough
+    /// head-room to land first and the bug surfaces
+    /// deterministically. The race is in the protocol: `fetch_add`
+    /// sidesteps it.
+    ///
+    /// **Why not `fetch_add` then ingest unconditionally?** A
+    /// failing ingest must not permanently advance the local
+    /// counter past a `seq_or_ts` that never made it to the log
+    /// — the next snapshot would persist the higher counter, and
+    /// on restore, future ingests would pick up at the inflated
+    /// value, leaving a permanent gap (and producing `seq_or_ts`
+    /// collisions when a second adapter sharing the same
+    /// `origin_hash` recovered via on-disk scan).
     fn ingest_typed<T: serde::Serialize>(
         &self,
         dispatch: u8,

@@ -1523,28 +1523,28 @@ impl CapabilityIndex {
 
     /// Index a capability announcement.
     ///
-    /// BUG #110: pre-fix this never called `ann.is_expired()` and
-    /// stored `ttl: Duration::from_secs(ann.ttl_secs)` from
-    /// `Instant::now()`, making the index entry alive for
-    /// `ttl_secs` seconds *from local indexing time*, not from
-    /// origin time. An attacker who saved an old (still
-    /// cryptographically valid) announcement could replay it to
-    /// a fresh node and get the stale capabilities reinstated
-    /// with a fresh local lease — useful for re-introducing a
-    /// model/tag/scope an operator deliberately removed, or an
-    /// old `reflex_addr` to misdirect NAT traversal.
-    ///
-    /// Now: reject `is_expired()` up-front, and when computing
-    /// the entry's TTL, take the lesser of "now + ttl_secs" and
+    /// Rejects `is_expired()` up-front, and when computing the
+    /// entry's TTL, takes the lesser of "now + ttl_secs" and
     /// "origin_timestamp + ttl_secs" so a clock-skew or replay
     /// scenario doesn't extend the announcement's effective
     /// lifetime past what the origin signed.
+    ///
+    /// Without these checks, the index would happily accept an
+    /// old (still cryptographically valid) announcement and store
+    /// `ttl: Duration::from_secs(ann.ttl_secs)` from
+    /// `Instant::now()`, making the index entry alive for
+    /// `ttl_secs` seconds *from local indexing time*. An attacker
+    /// could replay a saved announcement to a fresh node and get
+    /// the stale capabilities reinstated with a fresh local
+    /// lease — useful for re-introducing a model/tag/scope an
+    /// operator deliberately removed, or an old `reflex_addr` to
+    /// misdirect NAT traversal.
     pub fn index(&self, ann: CapabilityAnnouncement) {
-        // Reject already-expired announcements (BUG #110), but
-        // exempt the legitimate `ttl_secs == 0` "announce-and-
-        // forget" diagnostic case — those are intentionally
-        // short-lived and the next `gc()` sweep evicts them
-        // (see `gc_evicts_entries_with_ttl_zero`).
+        // Reject already-expired announcements, but exempt the
+        // legitimate `ttl_secs == 0` "announce-and-forget"
+        // diagnostic case — those are intentionally short-lived
+        // and the next `gc()` sweep evicts them (see
+        // `gc_evicts_entries_with_ttl_zero`).
         if ann.ttl_secs > 0 && ann.is_expired() {
             return;
         }
@@ -1576,8 +1576,8 @@ impl CapabilityIndex {
         // Add to inverted indexes
         self.add_to_indexes(node_id, &ann.capabilities);
 
-        // BUG #110: cap the local TTL by the origin's remaining
-        // lifetime. `origin_remaining_ns = ann.timestamp_ns +
+        // Cap the local TTL by the origin's remaining lifetime.
+        // `origin_remaining_ns = ann.timestamp_ns +
         // ttl_secs*1e9 - now_ns`. If positive, that's the
         // remaining lifetime according to the origin. The local
         // TTL is `min(local_ttl, origin_remaining)` so a replayed

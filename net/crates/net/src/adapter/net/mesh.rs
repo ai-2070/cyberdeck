@@ -129,13 +129,14 @@ pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
 /// Cancellation-safe rollback for a freshly registered peer
 /// session + addr map + routing entry.
 ///
-/// `handle_routed_handshake` (BUG #87) used to spawn a fire-and-
-/// forget `tokio::spawn` whose only rollback was inside the spawned
-/// future's error arm. If that future was cancelled (runtime
-/// shutdown, parent task abort) before the send completed, the
-/// rollback never ran and the responder kept session keys the
-/// initiator never received the matching msg2 for — wedged forever
-/// with no idle sweeper to reap it.
+/// `handle_routed_handshake` schedules its msg2 send on a
+/// background task, so the rollback path must survive task drop.
+/// A fire-and-forget `tokio::spawn` whose only rollback was inside
+/// the spawned future's error arm would skip the rollback if that
+/// future was cancelled (runtime shutdown, parent task abort)
+/// before the send completed — the responder would keep session
+/// keys the initiator never received the matching msg2 for,
+/// wedged forever with no idle sweeper to reap it.
 ///
 /// This guard moves the rollback into `Drop`, which runs
 /// synchronously whenever the spawned future is dropped. The
@@ -220,15 +221,17 @@ struct DispatchCtx {
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
     /// In-flight DIRECT initiator handshakes, keyed by the peer's
-    /// socket address. Closes BUG #86: pre-fix, `try_handshake_initiator`
-    /// polled `socket_arc.recv_from` directly, racing the dispatch
-    /// receive loop after `start()` had spawned it. Tokio dispatches
-    /// each datagram to exactly one waiter, so the handshake
-    /// response could be swallowed by either side. Now the initiator
-    /// registers a oneshot here BEFORE sending msg1; the dispatch
-    /// loop's direct-handshake branch looks up the source, forwards
-    /// the parsed payload bytes through the oneshot, and removes
-    /// the entry. If no entry matches the source (e.g., the
+    /// socket address. The initiator registers a oneshot here
+    /// BEFORE sending msg1; the dispatch loop's direct-handshake
+    /// branch looks up the source, forwards the parsed payload
+    /// bytes through the oneshot, and removes the entry.
+    ///
+    /// Polling `socket_arc.recv_from` directly from
+    /// `try_handshake_initiator` would race the dispatch receive
+    /// loop spawned by `start()` — tokio dispatches each datagram
+    /// to exactly one waiter, so the handshake response could be
+    /// swallowed by either side. If no entry matches the source
+    /// (e.g., the
     /// responder side or pre-start invocations), the dispatcher
     /// falls through to its drop-direct-handshake behaviour.
     pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
@@ -1004,8 +1007,8 @@ pub struct MeshNode {
     /// In-flight direct-handshake initiators, keyed by the peer's
     /// `SocketAddr`. Populated by `try_handshake_initiator` BEFORE
     /// sending msg1; consumed by the dispatch loop when a matching
-    /// direct handshake response arrives. Closes BUG #86 — see
-    /// the matching field on `DispatchCtx` for context.
+    /// direct handshake response arrives. See the matching field
+    /// on `DispatchCtx` for context.
     pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
     /// Proximity graph — topology awareness from pingwave propagation
     proximity_graph: Arc<ProximityGraph>,
@@ -1214,15 +1217,15 @@ pub struct MeshNode {
     shutdown_notify: Arc<Notify>,
     /// Whether the node has been started
     started: AtomicBool,
-    /// CR-7 / Cubic P1: number of `accept()` calls currently
-    /// awaiting `handshake_responder`. The pre-CR-7 guard
-    /// (`started.load(Acquire)` at `accept` entry) was a TOCTOU
-    /// — `start()` could fire between the check and the
-    /// `handshake_responder` poll, after which the dispatcher
-    /// would race the responder for inbound msg1 packets and
-    /// silently swallow them. The counter closes the race:
-    /// `accept()` increments on entry, decrements on exit, and
-    /// `start()` refuses while any `accept()` is in flight.
+    /// Number of `accept()` calls currently awaiting
+    /// `handshake_responder`. A simple `started.load(Acquire)`
+    /// guard at `accept` entry is a TOCTOU — `start()` could fire
+    /// between the check and the `handshake_responder` poll, after
+    /// which the dispatcher would race the responder for inbound
+    /// msg1 packets and silently swallow them. The counter closes
+    /// the race: `accept()` increments on entry, decrements on
+    /// exit, and `start()` refuses while any `accept()` is in
+    /// flight.
     accept_in_flight: std::sync::atomic::AtomicUsize,
 }
 
@@ -1778,7 +1781,7 @@ impl MeshNode {
     /// Waits for an incoming handshake packet and completes the handshake.
     /// Returns the peer's address and assigns the given node_id.
     ///
-    /// # Ordering contract (CR-7)
+    /// # Ordering contract
     ///
     /// `accept()` MUST be called before [`Self::start()`]. Once
     /// `start()` has spawned the dispatch loop, the dispatcher
@@ -1795,25 +1798,21 @@ impl MeshNode {
     pub async fn accept(&self, peer_node_id: u64) -> Result<(SocketAddr, u64), AdapterError> {
         use std::sync::atomic::Ordering as AtOrd;
 
-        // CR-7 + Cubic P1: race-free entry guard.
-        //
-        // Pre-Cubic-P1 this was a single `started.load(Acquire)`
-        // check, which is a TOCTOU: `start()` could fire between
-        // the check and `handshake_responder`'s recv_from, after
+        // Race-free entry guard. Increment `accept_in_flight`
+        // BEFORE checking `started`. `start()` checks
+        // `accept_in_flight` after its CAS and refuses, so the
+        // windows are ordered: accept either sees `started=true`
+        // and bails OUT (so accept_in_flight goes back to 0 and
+        // start sees 0), or `start` sees accept_in_flight > 0 and
+        // refuses to run. Reasoning is symmetric to a
+        // reader-writer SeqCst handshake: the SeqCst total order
+        // on these two atomics makes "either accept observes
+        // start and bails, or start observes accept and refuses"
+        // mutually exclusive. A bare `started.load(Acquire)` check
+        // would be a TOCTOU: `start()` could fire between the
+        // check and `handshake_responder`'s recv_from, after
         // which the dispatcher would race the responder for
         // msg1.
-        //
-        // The fix: increment `accept_in_flight` BEFORE checking
-        // `started`. `start()` checks `accept_in_flight` after
-        // its CAS and refuses (or, structurally, the windows are
-        // ordered: accept either sees `started=true` and bails
-        // OUT (so accept_in_flight goes back to 0 and start sees
-        // 0), or `start` sees accept_in_flight > 0 and refuses to
-        // run). Reasoning is symmetric to a reader-writer
-        // SeqCst handshake: the SeqCst total order on these two
-        // atomics makes "either accept observes start and bails,
-        // or start observes accept and refuses" mutually
-        // exclusive.
         //
         // RAII guard `AcceptGuard` decrements on drop so any
         // early-return (Err from handshake_responder, panic in
@@ -1833,8 +1832,7 @@ impl MeshNode {
             return Err(AdapterError::Fatal(
                 "Mesh::accept called after start() — the dispatch loop is already \
                  consuming inbound packets and would race the responder handshake. \
-                 Call accept() for every peer BEFORE invoking start(). See CR-7 / \
-                 BUG #86 for the responder-side handshake-race contract."
+                 Call accept() for every peer BEFORE invoking start()."
                     .into(),
             ));
         }
@@ -1880,17 +1878,16 @@ impl MeshNode {
     /// Must be called after `connect()` / `accept()` to begin processing
     /// inbound packets.
     ///
-    /// Cubic P1: refuses (no-op return) if any `accept()` call is
-    /// currently in flight. This closes the TOCTOU race that
-    /// `accept`'s entry guard alone could not — without this
-    /// counter check, `start` could fire between `accept`'s
-    /// `started.load` and its `handshake_responder` poll, after
-    /// which the dispatcher would race the responder for the
-    /// inbound msg1. Symmetric to `accept`'s contract: either
+    /// Refuses (no-op return) if any `accept()` call is currently
+    /// in flight. Symmetric to `accept`'s contract: either
     /// `accept` observes `started=true` and bails (in-flight
     /// count goes to 0, then `start` proceeds), or `start`
     /// observes `accept_in_flight > 0` and refuses. The SeqCst
-    /// orderings make this mutually exclusive.
+    /// orderings make this mutually exclusive. Without this
+    /// counter check, `start` could fire between `accept`'s
+    /// `started.load` and its `handshake_responder` poll, after
+    /// which the dispatcher would race the responder for the
+    /// inbound msg1.
     pub fn start(&self) {
         use std::sync::atomic::Ordering as AtOrd;
         if self.started.swap(true, AtOrd::SeqCst) {
@@ -1911,8 +1908,7 @@ impl MeshNode {
             tracing::warn!(
                 "MeshNode::start() called while an accept() is in flight — \
                  refusing to start the dispatch loop to avoid racing the \
-                 responder handshake. Retry start() after accept() returns. \
-                 (Cubic P1 / CR-7)"
+                 responder handshake. Retry start() after accept() returns."
             );
             return;
         }
@@ -2538,15 +2534,16 @@ impl MeshNode {
         };
 
         if parsed.header.flags.is_handshake() {
-            // BUG #86: pre-fix `try_handshake_initiator` polled
-            // `socket_arc.recv_from` directly, racing this
-            // dispatch loop. Tokio routes a UDP datagram to
-            // exactly one waiter — the response could be
-            // swallowed by either consumer. Now: if a direct
-            // initiator has registered an oneshot keyed by this
-            // source, forward the parsed payload bytes through
-            // it. Otherwise (no entry, e.g. responder side or
-            // unsolicited handshake) fall through to drop.
+            // If a direct initiator has registered an oneshot
+            // keyed by this source, forward the parsed payload
+            // bytes through it. Otherwise (no entry, e.g.
+            // responder side or unsolicited handshake) fall
+            // through to drop. Without this routing, polling
+            // `socket_arc.recv_from` directly from
+            // `try_handshake_initiator` would race this dispatch
+            // loop — tokio routes a UDP datagram to exactly one
+            // waiter — and the response could be swallowed by
+            // either consumer.
             if let Some((_, tx)) = ctx.pending_direct_initiators.remove(&source) {
                 let _ = tx.send(parsed.payload);
             }
@@ -2573,22 +2570,20 @@ impl MeshNode {
         };
 
         if parsed.header.flags.is_heartbeat() {
-            // BUG #85: previously this branch fast-pathed the
-            // heartbeat — touched `failure_detector` and `session`
-            // without verifying the AEAD tag. An attacker with the
-            // cleartext `session_id` (visible on every prior data
-            // packet) and the source UDP address could spoof
-            // heartbeats from `peer_addr`, indefinitely defeating
-            // session-idle timeout and injecting false
-            // `failure_detector.heartbeat(...)` notifications.
-            //
             // `verify_and_touch_heartbeat` fuses AEAD verify with
             // `session.touch()` so a future caller can't reorder
             // them or forget to touch on success — the type
-            // system enforces verify-then-touch atomically. The
-            // failure-detector callback is mesh-specific (legacy
-            // adapter has no such observer) and stays here, after
-            // a successful verify.
+            // system enforces verify-then-touch atomically.
+            // Fast-pathing the heartbeat without verifying the
+            // AEAD tag would let an attacker with the cleartext
+            // `session_id` (visible on every prior data packet)
+            // and the source UDP address spoof heartbeats from
+            // `peer_addr`, indefinitely defeating session-idle
+            // timeout and injecting false
+            // `failure_detector.heartbeat(...)` notifications.
+            // The failure-detector callback is mesh-specific
+            // (legacy adapter has no such observer) and stays
+            // here, after a successful verify.
             if !session.verify_and_touch_heartbeat(&parsed) {
                 return;
             }
@@ -2771,20 +2766,18 @@ impl MeshNode {
         // `peer_node_id` already installed a newer (valid) route, we must
         // not overwrite it.
         //
-        // BUG #87: previously this was a fire-and-forget `tokio::spawn`
-        // whose only rollback fired from inside the spawned future on
-        // socket-send error. If the runtime was shutting down or the
-        // spawned task was cancelled before the send completed, the
-        // rollback never ran and the peer/session/route survived in an
-        // unsendable state — the responder held session keys the
-        // initiator never received the matching msg2 for, with no idle
-        // sweeper to reap unsendable peer entries. Now: a Drop guard
-        // owns the rollback. The send marks the guard `completed` only
-        // on success; cancellation, panic, or any non-success drops the
-        // guard, which runs the rollback. Drop is invoked synchronously
-        // when the spawned future is dropped (whether by cancellation
-        // or normal completion), so the rollback is no longer dependent
-        // on the future actually awaiting through to its error arm.
+        // A Drop guard owns the rollback. The send marks the
+        // guard `completed` only on success; cancellation, panic,
+        // or any non-success drops the guard, which runs the
+        // rollback. Drop is invoked synchronously when the spawned
+        // future is dropped (whether by cancellation or normal
+        // completion), so the rollback is no longer dependent on
+        // the future actually awaiting through to its error arm.
+        // A fire-and-forget `tokio::spawn` with rollback only
+        // inside the spawned future on socket-send error would
+        // skip the rollback if the runtime was shutting down or
+        // the task was cancelled before the send completed,
+        // leaving the peer/session/route in an unsendable state.
         let socket = ctx.socket.clone();
         let payload = routed.freeze();
         let guard = PeerRegistrationGuard {
@@ -2866,15 +2859,14 @@ impl MeshNode {
             if let Some(handler) = handler_guard.as_ref() {
                 // Extract the payload(s) from the event frame wrapper.
                 //
-                // CR-8: pre-fix used `events.into_iter().next()` —
-                // dropping every payload past the first. The
-                // protocol design is single-event-per-frame, but
-                // the wire format permits multi-event, so a hostile
-                // (or buggy) peer batching multiple migration
-                // messages into one frame would silently lose
-                // every message past the first. We now iterate
-                // and log a warning for the (anomalous) multi-event
-                // case so operators see the protocol violation
+                // Iterate every event in the frame and log a
+                // warning for the (anomalous) multi-event case.
+                // The protocol design is single-event-per-frame,
+                // but the wire format permits multi-event — a
+                // hostile (or buggy) peer batching multiple
+                // migration messages into one frame must not
+                // silently lose every message past the first;
+                // operators need to see the protocol violation
                 // rather than a silent stall.
                 let events =
                     EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
@@ -2905,16 +2897,17 @@ impl MeshNode {
                             // loopback short-circuit is the only way a
                             // self-destined wire message gets dispatched.
                             //
-                            // Regression (Cubic-AI P1): the earlier
-                            // implementation `tokio::spawn`ed each
-                            // loopback with a fire-and-forget closure,
-                            // discarding `handle_message`'s return value.
-                            // Any outbound produced by the loopback —
-                            // including remote-bound messages that should
-                            // have ridden the wire — disappeared, wedging
-                            // state transitions whenever a self-bounce
-                            // chained into a further reply. The in-place
-                            // queue preserves all downstream messages.
+                            // The in-place queue preserves all
+                            // downstream messages. A
+                            // `tokio::spawn`ed fire-and-forget
+                            // loopback would discard
+                            // `handle_message`'s return value,
+                            // and any outbound it produced —
+                            // including remote-bound messages
+                            // that should have ridden the wire —
+                            // would disappear, wedging state
+                            // transitions whenever a self-bounce
+                            // chained into a further reply.
                             //
                             // Handler work is synchronous and cheap; doing
                             // it on the receive-loop task is fine.
@@ -2969,7 +2962,7 @@ impl MeshNode {
                             tracing::warn!(error = %e, "migration handler error");
                         }
                     }
-                } // end CR-8 for payload in events
+                } // end multi-event payload loop
                 return; // handler processed it
             }
             // No handler set — synthesize a `ComputeNotSupported`
@@ -2981,11 +2974,10 @@ impl MeshNode {
             // mid-migration, and a migration can't be mid-state
             // against a node that has no compute runtime.
             //
-            // CR-8: iterate every event in the frame so a
-            // multi-event migration packet (protocol violation, but
-            // possible on the wire) gets one reply per request
-            // rather than one for the first and silent drops for
-            // the rest.
+            // Iterate every event in the frame so a multi-event
+            // migration packet (protocol violation, but possible
+            // on the wire) gets one reply per request rather than
+            // one for the first and silent drops for the rest.
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
             for payload in events {
                 if let Some(reply) = synthesize_compute_not_supported_reply(&payload) {
@@ -3026,16 +3018,15 @@ impl MeshNode {
         // queue. The grant payload is an event frame carrying a
         // 12-byte `StreamWindow` message.
         //
-        // BUG #147: pre-fix this used `events.into_iter().next()`,
-        // dropping every grant past the first when a peer batched
-        // multiple stream credits into one event-frame packet (the
+        // Iterate the full event vector and apply each grant. The
         // codec supports multi-event frames, and `StreamWindow` is
-        // fixed-size at 16 bytes — there's no codec ambiguity).
-        // The dropped grants stalled their streams until the
-        // sender retransmitted; `apply_authoritative_grant` is
-        // monotonic so retransmits eventually caught up
-        // (efficiency loss, not data loss). Now we iterate the
-        // full event vector and apply each grant.
+        // fixed-size at 16 bytes — there's no codec ambiguity.
+        // Using `events.into_iter().next()` would drop every
+        // grant past the first when a peer batched multiple
+        // stream credits into one event-frame packet, stalling
+        // those streams until the sender retransmitted
+        // (`apply_authoritative_grant` is monotonic so retransmits
+        // eventually catch up — efficiency loss, not data loss).
         if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_WINDOW {
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
             for payload in events {
@@ -3070,11 +3061,12 @@ impl MeshNode {
 
         // Channel membership: Subscribe / Unsubscribe / Ack.
         //
-        // CR-8: pre-fix used `events.into_iter().next()`, dropping
-        // every membership op past the first when a peer batched
-        // multiple Subscribe/Unsubscribe events into one frame.
-        // Each membership op is independent and idempotent on the
-        // receiver, so iterating is structurally safe.
+        // Iterate every event in the frame. `events.into_iter()
+        // .next()` would drop every membership op past the first
+        // when a peer batched multiple Subscribe/Unsubscribe
+        // events into one frame. Each membership op is
+        // independent and idempotent on the receiver, so
+        // iterating is structurally safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_CHANNEL_MEMBERSHIP {
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
             if events.is_empty() {
@@ -3096,12 +3088,12 @@ impl MeshNode {
         // Capability announcement: signed, versioned capability metadata.
         // Feeds the local `CapabilityIndex`; never responded to.
         //
-        // CR-8: pre-fix used `events.into_iter().next()`, dropping
-        // every announcement past the first when a peer batched
-        // multiple capability updates into one frame. Each
-        // announcement is independently signed and version-skip
-        // safe on the index side, so iterating is structurally
-        // safe.
+        // Iterate every event in the frame. `events.into_iter()
+        // .next()` would drop every announcement past the first
+        // when a peer batched multiple capability updates into
+        // one frame. Each announcement is independently signed
+        // and version-skip safe on the index side, so iterating
+        // is structurally safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_CAPABILITY_ANN {
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
             if events.is_empty() {
@@ -3142,12 +3134,12 @@ impl MeshNode {
                 return;
             }
 
-            // CR-8: iterate every event in the frame. Pre-fix the
-            // dispatcher used `events.into_iter().next()` and
-            // dropped every reflex message past the first when a
-            // peer batched multiple probes into one packet.
-            // Reflex Request/Response are each independent so
-            // multi-event handling is structurally safe.
+            // Iterate every event in the frame.
+            // `events.into_iter().next()` would drop every reflex
+            // message past the first when a peer batched multiple
+            // probes into one packet. Reflex Request/Response are
+            // each independent so multi-event handling is
+            // structurally safe.
             for payload in events {
                 let Some(msg) = reflex::decode(&payload) else {
                     continue;
@@ -3233,13 +3225,13 @@ impl MeshNode {
                 return;
             }
 
-            // CR-8: iterate every event in the frame. Pre-fix the
-            // dispatcher used `events.into_iter().next()` and
-            // dropped every rendezvous message past the first when
-            // a peer batched PunchRequest/PunchIntroduce/PunchAck
-            // into one packet. Each is independent — no cross-event
-            // ordering dependency — so multi-event handling is
-            // structurally safe.
+            // Iterate every event in the frame.
+            // `events.into_iter().next()` would drop every
+            // rendezvous message past the first when a peer
+            // batched PunchRequest / PunchIntroduce / PunchAck
+            // into one packet. Each is independent — no
+            // cross-event ordering dependency — so multi-event
+            // handling is structurally safe.
             for payload in events {
                 let Some(msg) = rendezvous::decode(&payload) else {
                     continue;
@@ -3486,29 +3478,19 @@ impl MeshNode {
                                 continue;
                             }
                             let session = &entry.value().session;
-                            // BUG #97: previously this constructed
-                            // a fresh `PacketBuilder::new(&[0u8;
-                            // 32], session.session_id())` for each
-                            // heartbeat. Two compounding problems:
-                            //
-                            // (a) the all-zero key didn't match
-                            //     the session's RX key — so every
-                            //     heartbeat tag would have failed
-                            //     AEAD verify. Pre-#85-fix the
-                            //     receiver didn't verify; the bug
-                            //     was latent.
-                            // (b) each fresh builder owned a
-                            //     fresh `tx_counter` starting at
-                            //     0, so successive heartbeats
-                            //     reused counter=0 — the receiver
-                            //     would accept the first and
-                            //     reject every subsequent one as
-                            //     a replay.
-                            //
                             // `Session::build_heartbeat` routes
                             // through `thread_local_pool` (same
-                            // pool the data path uses) so heartbeats
-                            // and data share a single `tx_counter`.
+                            // pool the data path uses) so
+                            // heartbeats and data share a single
+                            // `tx_counter`. Constructing a fresh
+                            // `PacketBuilder::new(&[0u8; 32],
+                            // session.session_id())` per heartbeat
+                            // would (a) use the wrong key so the
+                            // receiver's AEAD verify would reject
+                            // every tag, and (b) reuse counter=0
+                            // across heartbeats so the replay
+                            // window would reject every heartbeat
+                            // after the first.
                             let packet = session.build_heartbeat();
                             let _ = socket.send_to(&packet, peer_addr).await;
                             // Pingwave (raw UDP — not encrypted, topology is public)
@@ -5346,8 +5328,8 @@ impl MeshNode {
         // set/clear/commit could interleave between our reads
         // and let us publish a torn state — e.g., the new
         // override's reflex paired with the pre-override NAT
-        // class. Cubic P1. The lock is held only for the two
-        // atomic reads, not across the signing or network send.
+        // class. The lock is held only for the two atomic reads,
+        // not across the signing or network send.
         #[cfg(feature = "nat-traversal")]
         let (caps, reflex_snapshot) = {
             use super::traversal::classify::NatClass;
@@ -5458,7 +5440,7 @@ impl MeshNode {
         let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
         // See doc-comment: without a policy, an unresolvable
-        // "unknown" cannot be admitted as same-subnet (Cubic P1).
+        // "unknown" cannot be admitted as same-subnet.
         let policy_installed = self.local_subnet_policy.is_some();
         self.capability_index
             .find_nodes_scoped(filter, scope, |nid| {
@@ -5623,10 +5605,10 @@ impl MeshNode {
         // short-circuit (session is already on the path we want)
         // vs. re-handshake to upgrade (session exists but on the
         // wrong path — typically a relayed session that a fresh
-        // direct/punched attempt should replace). Cubic P1
-        // flagged that unconditionally short-circuiting on any
-        // existing session left callers stuck on the relay
-        // forever, defeating the optimization.
+        // direct/punched attempt should replace).
+        // Unconditionally short-circuiting on any existing session
+        // would leave callers stuck on the relay forever,
+        // defeating the optimization.
         let session_matches = |want_addr: std::net::SocketAddr| {
             self.peers
                 .get(&peer_node_id)
@@ -5653,14 +5635,13 @@ impl MeshNode {
         // circuits only when an existing session is already on
         // exactly that coordinator's path. An unrelated session
         // (stale, dead, on a different hop) is NOT treated as
-        // success — Cubic P1 flagged that `contains_key`-based
-        // short-circuit here would mask a failed direct attempt
-        // behind whatever stale session happened to still be in
-        // the peers map, so `connect_direct` reported "success"
-        // without actually establishing the intended path. The
-        // handshake runs unless we can confirm the existing
-        // session is already the one this call was asked to
-        // resolve.
+        // success — a `contains_key`-based short-circuit here
+        // would mask a failed direct attempt behind whatever
+        // stale session happened to still be in the peers map,
+        // so `connect_direct` would report "success" without
+        // actually establishing the intended path. The handshake
+        // runs unless we can confirm the existing session is
+        // already the one this call was asked to resolve.
         let connect_via_coordinator = |coord_addr: std::net::SocketAddr| async move {
             if session_matches(coord_addr) {
                 return Ok(peer_node_id);
@@ -5681,17 +5662,17 @@ impl MeshNode {
                 // `dest == self` and completes locally. Only
                 // when that direct attempt fails do we try the
                 // routing table's first-hop as a fallback
-                // (pingwave-installed routes, etc.). Cubic P2:
-                // the earlier implementation always went via
-                // the routing table, which added an unnecessary
-                // relay hop when a direct path was available.
+                // (pingwave-installed routes, etc.). Always
+                // going via the routing table would add an
+                // unnecessary relay hop when a direct path is
+                // available.
                 //
-                // Stats note (cubic P1): `record_relay_fallback`
-                // fires only when we actually fall back to the
-                // routed path — not on entry. A successful
-                // direct connect is not a fallback; attributing
-                // it as one breaks `TraversalStats.relay_fallbacks`'s
-                // documented meaning ("ended up on the routed-
+                // Stats note: `record_relay_fallback` fires only
+                // when we actually fall back to the routed path
+                // — not on entry. A successful direct connect is
+                // not a fallback; attributing it as one breaks
+                // `TraversalStats.relay_fallbacks`'s documented
+                // meaning ("ended up on the routed-
                 // handshake path") and makes the counter useless
                 // for assessing NAT-traversal effectiveness.
                 // `Direct` is the one branch that genuinely

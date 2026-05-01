@@ -359,23 +359,21 @@ impl EndpointState {
 
     /// Returns true if new requests should be rejected for this endpoint.
     ///
-    /// **Pure predicate** (BUG #101): post-fix, this method has no
-    /// side effects. The half-open probe slot is claimed lazily at
-    /// selection time via [`try_claim_half_open_probe`] — only the
-    /// endpoint actually chosen by the selector claims the probe,
-    /// preventing the N-1 leaked-slot scenario the audit
-    /// described.
+    /// **Pure predicate** — this method has no side effects. The
+    /// half-open probe slot is claimed lazily at selection time
+    /// via [`try_claim_half_open_probe`], so only the endpoint
+    /// actually chosen by the selector claims the probe.
     ///
-    /// Pre-fix this method had two roles: it tested whether the
-    /// circuit was open AND CAS-claimed the half-open probe slot
-    /// when the recovery window had elapsed. Since
-    /// `get_available_endpoints` calls this for every endpoint
-    /// being filtered, a multi-endpoint outage past its recovery
-    /// window had every endpoint claim the probe slot in the
-    /// scan, while only one (or zero) was selected. The N-1
-    /// others held a `half_open_probe == true` with no in-flight
-    /// request and no completion path — every subsequent
-    /// `is_circuit_open` then returned true forever.
+    /// Conflating "is the circuit open?" with "CAS-claim the
+    /// half-open probe slot when the recovery window has elapsed"
+    /// would let `get_available_endpoints` claim the probe slot
+    /// for every endpoint it filters. A multi-endpoint outage past
+    /// its recovery window would then have every endpoint claim
+    /// the probe slot in the scan while only one (or zero) was
+    /// selected. The N-1 others would hold
+    /// `half_open_probe == true` with no in-flight request and no
+    /// completion path — every subsequent `is_circuit_open` would
+    /// return true forever.
     fn is_circuit_open(&self, recovery_time: Duration) -> bool {
         if !self.circuit_open.load(Ordering::Acquire) {
             return false;
@@ -398,8 +396,8 @@ impl EndpointState {
 
     /// Try to claim the half-open probe slot.
     ///
-    /// CR-19: returns an [`Option<ProbeGuard<'_>>`]; the `Some`
-    /// arm carries an RAII guard whose `Drop` releases the slot
+    /// Returns an [`Option<ProbeGuard<'_>>`]; the `Some` arm
+    /// carries an RAII guard whose `Drop` releases the slot
     /// automatically. Callers that successfully drive the request
     /// to completion MUST invoke [`ProbeGuard::commit`] before
     /// dispatching to the network — `record_completion` is then
@@ -417,8 +415,6 @@ impl EndpointState {
     /// → release window is a few atomic ops; the borrow checker
     /// forbids holding a `ProbeGuard<'_>` across the dashmap
     /// `Ref`'s `drop(state)` boundary in that loop.
-    ///
-    /// Closes BUG #101 / CR-19.
     #[allow(dead_code)]
     fn try_claim_half_open_probe(&self) -> Option<ProbeGuard<'_>> {
         self.half_open_probe
@@ -428,16 +424,16 @@ impl EndpointState {
     }
 
     /// Release the half-open probe slot without recording a
-    /// completion outcome. CR-19 prefers [`ProbeGuard`]'s Drop
-    /// for routine release; this method exists for paths where
-    /// the slot must be cleared via direct atomic write (e.g.
+    /// completion outcome. Prefer [`ProbeGuard`]'s Drop for
+    /// routine release; this method exists for paths where the
+    /// slot must be cleared via direct atomic write (e.g.
     /// `record_completion` once the breaker fully reopens).
     fn release_half_open_probe(&self) {
         self.half_open_probe.store(false, Ordering::Release);
     }
 }
 
-/// CR-19: RAII guard returned by
+/// RAII guard returned by
 /// [`EndpointState::try_claim_half_open_probe`]. The Drop impl
 /// clears the `half_open_probe` slot UNLESS [`Self::commit`] was
 /// called first (which `mem::forget`-equivalent the guard, so
@@ -455,8 +451,8 @@ impl EndpointState {
 /// // ... dispatch ...
 /// ```
 ///
-/// Pre-CR-19 the success vs failure path was tracked by a `bool`
-/// plus a manual `release_half_open_probe` at every fall-through —
+/// Tracking the success vs failure path with a `bool` plus a
+/// manual `release_half_open_probe` at every fall-through is
 /// easy to miss on a future-cancel where neither `Ok` nor `Err`
 /// runs to completion.
 #[allow(dead_code)]
@@ -787,40 +783,39 @@ impl LoadBalancer {
             // Atomically reserve the connection slot. If a concurrent
             // selector filled the cap, re-run selection against fresh state.
             if let Some(state) = self.endpoints.get(&selection.node_id) {
-                // BUG #101: claim the half-open probe slot ONLY on
-                // the endpoint we actually selected, AFTER the
+                // Claim the half-open probe slot ONLY on the
+                // endpoint we actually selected, AFTER the
                 // pure-predicate `is_circuit_open` check has
                 // already admitted the endpoint into `available`.
-                // This prevents the filter-time slot-leak the
-                // pre-fix code had on multi-endpoint outages.
+                // Claiming during the filter pass would leak slots
+                // on multi-endpoint outages.
                 //
-                // Cubic-ai P1: when `circuit_open == true`, the
-                // half-open probe claim is the HARD GATE — losers
-                // of the CAS race must NOT proceed through
-                // `try_record_request`. Pre-fix, a concurrent
+                // When `circuit_open == true`, the half-open probe
+                // claim is the HARD GATE — losers of the CAS race
+                // must NOT proceed through `try_record_request`.
+                // Without strict half-open semantics, a concurrent
                 // selector that observed `half_open_probe == false`
-                // at filter time but lost the claim CAS still rode
-                // the connection-cap path through and sent real
-                // traffic to a recovering endpoint alongside the
-                // actual probe. Strict half-open semantics: only
-                // the thread that wins the probe-slot CAS may test
-                // the endpoint; everyone else skips and retries
-                // selection. With the slot now claimed (by
-                // whoever won), the next iteration's
-                // `get_available_endpoints` sees
+                // at filter time but lost the claim CAS could still
+                // ride the connection-cap path through and send
+                // real traffic to a recovering endpoint alongside
+                // the actual probe. Only the thread that wins the
+                // probe-slot CAS may test the endpoint; everyone
+                // else skips and retries selection. With the slot
+                // now claimed (by whoever won), the next
+                // iteration's `get_available_endpoints` sees
                 // `half_open_probe == true` and filters this
                 // endpoint out — losers naturally pick a different
                 // endpoint or surface `NoEndpointsAvailable` if
                 // this was the only option.
                 let circuit_open = state.circuit_open.load(Ordering::Acquire);
-                // CR-19: the new `ProbeGuard` RAII type is the
-                // preferred API for future async callers (where
-                // the request future may panic / cancel between
-                // claim and `record_completion`, leaking the slot
-                // without a guard). At THIS synchronous selection
-                // callsite, the guard's lifetime is tied to the
-                // dashmap `Ref` we hold via `state`; carrying it
-                // across the `drop(state); continue;` path the
+                // The `ProbeGuard` RAII type is the preferred API
+                // for future async callers (where the request
+                // future may panic / cancel between claim and
+                // `record_completion`, leaking the slot without a
+                // guard). At THIS synchronous selection callsite,
+                // the guard's lifetime is tied to the dashmap
+                // `Ref` we hold via `state`; carrying it across
+                // the `drop(state); continue;` path the
                 // lost-race branch needs is forbidden by the
                 // borrow checker. Since this loop is fully
                 // synchronous (a few atomic ops between claim
@@ -830,8 +825,8 @@ impl LoadBalancer {
                 // practice — the only ops between claim and
                 // release are atomic loads / stores that don't
                 // unwind. We use a direct CAS here rather than
-                // `try_claim_half_open_probe` so we don't have
-                // to immediately drop the guard returned by it.
+                // `try_claim_half_open_probe` so we don't have to
+                // immediately drop the guard returned by it.
                 let claimed_probe = if circuit_open {
                     let claim_ok = state
                         .half_open_probe
@@ -1314,15 +1309,15 @@ impl LoadBalancer {
 
 /// Generate random usize.
 ///
-/// CR-21 / BUG #150: aborts on `getrandom` failure rather than
-/// panic-unwinding through the FFI boundary. Load-balance random
-/// numbers are not directly auth-bearing, but this function is
-/// reachable from hot paths called by `extern "C"` FFI consumers
-/// (Python / Node / Go bindings) — a `getrandom` failure would
-/// otherwise unwind across the C ABI = undefined behaviour.
-/// `process::abort` is `extern "C"`-safe (terminates rather than
-/// unwinds) and loss-of-availability is the only safe response
-/// when the system can't produce randomness.
+/// Aborts on `getrandom` failure rather than panic-unwinding
+/// through the FFI boundary. Load-balance random numbers are not
+/// directly auth-bearing, but this function is reachable from hot
+/// paths called by `extern "C"` FFI consumers (Python / Node / Go
+/// bindings) — a `getrandom` failure that unwound across the C
+/// ABI would be undefined behaviour. `process::abort` is
+/// `extern "C"`-safe (terminates rather than unwinds) and
+/// loss-of-availability is the only safe response when the system
+/// can't produce randomness.
 fn random_usize() -> usize {
     let mut bytes = [0u8; 8];
     if let Err(e) = getrandom::fill(&mut bytes) {
