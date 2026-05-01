@@ -193,6 +193,16 @@ jobs:
         with:
           path: net/crates/net/bindings/node/artifacts
 
+      # `napi artifacts` writes each `*.node` into `npm/<platform>/`,
+      # but expects those subdirectories to already exist. They're
+      # normally created once by `napi create-npm-dirs` and committed
+      # to the repo; whenever a new target lands in
+      # `package.json`'s `napi.targets`, the corresponding sub-dir
+      # is missing. Run create-npm-dirs in CI so the per-platform
+      # scaffolding is always in lockstep with `napi.targets`.
+      - name: Create per-platform npm dirs
+        run: npx napi create-npm-dirs
+
       - name: Move artifacts
         run: npm run artifacts
 
