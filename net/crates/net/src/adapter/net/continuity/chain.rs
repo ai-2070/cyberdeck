@@ -650,6 +650,70 @@ mod tests {
         }
     }
 
+    /// A caller who passes the right `chain_link` but forgets to
+    /// populate `head_payload` (leaves it as `Bytes::new()`) MUST
+    /// NOT silently bypass the anchor check. The `assess_continuity`
+    /// doc explicitly warns: "callers anchoring a real post-restore
+    /// log MUST populate `head_payload` first." Pin that contract so
+    /// a future "be lenient on missing payload" change can't slip
+    /// through and let any snapshot with a correct `through_seq` +
+    /// `chain_link` anchor a log whose actual seq-(through_seq)
+    /// payload was non-empty (which is the realistic case — empty
+    /// payloads are rare).
+    ///
+    /// Mechanism: the expected anchor hash is
+    /// `xxh3(chain_link ++ head_payload)`. The log's seq-11
+    /// `parent_hash` was computed against the REAL seq-10 payload.
+    /// Empty `head_payload` ≠ real payload → hashes diverge → Forked.
+    #[test]
+    fn assess_continuity_forked_when_snapshot_head_payload_is_unpopulated() {
+        use crate::adapter::net::state::horizon::ObservedHorizon;
+
+        let (mut log, _) = build_log(20);
+        let event_at_10 = log.range(10, 10)[0].clone();
+        // Sanity: the test is only meaningful if the real payload
+        // is non-empty. `build_log` writes "event-{i}" so this
+        // holds, but pin it so a future tweak doesn't silently
+        // empty the payload and turn this test into a no-op.
+        assert!(
+            !event_at_10.payload.is_empty(),
+            "test setup: build_log must produce non-empty payloads, \
+             otherwise empty-vs-real head_payload comparison is moot",
+        );
+        log.prune_through(10);
+
+        let snapshot = StateSnapshot {
+            version: 1,
+            entity_id: log.entity_id().clone(),
+            through_seq: 10,
+            // Right link, but caller forgot to attach the real
+            // head event's bytes — `head_payload` is empty.
+            chain_link: event_at_10.link,
+            state: bytes::Bytes::new(),
+            horizon: ObservedHorizon::default(),
+            created_at: 0,
+            bindings_bytes: Vec::new(),
+            identity_envelope: None,
+            head_payload: bytes::Bytes::new(),
+        };
+
+        let status = assess_continuity(&log, Some(&snapshot));
+        match status {
+            ContinuityStatus::Forked { fork_point, .. } => {
+                assert_eq!(
+                    fork_point, 11,
+                    "missing head_payload must trigger Forked at the anchor — \
+                     a lenient check that ignored an empty head_payload would \
+                     silently return Continuous and defeat the cubic-ai P1 fix",
+                );
+            }
+            other => panic!(
+                "expected Forked when caller forgot to populate head_payload, got {:?}",
+                other
+            ),
+        }
+    }
+
     /// Anchor parent_hash check must NOT lock out a snapshot whose
     /// `chain_link` and `head_payload` legitimately match the log
     /// (the success path for a real cross-node migration). Pins the
@@ -762,10 +826,17 @@ mod tests {
         // The proof spans `[1, 5]`. With events 1..4 missing, the
         // verifier's first range lookup must surface a missing-event
         // error rather than silently passing on the endpoints.
+        // Cubic-ai P3: pin the missing seq to `from_seq` (1)
+        // specifically — the contract is "the from_seq endpoint is
+        // the one we noticed missing." A future regression that
+        // shifted which gap is reported (e.g. surfacing the to_seq
+        // miss instead) would silently mask broken anchor-detection
+        // without this tightening.
         let result = proof.verify_against(&peer_log);
         assert!(
-            matches!(result, Err(ProofError::MissingEvent(_))),
-            "verify_against must reject when middle events are missing (BUG #98), got {:?}",
+            matches!(result, Err(ProofError::MissingEvent(1))),
+            "verify_against must reject with MissingEvent(from_seq=1) when \
+             from_seq itself is gone (BUG #98 + cubic-ai P3), got {:?}",
             result,
         );
     }

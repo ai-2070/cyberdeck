@@ -182,17 +182,34 @@ impl NetSession {
         self.peer_addr
     }
 
-    /// Get the raw TX key. Used by callers (such as the mesh
-    /// heartbeat timer) that need to construct ad-hoc
-    /// `PacketBuilder` instances bound to this session's key.
-    /// Closes BUG #97 — pre-fix, the heartbeat sender substituted
-    /// `&[0u8; 32]` here, producing AEAD-tagged heartbeats whose
-    /// tag the receiver could never verify against the session's
-    /// actual key.
+    /// Get the raw TX key.
     ///
-    /// BUG #106: the previous `tx_cipher()` getter has been
-    /// removed — see `tx_key` field doc for the cross-pool
-    /// nonce-reuse rationale.
+    /// **HAZARDOUS — internal-use only.** This accessor exists for
+    /// the mesh heartbeat timer (`mesh.rs`), which needs to build
+    /// ad-hoc `PacketBuilder` instances bound to the session's
+    /// real key (substituting a placeholder here is what caused
+    /// BUG #97 — heartbeats AEAD-tagged with the wrong key that
+    /// the receiver correctly rejected). It is NOT part of the
+    /// supported SDK surface; outside callers MUST go through the
+    /// normal `send_*` paths or `NetSession::build_heartbeat` so
+    /// every TX-side AEAD operation flows through
+    /// `thread_local_pool` (the single nonce-counter source —
+    /// see the `tx_key` field doc and BUG #106 for the cross-
+    /// pool nonce-reuse hazard a parallel `PacketBuilder` would
+    /// reintroduce).
+    ///
+    /// If you find yourself reaching for this from a new call site,
+    /// either:
+    ///  - Add a typed wrapper that hands you a pre-wired
+    ///    `PacketBuilder` whose nonce counter shares the session's
+    ///    `thread_local_pool`, or
+    ///  - Add a method on `NetSession` for the operation you're
+    ///    trying to perform.
+    ///
+    /// Cubic-ai P1 surfaced this as a footgun; the fix is the
+    /// doc-warn here plus internal-only positioning. If observed
+    /// misuse appears in the future, replace the accessor with a
+    /// guard type.
     #[inline]
     pub fn tx_key(&self) -> &[u8; 32] {
         &self.tx_key
