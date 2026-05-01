@@ -49,7 +49,19 @@ pytestmark = pytest.mark.skipif(
 # `from net import RedisStreamDedup`. If the re-export is broken
 # this raises ImportError and every test below errors out
 # (not skipped). That's the contract we want to pin.
-from net import RedisStreamDedup  # noqa: E402
+#
+# Guarded on `_BINDING_HAS_REDIS_DEDUP` so that builds WITHOUT the
+# `redis` feature take the skip path cleanly. Without the guard,
+# the unconditional import would fail at collection time and
+# pytest reports it as ERROR rather than SKIPPED — the skipif
+# marker above doesn't get a chance to fire because module-level
+# imports run before pytest evaluates pytestmark. The contract we
+# pin is "binding has the symbol → public import must succeed",
+# not "any build must export the symbol".
+if _BINDING_HAS_REDIS_DEDUP:
+    from net import RedisStreamDedup  # noqa: E402
+else:
+    RedisStreamDedup = None  # type: ignore[assignment]
 
 
 def test_first_observation_is_not_a_duplicate() -> None:
