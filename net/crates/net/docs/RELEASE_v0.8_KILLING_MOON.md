@@ -36,7 +36,7 @@ Net is built on the conviction that distributed compute should not be a control-
 
 We chose the Cyberpunk frame because it's the right one. Mikoshi is the engram store — minds persisting outside the hardware that bore them. Net's daemons persist outside the nodes that host them. That is not a metaphor we are reaching for. It is what the migration state machine does, packet by packet, with cryptographic receipts.
 
-v0.8 is the version of Net we are willing to put a name on. The codename does double duty. The song — Echo & the Bunnymen, 1984 — is about the part of yourself you don't get to negotiate with. The mission — *Phantom Liberty*'s final act — is V carrying Songbird to the moon, where the system that would destroy her can't reach. An entity, carried across, preserved outside the substrate that bore it. Mikoshi by another name.
+v0.8 is the version of Net we are willing to put a name on. The codename does double duty. The song — Echo & the Bunnymen, 1984 — is about the part of yourself you don't get to negotiate with. The mission — *Phantom Liberty*'s final act — is V carrying Songbird (Somi) to the Moon, where the system that would destroy her can't reach.
 
 The release ships when it's ready, not when it's convenient. It happens to ship on May 1, 2026, under a full moon. We didn't plan that. We're taking it.
 
