@@ -1414,7 +1414,9 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                         )
                         .await
                         {
-                            stats.batches_dispatched.fetch_add(1, AtomicOrdering::Relaxed);
+                            stats
+                                .batches_dispatched
+                                .fetch_add(1, AtomicOrdering::Relaxed);
                             stats
                                 .events_dispatched
                                 .fetch_add(batch_len, AtomicOrdering::Relaxed);
@@ -1439,7 +1441,9 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                             )
                             .await
                             {
-                                stats.batches_dispatched.fetch_add(1, AtomicOrdering::Relaxed);
+                                stats
+                                    .batches_dispatched
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
                                 stats
                                     .events_dispatched
                                     .fetch_add(batch_len, AtomicOrdering::Relaxed);
@@ -1461,7 +1465,9 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                         )
                         .await
                         {
-                            stats.batches_dispatched.fetch_add(1, AtomicOrdering::Relaxed);
+                            stats
+                                .batches_dispatched
+                                .fetch_add(1, AtomicOrdering::Relaxed);
                             stats
                                 .events_dispatched
                                 .fetch_add(batch_len, AtomicOrdering::Relaxed);

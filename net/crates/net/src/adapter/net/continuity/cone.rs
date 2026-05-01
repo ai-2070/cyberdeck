@@ -34,8 +34,11 @@ pub struct CausalCone {
     sequence: u64,
     /// Full horizon at this point (exact, if available locally).
     horizon: Option<ObservedHorizon>,
-    /// Compressed horizon from the wire (always available).
-    horizon_encoded: u32,
+    /// Compressed horizon from the wire (always available). 64-bit
+    /// bloom filter as of BUG #130 — see `state/horizon.rs` for the
+    /// FPR-vs-cardinality table and the out-of-band-fallback escape
+    /// hatch when n > 16 active origins.
+    horizon_encoded: u64,
 }
 
 impl CausalCone {
@@ -146,7 +149,7 @@ impl CausalCone {
 
     /// Get the compressed horizon.
     #[inline]
-    pub fn horizon_encoded(&self) -> u32 {
+    pub fn horizon_encoded(&self) -> u64 {
         self.horizon_encoded
     }
 
@@ -161,7 +164,7 @@ impl CausalCone {
 mod tests {
     use super::*;
 
-    fn make_link(origin: u32, seq: u64, horizon: u32) -> CausalLink {
+    fn make_link(origin: u32, seq: u64, horizon: u64) -> CausalLink {
         CausalLink {
             origin_hash: origin,
             horizon_encoded: horizon,

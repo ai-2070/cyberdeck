@@ -72,7 +72,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Secret};
 
 use super::entity::{EntityError, EntityKeypair};
-use crate::adapter::net::state::causal::CausalLink;
+use crate::adapter::net::state::causal::{CausalLink, CAUSAL_LINK_SIZE};
 
 /// Fixed wire size of a serialized `IdentityEnvelope`.
 pub const IDENTITY_ENVELOPE_SIZE: usize = 32 + 80 + 32 + 64;
@@ -435,9 +435,17 @@ impl IdentityEnvelope {
 // ---- helpers --------------------------------------------------------
 
 /// Transcript bytes signed by the source and verified by the target:
-/// `target_static_pub (32) || chain_link.to_bytes() (24)`.
-fn attestation_transcript(target_static_pub: &[u8; 32], chain_link: &CausalLink) -> [u8; 56] {
-    let mut out = [0u8; 56];
+/// `target_static_pub (32) || chain_link.to_bytes() (CAUSAL_LINK_SIZE)`.
+///
+/// Width follows `CAUSAL_LINK_SIZE` so a wire-format change to the
+/// causal link (e.g. BUG #130 widening `horizon_encoded` to u64,
+/// which took the link from 24 → 28 bytes) doesn't require a
+/// hand-edited length here.
+fn attestation_transcript(
+    target_static_pub: &[u8; 32],
+    chain_link: &CausalLink,
+) -> [u8; 32 + CAUSAL_LINK_SIZE] {
+    let mut out = [0u8; 32 + CAUSAL_LINK_SIZE];
     out[..32].copy_from_slice(target_static_pub);
     out[32..].copy_from_slice(&chain_link.to_bytes());
     out

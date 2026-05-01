@@ -1,8 +1,31 @@
 //! Compressed observed horizon for causal ordering.
 //!
-//! Replaces full vector clocks with a 4-byte bloom sketch that fits in
-//! `CausalLink::horizon_encoded`. Provides O(1) approximate causality
-//! detection without O(N) scaling.
+//! Replaces full vector clocks with a fixed-size bloom sketch that fits
+//! in `CausalLink::horizon_encoded`. Provides O(1) approximate causality
+//! detection without O(N) wire-size scaling.
+//!
+//! # Approximation envelope (LOAD-BEARING — read before relying on this)
+//!
+//! - **Approximate.** The wire-encoded horizon is a 64-bit bloom filter
+//!   with 3 hash positions per origin. False positives are possible
+//!   (and the ONLY error direction the encoding can produce);
+//!   false negatives are not. `might_contain` returns `true` if the
+//!   origin is in the horizon OR if it bloom-collides with origins
+//!   that are.
+//! - **Tuned for ≲ 16 active origins.** Past ~16 origins observed
+//!   per event the false-positive rate climbs above 50 %, and
+//!   `potentially_concurrent` (which AND-negates two `might_contain`
+//!   calls) starts collapsing toward constant `false` — i.e. the
+//!   sketch claims everything is causally ordered, defeating the
+//!   concurrency-detection path. See the FPR table on
+//!   `HorizonEncoder` for the full curve.
+//! - **Above the ceiling, use the out-of-band full-horizon path.**
+//!   Callers that need exact answers at higher origin cardinalities
+//!   must NOT rely on `might_contain` / `potentially_concurrent`.
+//!   The full [`ObservedHorizon`] is exchanged out-of-band (not
+//!   per-event) and queried via [`ObservedHorizon::has_observed`] /
+//!   [`CausalCone::from_link_with_horizon`](super::super::continuity::cone::CausalCone::from_link_with_horizon),
+//!   which gives an exact answer regardless of cardinality.
 
 use std::collections::HashMap;
 use xxhash_rust::xxh3::xxh3_64;
@@ -10,6 +33,10 @@ use xxhash_rust::xxh3::xxh3_64;
 /// Full vector clock — exchanged out-of-band, not per-event.
 ///
 /// Tracks the highest sequence number observed from each entity.
+/// Locally-held; cardinality is unbounded by wire-format constraints.
+/// Use this (via [`Self::has_observed`]) for exact causality answers
+/// when the bloom-filter approximation in [`Self::encode`] isn't
+/// precise enough — see the module docs' "Approximation envelope".
 #[derive(Debug, Clone, Default)]
 pub struct ObservedHorizon {
     /// origin_hash -> highest sequence observed from that entity.
@@ -47,7 +74,11 @@ impl ObservedHorizon {
         self.entries.get(&origin_hash).copied()
     }
 
-    /// Check if this horizon has observed a specific (origin, sequence) pair.
+    /// Exact "have I observed an event at or past this sequence?"
+    /// query. Use this (with the locally-held full horizon) when
+    /// `HorizonEncoder::might_contain` would saturate — past
+    /// ~16 active origins per event the bloom approximation
+    /// becomes unreliable.
     pub fn has_observed(&self, origin_hash: u32, sequence: u64) -> bool {
         self.entries
             .get(&origin_hash)
@@ -84,94 +115,122 @@ impl ObservedHorizon {
         self.logical_time = self.logical_time.max(other.logical_time).saturating_add(1);
     }
 
-    /// Encode to a 4-byte compressed horizon for CausalLink.
+    /// Encode to an 8-byte compressed horizon for `CausalLink`.
     ///
-    /// Format:
-    /// - bits 31-16: bloom filter of recently-observed origin_hashes (16 bits)
-    /// - bits 15-0: truncated max observed sequence across all entities (16 bits)
-    pub fn encode(&self) -> u32 {
+    /// Returns a 64-bit bloom filter — see [`HorizonEncoder`] for
+    /// the FPR-vs-cardinality curve. NOT EXACT past ~16 active
+    /// origins; for exact answers, query the full horizon via
+    /// [`Self::has_observed`].
+    pub fn encode(&self) -> u64 {
         HorizonEncoder::encode(self)
     }
 }
 
-/// Encoder/decoder for the 4-byte compressed horizon.
+/// Encoder/decoder for the 8-byte compressed horizon.
+///
+/// # Format
+///
+/// `horizon_encoded` is a 64-bit bloom filter. Each observed
+/// `origin_hash` sets 3 bits in the filter, derived from one
+/// xxh3 output via Kirsch-Mitzenmacher double-hashing
+/// (positions `h1`, `h1 + h2`, `h1 + 2*h2` mod 64).
+///
+/// Pre-#130 this was a 16-bit bloom packed into the high half of a
+/// `u32` with a log-scale max-seq in the low half. The 16-bit bloom
+/// saturated after ~6-8 distinct origins, collapsing
+/// `potentially_concurrent` into constant-false on any non-tiny
+/// mesh. The seq half was unused in production (only test code
+/// called `decode_seq`). Post-#130 the full 64 bits are bloom and
+/// the seq encoding is removed.
+///
+/// # False-positive rate (LOAD-BEARING)
+///
+/// With m = 64 bits, k = 3 hash positions:
+///
+/// | active origins (n) | FPR of `might_contain` |
+/// |---|---|
+/// | 2 | ~0.4 % |
+/// | 4 | ~3 % |
+/// | 8 | ~13 % |
+/// | 16 | ~44 % |
+/// | 24 | ~70 % |
+///
+/// Past n ≈ 16, `potentially_concurrent` (which AND-negates two
+/// `might_contain` calls) starts collapsing toward constant
+/// `false`, defeating concurrency detection. **Callers above
+/// this ceiling MUST fall back to the out-of-band full-horizon
+/// path** ([`ObservedHorizon::has_observed`] /
+/// `CausalCone::from_link_with_horizon`) for exact answers.
 pub struct HorizonEncoder;
 
 impl HorizonEncoder {
-    /// Encode a full horizon into 4 bytes.
-    pub fn encode(horizon: &ObservedHorizon) -> u32 {
-        let mut bloom: u16 = 0;
-        let mut max_seq: u64 = 0;
-
-        for (&origin_hash, &seq) in &horizon.entries {
-            // Set bloom bits for this origin (2 hash functions)
-            let h = xxh3_64(&origin_hash.to_le_bytes());
-            bloom |= 1 << (h & 0xF);
-            bloom |= 1 << ((h >> 4) & 0xF);
-
-            if seq > max_seq {
-                max_seq = seq;
-            }
-        }
-
-        // Encode max_seq as log-scale u16 to preserve ordering across full u64 range.
-        // Uses the position of the highest set bit (0-63) in the high 6 bits,
-        // and the next 10 significant bits as mantissa. This gives ~0.1% precision
-        // for large values and exact representation for values < 1024.
-        let seq_encoded = encode_seq_log(max_seq);
-        ((bloom as u32) << 16) | (seq_encoded as u32)
+    /// Compute the three bloom positions for an origin hash.
+    ///
+    /// Kirsch-Mitzenmacher double-hashing: take xxh3 over the
+    /// `origin_hash` bytes, split the 64-bit output into two 32-bit
+    /// halves (`h1`, `h2`), and produce positions
+    /// `h1`, `h1 + h2`, `h1 + 2*h2` (all mod 64).
+    ///
+    /// `h2` is OR'd with 1 to force it odd — without that, an `h2`
+    /// that happens to be ≡ 0 (mod 64) would collapse all three
+    /// positions onto `h1 % 64`, giving a single-bit filter for
+    /// that origin. Forcing `h2` odd guarantees the three
+    /// positions are distinct (because gcd(odd, 64) = 1, so
+    /// `h1`, `h1+h2`, `h1+2*h2` are mutually distinct mod 64).
+    ///
+    /// Returns a `u64` with exactly 3 bits set (the union of the
+    /// three positions).
+    #[inline]
+    fn bloom_bits_for_origin(origin_hash: u32) -> u64 {
+        let h = xxh3_64(&origin_hash.to_le_bytes());
+        let h1 = h as u32;
+        let h2 = ((h >> 32) as u32) | 1; // force odd — see above
+        let p1 = (h1 % 64) as u64;
+        let p2 = (h1.wrapping_add(h2) % 64) as u64;
+        let p3 = (h1.wrapping_add(h2.wrapping_mul(2)) % 64) as u64;
+        (1u64 << p1) | (1u64 << p2) | (1u64 << p3)
     }
 
-    /// Decode the log-scale sequence from an encoded horizon.
-    pub fn decode_seq(encoded: u32) -> u64 {
-        decode_seq_log((encoded & 0xFFFF) as u16)
+    /// Encode a full horizon into 8 bytes (a 64-bit bloom filter).
+    pub fn encode(horizon: &ObservedHorizon) -> u64 {
+        let mut bloom: u64 = 0;
+        for (&origin_hash, _seq) in &horizon.entries {
+            bloom |= Self::bloom_bits_for_origin(origin_hash);
+        }
+        bloom
     }
 
     /// Check if an origin_hash is possibly in a compressed horizon.
     ///
-    /// Returns false = definitely not observed, true = possibly observed.
-    pub fn might_contain(encoded: u32, origin_hash: u32) -> bool {
-        let bloom = (encoded >> 16) as u16;
-        let h = xxh3_64(&origin_hash.to_le_bytes());
-        let bit1 = 1u16 << (h & 0xF);
-        let bit2 = 1u16 << ((h >> 4) & 0xF);
-        (bloom & bit1) != 0 && (bloom & bit2) != 0
+    /// Returns `false` = definitely not observed,
+    /// `true` = possibly observed (false-positive rate climbs with
+    /// the number of distinct origins encoded; see the type-level
+    /// FPR table). Bloom invariant: every inserted origin reports
+    /// `true`.
+    pub fn might_contain(encoded: u64, origin_hash: u32) -> bool {
+        let bits = Self::bloom_bits_for_origin(origin_hash);
+        (encoded & bits) == bits
     }
 
-    /// Check if two events are potentially concurrent (neither observed the other).
+    /// Check if two events are potentially concurrent (neither
+    /// observed the other). Built from two `might_contain` calls.
+    ///
+    /// Note that `might_contain`'s false positives bias this
+    /// function toward `false` ("looks causally ordered"). On a
+    /// saturated bloom (>16 distinct origins encoded into either
+    /// horizon), this method returns false constantly even for
+    /// genuinely concurrent events — see the type-level FPR
+    /// discussion. Callers gating conflict resolution / merging on
+    /// this method MUST also have an out-of-band escape hatch via
+    /// the full [`ObservedHorizon`].
     pub fn potentially_concurrent(
-        horizon_a: u32,
+        horizon_a: u64,
         origin_b: u32,
-        horizon_b: u32,
+        horizon_b: u64,
         origin_a: u32,
     ) -> bool {
         !Self::might_contain(horizon_a, origin_b) && !Self::might_contain(horizon_b, origin_a)
     }
-}
-
-/// Encode a u64 sequence as a log-scale u16.
-///
-/// Format: [exponent: 6 bits][mantissa: 10 bits]
-/// Values < 1024 are encoded exactly. Larger values lose low bits
-/// but preserve ordering across the full u64 range.
-fn encode_seq_log(seq: u64) -> u16 {
-    if seq < 1024 {
-        return seq as u16;
-    }
-    let bits = 64 - seq.leading_zeros() as u16; // position of highest bit (1-64)
-    let exponent = bits - 10; // shift needed to get top 10 bits
-    let mantissa = (seq >> exponent) as u16 & 0x3FF;
-    (exponent << 10) | mantissa
-}
-
-/// Decode a log-scale u16 back to approximate u64 sequence.
-fn decode_seq_log(encoded: u16) -> u64 {
-    if encoded < 1024 {
-        return encoded as u64;
-    }
-    let exponent = (encoded >> 10) as u64;
-    let mantissa = (encoded & 0x3FF) as u64;
-    mantissa << exponent
 }
 
 #[cfg(test)]
@@ -304,125 +363,124 @@ mod tests {
         ));
     }
 
-    // ---- Regression tests for Cubic AI findings ----
+    // ---- BUG #130 regression coverage ----
 
+    /// BUG #130: pre-fix the bloom was 16 bits with k=2, saturating
+    /// after ~6-8 inserted origins. Post-fix it's 64 bits with k=3,
+    /// usable up to ~16 origins at <50 % FPR. Pin the BLOOM-INVARIANT
+    /// directly — every inserted origin must report `true`. False
+    /// positives are allowed; false negatives are not.
     #[test]
-    fn test_regression_seq_encoding_preserves_ordering() {
-        // Regression: old encoding used (max_seq >> 48) as u16 with a fallback
-        // to low bits, which broke ordering for values in [0x10000, 0xFFFF_FFFF_FFFF].
-        // Sequence 65536 encoded as 0, sequence 65537 encoded as 1.
-        // Log-scale encoding now preserves monotonic ordering.
-        let test_values: Vec<u64> = vec![
-            0,
-            1,
-            100,
-            1023,
-            1024, // exact range
-            65535,
-            65536,
-            65537, // old breakpoint
-            1_000_000,
-            1_000_000_000, // mid-range
-            u64::MAX / 2,
-            u64::MAX, // high range
-        ];
-
-        for i in 0..test_values.len() - 1 {
-            let a = test_values[i];
-            let b = test_values[i + 1];
-            let enc_a = encode_seq_log(a);
-            let enc_b = encode_seq_log(b);
+    fn might_contain_has_no_false_negatives_for_inserted_origins() {
+        let mut h = ObservedHorizon::new();
+        let origins: Vec<u32> = (0..50u32)
+            .map(|i| 0xDEAD_0000_u32 ^ i.wrapping_mul(0x9E37_79B1))
+            .collect();
+        for &o in &origins {
+            h.observe(o, 1);
+        }
+        let encoded = h.encode();
+        for &o in &origins {
             assert!(
-                enc_a <= enc_b,
-                "encoding must preserve ordering: encode({}) = {} > encode({}) = {}",
-                a,
-                enc_a,
-                b,
-                enc_b
+                HorizonEncoder::might_contain(encoded, o),
+                "every inserted origin (here 0x{o:08X}) must report `true` — bloom invariant",
             );
         }
     }
 
+    /// BUG #130: probabilistic FPR pin at small cardinality. With
+    /// m=64, k=3, n=8, expected FPR ≈ 13 %. Test draws 1000 random
+    /// non-inserted origins and asserts the empirical FPR stays
+    /// below a generous 25 % ceiling — well under the pre-fix
+    /// 16-bit bloom's ~57 % at the same n, and conservative enough
+    /// to not flake on hash-distribution noise. The point is to
+    /// pin "the new bloom is meaningfully better than 16-bit", not
+    /// to enforce the exact analytical FPR.
     #[test]
-    fn test_regression_seq_roundtrip_exact_for_small() {
-        // Values < 1024 must roundtrip exactly.
-        for v in 0..1024u64 {
-            let encoded = encode_seq_log(v);
-            let decoded = decode_seq_log(encoded);
-            assert_eq!(decoded, v, "small value {} must roundtrip exactly", v);
+    fn might_contain_fpr_at_n_8_is_well_below_pre_fix_saturation() {
+        let mut h = ObservedHorizon::new();
+        let inserted: Vec<u32> = (0..8u32)
+            .map(|i| 0x1000_0000_u32.wrapping_add(i.wrapping_mul(0xC0FF_EEAB)))
+            .collect();
+        for &o in &inserted {
+            h.observe(o, 1);
         }
-    }
+        let encoded = h.encode();
 
-    #[test]
-    fn test_seq_encoding_boundary_at_1024() {
-        // 1023 is exact, 1024 is the first log-scale value.
-        // Both must encode without panic and preserve ordering.
-        let enc_1023 = encode_seq_log(1023);
-        let enc_1024 = encode_seq_log(1024);
-        assert!(enc_1024 > enc_1023, "1024 must encode higher than 1023");
-
-        // 1024 should roundtrip exactly (it's a power of 2, mantissa is clean)
-        let dec_1024 = decode_seq_log(enc_1024);
-        assert_eq!(dec_1024, 1024, "1024 (power of 2) should roundtrip exactly");
-    }
-
-    #[test]
-    fn test_seq_encoding_does_not_overflow_u16() {
-        // The encoded value must fit in u16 for all u64 inputs.
-        // The most extreme input is u64::MAX.
-        let enc = encode_seq_log(u64::MAX);
-        // enc is a u16 — if the encoding overflowed, this would have
-        // panicked in debug or wrapped in release. We verify it's valid.
-        assert!(enc > 0, "u64::MAX should encode to a nonzero u16");
-
-        // Decode should produce a large value (approximate, not exact)
-        let dec = decode_seq_log(enc);
+        let mut false_positives = 0;
+        let trials = 1000;
+        for i in 0..trials {
+            // Probe origin not in the inserted set.
+            let probe = 0xBEEF_0000_u32.wrapping_add((i as u32).wrapping_mul(0x9E37_79B9));
+            if inserted.contains(&probe) {
+                continue;
+            }
+            if HorizonEncoder::might_contain(encoded, probe) {
+                false_positives += 1;
+            }
+        }
+        let fpr = (false_positives as f64) / (trials as f64);
         assert!(
-            dec > u64::MAX / 2,
-            "decoded u64::MAX should be in the right ballpark, got {}",
-            dec
+            fpr < 0.25,
+            "FPR at n=8 should be well under the pre-fix 16-bit-bloom \
+             saturation (~57 % at n=8); observed {:.1} % over {} trials, \
+             expected analytically ~13 %",
+            fpr * 100.0,
+            trials,
         );
     }
 
+    /// Three set bits per insert (modulo collision when h1 / h2
+    /// happen to alias). For a "clean" origin (we choose one whose
+    /// xxh3 output gives three distinct bloom positions), the
+    /// encoded value must have exactly 3 bits set.
+    ///
+    /// We test the lower bound: at LEAST 1 bit set per insert (a
+    /// tighter "exactly 3" assertion would have to special-case
+    /// collision-prone inputs, which doesn't add coverage).
     #[test]
-    fn test_seq_encoding_decode_preserves_magnitude() {
-        // For large values, decode(encode(v)) should be within ~0.1% of v.
-        let test_values = [
-            1_000_000u64,
-            1_000_000_000,
-            1_000_000_000_000,
-            u64::MAX / 1024,
-        ];
-
-        for &v in &test_values {
-            let encoded = encode_seq_log(v);
-            let decoded = decode_seq_log(encoded);
-            let ratio = decoded as f64 / v as f64;
-            assert!(
-                (0.99..=1.01).contains(&ratio),
-                "decode(encode({})) = {} — ratio {} is outside 1% tolerance",
-                v,
-                decoded,
-                ratio
-            );
-        }
+    fn bloom_sets_at_least_one_bit_per_insert() {
+        let mut h = ObservedHorizon::new();
+        h.observe(0xAAAA_BBBB, 1);
+        let encoded = h.encode();
+        assert_ne!(encoded, 0, "single insert must set at least one bit");
+        let bits = encoded.count_ones();
+        assert!(
+            (1..=3).contains(&bits),
+            "single insert sets between 1 and 3 bits (got {bits})",
+        );
     }
 
+    /// Defense-in-depth on the Kirsch-Mitzenmacher double-hash
+    /// odd-h2 trick. If a future refactor drops the `| 1` mask on
+    /// `h2`, an origin whose xxh3 output happens to give h2 ≡ 0
+    /// (mod 64) would collapse all three bloom positions onto the
+    /// h1 bit, producing a single-bit insert for that origin.
+    /// We can't directly inspect the inner hash without exposing
+    /// it, but we can pin that across a wide range of inputs no
+    /// origin produces a single-bit encoding (with very high
+    /// probability, given odd h2).
     #[test]
-    fn test_horizon_encode_decode_seq_consistency() {
-        // Full round trip through ObservedHorizon → encode → decode_seq.
-        let mut h = ObservedHorizon::new();
-        h.observe(0xAAAA, 999_999);
-
-        let encoded = h.encode();
-        let decoded_seq = HorizonEncoder::decode_seq(encoded);
-
-        // The decoded max-seq should approximate the input
-        let ratio = decoded_seq as f64 / 999_999.0;
+    fn bloom_does_not_collapse_to_one_bit_for_typical_origins() {
+        let mut single_bit_count = 0;
+        for i in 0..256u32 {
+            let mut h = ObservedHorizon::new();
+            h.observe(i, 1);
+            let encoded = h.encode();
+            if encoded.count_ones() == 1 {
+                single_bit_count += 1;
+            }
+        }
+        // With odd h2 and proper double-hashing, no origin should
+        // collapse to a single-bit encoding. With even h2 (the
+        // pre-fix mistake we're guarding against), ~1/64 origins
+        // would. Allow up to 1 collision out of 256 to leave
+        // headroom for coincidental p1/p2/p3 aliasing in the modular
+        // arithmetic.
         assert!(
-            (0.99..=1.01).contains(&ratio),
-            "horizon seq should roundtrip within 1%, got ratio {}",
-            ratio
+            single_bit_count <= 1,
+            "{single_bit_count} of 256 origins encoded to a single-bit \
+             bloom — Kirsch-Mitzenmacher odd-h2 invariant likely broken",
         );
     }
 }

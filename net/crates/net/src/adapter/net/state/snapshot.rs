@@ -20,7 +20,7 @@
 
 use bytes::{Buf, Bytes};
 
-use super::causal::CausalLink;
+use super::causal::{CausalLink, CAUSAL_LINK_SIZE};
 use super::horizon::ObservedHorizon;
 use crate::adapter::net::identity::{
     EntityId, EntityKeypair, IdentityEnvelope, IDENTITY_ENVELOPE_SIZE,
@@ -242,7 +242,7 @@ impl StateSnapshot {
     /// version:           1 byte  (SNAPSHOT_VERSION)
     /// entity_id:        32 bytes
     /// through_seq:       8 bytes
-    /// chain_link:       24 bytes
+    /// chain_link:       CAUSAL_LINK_SIZE bytes (28 since BUG #130)
     /// created_at:        8 bytes
     /// state_len:         4 bytes (u32)
     /// state:             state_len bytes
@@ -307,7 +307,7 @@ impl StateSnapshot {
         } else {
             0
         };
-        let header_size = V1_MAGIC.len() + 1 + 32 + 8 + 24 + 8 + 4;
+        let header_size = V1_MAGIC.len() + 1 + 32 + 8 + CAUSAL_LINK_SIZE + 8 + 4;
         let trailer_size = 4 + self.bindings_bytes.len() + 1 + envelope_bytes_len;
         let mut buf = Vec::with_capacity(header_size + self.state.len() + trailer_size);
 
@@ -367,7 +367,7 @@ impl StateSnapshot {
 
         // Core header — same layout as v0 past this point, except
         // the reader branches to the v1 trailer at the end.
-        let header_remaining = 32 + 8 + 24 + 8 + 4;
+        let header_remaining = 32 + 8 + CAUSAL_LINK_SIZE + 8 + 4;
         if cursor.remaining() < header_remaining {
             return None;
         }
@@ -378,7 +378,7 @@ impl StateSnapshot {
 
         let through_seq = cursor.get_u64_le();
 
-        let mut link_bytes = [0u8; 24];
+        let mut link_bytes = [0u8; CAUSAL_LINK_SIZE];
         cursor.copy_to_slice(&mut link_bytes);
         let chain_link = CausalLink::from_bytes(&link_bytes)?;
 
@@ -451,7 +451,7 @@ impl StateSnapshot {
     }
 
     fn from_bytes_v0(data: &[u8]) -> Option<Self> {
-        let header_size = 32 + 8 + 24 + 8 + 4;
+        let header_size = 32 + 8 + CAUSAL_LINK_SIZE + 8 + 4;
         if data.len() < header_size {
             return None;
         }
@@ -464,7 +464,7 @@ impl StateSnapshot {
 
         let through_seq = cursor.get_u64_le();
 
-        let mut link_bytes = [0u8; 24];
+        let mut link_bytes = [0u8; CAUSAL_LINK_SIZE];
         cursor.copy_to_slice(&mut link_bytes);
         let chain_link = CausalLink::from_bytes(&link_bytes)?;
 
@@ -513,7 +513,7 @@ impl StateSnapshot {
     /// Compact header size (excluding state payload). Kept for the
     /// v0 compatibility path — v1 writers allocate from
     /// [`Self::to_bytes`]'s own sizing math.
-    pub const HEADER_SIZE: usize = 32 + 8 + 24 + 8 + 4; // 76 bytes
+    pub const HEADER_SIZE: usize = 32 + 8 + CAUSAL_LINK_SIZE + 8 + 4; // 80 bytes (was 76 pre-#130)
 
     /// Age of this snapshot in seconds.
     pub fn age_secs(&self) -> u64 {
