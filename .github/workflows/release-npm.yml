@@ -76,36 +76,50 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      - name: Install cross-compilation tools (aarch64-linux)
+      - name: Install cross-compilation tools (aarch64-linux-gnu)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      # `cc-rs` (used by `ring` and other native deps) needs a real
+      # `<arch>-linux-musl-gcc` binary on PATH for musl cross-builds.
+      # Ubuntu doesn't ship one, and `--use-napi-cross` from napi-rs's
+      # CLI didn't pull a Docker image in this environment. musl.cc
+      # ships static prebuilt cross-toolchains; we untar one, prepend
+      # its bin/ to PATH, and pin cargo's linker env so the wire-up
+      # is explicit.
+      - name: Install musl cross compiler
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              NAME="x86_64-linux-musl-cross"
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc" >> "$GITHUB_ENV"
+              ;;
+            aarch64-unknown-linux-musl)
+              NAME="aarch64-linux-musl-cross"
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "Unexpected musl target: ${{ matrix.target }}" >&2
+              exit 1
+              ;;
+          esac
+          wget -q "https://musl.cc/${NAME}.tgz" -O /tmp/musl-cross.tgz
+          tar -xf /tmp/musl-cross.tgz -C "$HOME"
+          echo "$HOME/${NAME}/bin" >> "$GITHUB_PATH"
 
       - name: Install npm dependencies
         run: npm i
 
       - name: Build native module
-        # `--features` is already baked into the `build` script in
+        # `--features` is baked into the `build` script in
         # package.json (redis,net,cortex,compute,groups). Don't pass
         # it again here — `@napi-rs/cli` 3.x forwards the second
         # `--features <name>` to cargo as a positional, and cargo
         # rejects it with "unexpected argument 'name' found".
-        #
-        # `--use-napi-cross` is required for any cross-target whose
-        # C cross-toolchain isn't in apt (musl is the obvious one;
-        # `cc-rs` chokes with "failed to find tool
-        # aarch64-linux-musl-gcc" otherwise). napi-rs's own Docker
-        # cross images carry the right gcc + binutils + libc per
-        # target. Native-host targets (host x86_64-linux,
-        # macOS, Windows) skip it — Docker isn't even available
-        # on macOS / Windows runners.
-        shell: bash
-        run: |
-          EXTRA=""
-          if [[ "${{ matrix.target }}" == *-linux-musl ]]; then
-            EXTRA="--use-napi-cross"
-          fi
-          npm run build -- --target ${{ matrix.target }} $EXTRA
+        run: npm run build -- --target ${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
