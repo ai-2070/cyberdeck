@@ -330,7 +330,23 @@ pub fn assess_continuity(log: &EntityLog, snapshot: Option<&StateSnapshot>) -> C
         // `checked_add` propagates as "not anchored," surfacing
         // as `Unverifiable` below.
         if s.through_seq.checked_add(1) == Some(first_seq) {
-            Some(compute_parent_hash(&s.chain_link, &s.head_payload))
+            // CR-34: a snapshot with `head_payload` empty for a
+            // non-genesis (`chain_link.sequence > 0`) snapshot has
+            // not been populated by the caller. The anchor hash
+            // computed against an empty payload will only match
+            // if the producer side ALSO had an empty payload at
+            // through_seq — usually wrong, masquerading as a
+            // legitimate chain mismatch. Surfaces as
+            // `Unverifiable` rather than `Forked` to distinguish
+            // "missing payload context" from "real chain
+            // divergence." Genesis snapshots (sequence == 0)
+            // legitimately have empty head_payload and continue
+            // through the standard path.
+            if s.chain_link.sequence > 0 && s.head_payload.is_empty() {
+                None
+            } else {
+                Some(compute_parent_hash(&s.chain_link, &s.head_payload))
+            }
         } else {
             None
         }
@@ -673,22 +689,23 @@ mod tests {
     }
 
     /// A caller who passes the right `chain_link` but forgets to
-    /// populate `head_payload` (leaves it as `Bytes::new()`) MUST
-    /// NOT silently bypass the anchor check. The `assess_continuity`
-    /// doc explicitly warns: "callers anchoring a real post-restore
-    /// log MUST populate `head_payload` first." Pin that contract so
-    /// a future "be lenient on missing payload" change can't slip
-    /// through and let any snapshot with a correct `through_seq` +
-    /// `chain_link` anchor a log whose actual seq-(through_seq)
-    /// payload was non-empty (which is the realistic case — empty
-    /// payloads are rare).
+    /// populate `head_payload` (leaves it as `Bytes::new()`) for a
+    /// non-genesis snapshot MUST surface as `Unverifiable`, NOT as
+    /// `Forked`. Pre-CR-34 the empty-payload anchor hash was
+    /// computed eagerly and the resulting mismatch was reported as
+    /// `Forked` — confusing for callers who saw "fork detected"
+    /// when the real cause was "snapshot deserialized without
+    /// out-of-band head_payload transfer."
     ///
-    /// Mechanism: the expected anchor hash is
-    /// `xxh3(chain_link ++ head_payload)`. The log's seq-11
-    /// `parent_hash` was computed against the REAL seq-10 payload.
-    /// Empty `head_payload` ≠ real payload → hashes diverge → Forked.
+    /// CR-34 contract: `assess_continuity` distinguishes
+    ///   - genuine chain divergence (`Forked`),
+    ///   - missing context preventing verification (`Unverifiable`).
+    /// An empty `head_payload` for `chain_link.sequence > 0` falls
+    /// in the second bucket. Genesis snapshots
+    /// (`chain_link.sequence == 0`) legitimately carry empty
+    /// `head_payload` and continue through the standard hash path.
     #[test]
-    fn assess_continuity_forked_when_snapshot_head_payload_is_unpopulated() {
+    fn assess_continuity_unverifiable_when_snapshot_head_payload_is_unpopulated() {
         use crate::adapter::net::state::horizon::ObservedHorizon;
 
         let (mut log, _) = build_log(20);
@@ -721,16 +738,67 @@ mod tests {
 
         let status = assess_continuity(&log, Some(&snapshot));
         match status {
-            ContinuityStatus::Forked { fork_point, .. } => {
+            ContinuityStatus::Unverifiable {
+                last_verified_seq,
+                gap_start,
+            } => {
                 assert_eq!(
-                    fork_point, 11,
-                    "missing head_payload must trigger Forked at the anchor — \
-                     a lenient check that ignored an empty head_payload would \
-                     silently return Continuous and defeat the cubic-ai P1 fix",
+                    last_verified_seq, 0,
+                    "anchor unverifiable: nothing has been verified yet"
                 );
+                assert_eq!(gap_start, 0, "gap starts at the (un-verifiable) anchor");
             }
             other => panic!(
-                "expected Forked when caller forgot to populate head_payload, got {:?}",
+                "CR-34: empty head_payload for non-genesis snapshot must surface as \
+                 Unverifiable (not Forked); got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// CR-34: genesis snapshots (`chain_link.sequence == 0`)
+    /// legitimately carry empty `head_payload` — there's no
+    /// predecessor to source a payload from. The empty-payload
+    /// detection in `assess_continuity` MUST NOT trip on genesis;
+    /// it must compute the canonical genesis-anchor hash and
+    /// validate normally.
+    ///
+    /// The CR-34 detection only fires for non-genesis snapshots
+    /// — without this carve-out, every genesis-anchored chain
+    /// would be `Unverifiable`, defeating the BUG #114 fix.
+    #[test]
+    fn cr34_genesis_snapshot_with_empty_head_payload_still_validates() {
+        use crate::adapter::net::state::horizon::ObservedHorizon;
+
+        let (log, _) = build_log(5);
+        // Build a "genesis snapshot" by hand: through_seq = 0, the
+        // chain_link IS the canonical genesis link, head_payload
+        // is empty (the genesis link has no predecessor payload).
+        let genesis_link = CausalLink::genesis(log.origin_hash(), 0);
+        let snapshot = StateSnapshot {
+            version: 1,
+            entity_id: log.entity_id().clone(),
+            through_seq: 0,
+            chain_link: genesis_link,
+            state: bytes::Bytes::new(),
+            horizon: ObservedHorizon::default(),
+            created_at: 0,
+            bindings_bytes: Vec::new(),
+            identity_envelope: None,
+            head_payload: bytes::Bytes::new(),
+        };
+
+        let status = assess_continuity(&log, Some(&snapshot));
+        match status {
+            ContinuityStatus::Continuous { .. } => {
+                // Expected: a genesis snapshot anchors the seq=1
+                // first event via the canonical genesis successor
+                // hash. Empty head_payload is the legitimate
+                // genesis case.
+            }
+            other => panic!(
+                "CR-34: genesis snapshot (seq=0) with empty head_payload must \
+                 be Continuous (legitimate), got {:?}",
                 other
             ),
         }

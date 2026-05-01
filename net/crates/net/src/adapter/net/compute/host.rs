@@ -142,7 +142,25 @@ impl DaemonHost {
         // transfer), we fall back to `snapshot.state` to preserve
         // the prior behavior — but this fallback only works when
         // the source side made the same choice.
+        //
+        // CR-34: warn when the fallback fires for a non-genesis
+        // snapshot. Genesis snapshots (`sequence == 0`) legitimately
+        // carry an empty head_payload — the genesis link's
+        // predecessor doesn't exist, so there's no payload to
+        // forward. For non-genesis the fallback is fragile and
+        // operators need to know.
         let head_payload = if snapshot.head_payload.is_empty() {
+            if snapshot.chain_link.sequence > 0 {
+                tracing::warn!(
+                    sequence = snapshot.chain_link.sequence,
+                    entity_id = ?snapshot.entity_id,
+                    "DaemonHost::from_snapshot: head_payload is empty for non-genesis \
+                     snapshot — falling back to snapshot.state which only validates \
+                     against subsequent events if the source side made the same choice. \
+                     Production callers MUST populate head_payload via \
+                     `StateSnapshot::with_head_payload` before passing to from_snapshot."
+                );
+            }
             snapshot.state.clone()
         } else {
             snapshot.head_payload.clone()
@@ -260,7 +278,20 @@ impl DaemonHost {
         // head_link with the right `parent_hash`. Same fallback
         // logic as `from_snapshot` for the runtime-only
         // `head_payload`.
+        //
+        // CR-34: warn when the fallback fires for a non-genesis
+        // snapshot. See `from_snapshot` for the rationale.
         let head_payload = if snapshot.head_payload.is_empty() {
+            if snapshot.chain_link.sequence > 0 {
+                tracing::warn!(
+                    sequence = snapshot.chain_link.sequence,
+                    entity_id = ?snapshot.entity_id,
+                    "DaemonHost::restore_from_snapshot: head_payload is empty for \
+                     non-genesis snapshot — falling back to snapshot.state. \
+                     Production callers MUST populate head_payload via \
+                     `StateSnapshot::with_head_payload`."
+                );
+            }
             snapshot.state.clone()
         } else {
             snapshot.head_payload.clone()
