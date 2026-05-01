@@ -352,6 +352,72 @@ async fn test_regression_dual_model_alternating_ingests_do_not_produce_duplicate
     assert_eq!(db.memories().count(), 1);
 }
 
+/// Companion regression: concurrent `tasks.create` from N
+/// threads on a SINGLE adapter must yield N distinct `app_seq`
+/// values and surface no errors. The post-fix `fetch_add` is
+/// the load-bearing primitive — it atomically reserves the next
+/// `app_seq` per call, so threads can't race onto the same
+/// number.
+///
+/// Pre-fix the load + ingest + CAS shape would have had at
+/// least one losing thread on every contended call (CAS retry
+/// wasn't even wired — the loser surfaced
+/// `concurrent ingest_typed produced duplicate app_seq` and the
+/// caller had to "rebuild adapter from snapshot to reconcile").
+/// `fetch_add` makes contention free: every caller gets a
+/// monotonically-distinct slot, no retry, no error.
+#[tokio::test]
+async fn test_regression_concurrent_ingest_into_single_tasks_adapter_succeeds() {
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
+
+    let redex = Redex::new();
+    let db = NetDb::builder(redex)
+        .origin(ORIGIN)
+        .with_tasks()
+        .build()
+        .await
+        .unwrap();
+    let db = Arc::new(db);
+
+    const N: u64 = 32;
+    let barrier = Arc::new(Barrier::new(N as usize));
+    let mut handles = Vec::with_capacity(N as usize);
+    for i in 1..=N {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            // Each thread creates a distinct task id. Every call
+            // MUST succeed — pre-fix the load+CAS race would have
+            // produced phantom-duplicate errors for the losing
+            // threads under contention.
+            db.tasks()
+                .create(i, "t", 100 * i)
+                .expect("concurrent create on a single adapter must not error")
+        }));
+    }
+    let seqs: Vec<u64> = handles
+        .into_iter()
+        .map(|h| h.join().expect("thread panicked"))
+        .collect();
+    assert_eq!(seqs.len(), N as usize, "every thread must have returned");
+
+    // Wait for the fold to apply every event so `count()` is
+    // authoritative.
+    let max_seq = *seqs.iter().max().unwrap();
+    db.tasks().wait_for_seq(max_seq).await;
+
+    assert_eq!(
+        db.tasks().count(),
+        N as usize,
+        "every concurrently-created task must have landed in state — \
+         a missing one would mean two threads stamped the same app_seq \
+         and the second overwrote the first (pre-fix CAS-race regression)",
+    );
+}
+
 /// Stress companion to the alternating-ingests regression: a
 /// tighter loop hammers both adapters under one NetDb to maximize
 /// the WatermarkingFold-vs-foreground race window. Pre-fix this

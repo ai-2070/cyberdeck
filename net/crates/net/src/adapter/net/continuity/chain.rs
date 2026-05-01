@@ -721,6 +721,65 @@ mod tests {
         }
     }
 
+    /// Cubic-ai P2: a snapshot with `through_seq == u64::MAX` must
+    /// NOT anchor any log — `checked_add(1)` returns `None`, so the
+    /// snapshot path falls through to `Unverifiable`. Pre-fix the
+    /// code used `saturating_add(1)` which clamps at `u64::MAX`, so
+    /// a (pathological) log whose first event also claimed
+    /// `sequence == u64::MAX` would have falsely anchored.
+    ///
+    /// `u64::MAX` events under one origin is impossible in practice
+    /// (would require 2^64 ingests), but a future regression that
+    /// flipped the comparator back to `saturating_add` would
+    /// silently re-introduce the false-anchor edge case — this
+    /// test is the canary.
+    #[test]
+    fn assess_continuity_unverifiable_when_snapshot_through_seq_is_u64_max() {
+        use crate::adapter::net::state::horizon::ObservedHorizon;
+
+        let (mut log, _) = build_log(20);
+        // Prune so the log starts past genesis — we want the
+        // snapshot anchor branch to be the one under test, not
+        // the `first_seq == 1` genesis branch (which doesn't use
+        // `checked_add`).
+        log.prune_through(10);
+
+        // Snapshot with `through_seq = u64::MAX`. With pre-fix
+        // `saturating_add(1)`, this would have produced
+        // `u64::MAX + 1 (saturated) = u64::MAX`, and a log claiming
+        // `first_seq == u64::MAX` could have falsely matched. With
+        // the post-fix `checked_add(1) == Some(first_seq)` shape,
+        // `checked_add(u64::MAX, 1) = None`, so no anchor matches
+        // regardless of `first_seq`.
+        let snapshot = StateSnapshot {
+            version: 1,
+            entity_id: log.entity_id().clone(),
+            through_seq: u64::MAX,
+            chain_link: CausalLink::genesis(log.origin_hash(), 0),
+            state: bytes::Bytes::new(),
+            horizon: ObservedHorizon::default(),
+            created_at: 0,
+            bindings_bytes: Vec::new(),
+            identity_envelope: None,
+            head_payload: bytes::Bytes::new(),
+        };
+
+        let status = assess_continuity(&log, Some(&snapshot));
+        assert!(
+            matches!(
+                status,
+                ContinuityStatus::Unverifiable {
+                    last_verified_seq: 0,
+                    gap_start: 0,
+                }
+            ),
+            "snapshot.through_seq == u64::MAX must never anchor — \
+             pre-fix saturating_add would have falsely matched a log \
+             claiming first_seq == u64::MAX. Got: {:?}",
+            status,
+        );
+    }
+
     /// Anchor parent_hash check must NOT lock out a snapshot whose
     /// `chain_link` and `head_payload` legitimately match the log
     /// (the success path for a real cross-node migration). Pins the
