@@ -1,0 +1,27 @@
+net/crates/net/src/bus.rs
+  36b642b129ab4a5e 2254-2364
+net/crates/net/src/event.rs
+  36b642b129ab4a5e 738-758
+net/crates/net/tests/bus_stranded_flush.rs
+  36b642b129ab4a5e 54-57,114,345-433
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "3366bc4f357bd339858ad8985ea568a15ece95cd",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1027,
+      "total_deletions": 22,
+      "accepted_lines": 237,
+      "overriden_lines": 0
+    }
+  }
+}
