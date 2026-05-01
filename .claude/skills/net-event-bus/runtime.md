@@ -35,15 +35,19 @@ If you skip step 1, late emits race with step 4 and surface as `Shutdown` errors
 
 | SDK | Call | Async? | Multi-call safety |
 |---|---|---|---|
-| Rust | `node.shutdown().await?` | Yes | **Consumes `self`** (single call enforced by ownership). See "Rust: subscribe streams hold the bus" below — outstanding clones cause `SdkError::Adapter("cannot shutdown: outstanding references exist")`. |
+| Rust | `node.shutdown().await?` | Yes | **Consumes `self`** (single call enforced by ownership), but the work is reference-based — outstanding `EventStream` clones do **not** block shutdown. See "Rust: subscribe streams and shutdown" below. |
 | TypeScript | `await node.shutdown()` | Yes | Idempotent — safe to call twice |
 | Python | `node.shutdown()` or context manager exit | No | Idempotent |
 | Go | `bus.Shutdown()` (typically `defer bus.Shutdown()`) | No | Idempotent |
 | C | `net_shutdown(handle)` then stop using the handle | No | Calling twice is undefined — don't |
 
-### Rust: subscribe streams hold the bus
+### Rust: subscribe streams and shutdown
 
-`Net::subscribe()` and `subscribe_typed()` clone the inner `Arc<EventBus>` into the returned stream. `node.shutdown()` consumes `self` and then calls `Arc::try_unwrap` on the bus — if **any** stream is still alive, that fails and `shutdown` returns `SdkError::Adapter("cannot shutdown: outstanding references exist")` (`net/crates/net/sdk/src/net.rs:236-246`). Drop every stream you spawned (`task.abort()`, break the loop and let it fall out of scope) **before** calling `shutdown`. This is why steps 1 and 3 in the order above are non-negotiable on Rust.
+`Net::subscribe()` and `subscribe_typed()` clone the inner `Arc<EventBus>` into the returned stream. `node.shutdown()` consumes `self` and delegates to `EventBus::shutdown_via_ref()` (`net/crates/net/sdk/src/net.rs:236-246`), which is **reference-based and idempotent** — it signals shutdown via internal flags rather than `Arc::try_unwrap`, so outstanding `EventStream` clones don't fail the call. Streams observe shutdown on their next poll and terminate cleanly.
+
+Concurrent callers of `shutdown` are also safe: the second caller's CAS loses, then it spins on `is_shutdown_completed()` until the first caller finishes (10 s production deadline) and surfaces `AdapterError::Transient(...)` if that deadline elapses — never a silent `Ok` and never a panic.
+
+This is a forgiving contract, but the recommended order in the previous section is still cleaner: stop emitting first, drop your subscribe loops, then call `shutdown`. You just won't hit a hard failure if a stream outlives the call.
 
 ### Tests
 

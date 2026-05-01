@@ -97,6 +97,29 @@ What to do: see "I want events to survive a process restart" in `patterns.md`. P
 
 What to do: include a unique event ID (hash of payload + timestamp) and have consumers deduplicate. Or use a persistence adapter that gives offsets and let consumers track what they've processed.
 
+**If you're on the Redis transport, the dedup primitive is already there.** The Redis adapter writes a stable `dedup_id` field on every XADD entry (`{producer_nonce}:{shard}:{seq_start}:{i}`) so a producer-retry-induced duplicate has the same `dedup_id` as its original. Net ships an LRU-bounded consumer-side helper across every SDK that filters those duplicates without you maintaining the set yourself. Sizing rule of thumb: `events_per_sec × dedup_window_seconds`.
+
+```rust
+// Rust
+use net_sdk::RedisStreamDedup;
+let mut dedup = RedisStreamDedup::with_capacity(600_000);
+if !dedup.is_duplicate(&entry.dedup_id) { process(entry); }
+```
+```typescript
+// TypeScript
+import { RedisStreamDedup } from '@ai2070/net-sdk';
+const dedup = new RedisStreamDedup(600_000);
+if (!dedup.isDuplicate(entry.message.dedup_id)) await process(entry);
+```
+```python
+# Python
+from net import RedisStreamDedup
+dedup = RedisStreamDedup(capacity=600_000)
+if not dedup.is_duplicate(entry["dedup_id"]): process(entry)
+```
+
+Go (`net.NewRedisStreamDedup`) and C (`net_redis_dedup_new`) ship the same surface. The helper is local + per-consumer; on a consumer-group rebalance, call `clear()` rather than trying to share state across consumers.
+
 ## "How do I do schema evolution?"
 
 **There is no schema registry.** Wire format is JSON. Producer and consumer must agree on the shape — typically by sharing the type definition (TS interface, Python dataclass, Rust struct) across packages.
