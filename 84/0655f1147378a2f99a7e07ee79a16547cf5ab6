@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  36b642b129ab4a5e 733-764,1913-2102
+net/crates/net/src/adapter/net/continuity/chain.rs
+  36b642b129ab4a5e 653-716,829-834,837-839
+net/crates/net/src/adapter/net/session.rs
+  36b642b129ab4a5e 185,187-212
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "840655f1147378a2f99a7e07ee79a16547cf5ab6",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 5865,
+      "total_deletions": 19,
+      "accepted_lines": 322,
+      "overriden_lines": 0
+    }
+  }
+}
