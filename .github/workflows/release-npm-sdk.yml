@@ -1,0 +1,52 @@
+name: Release NPM SDK
+
+# Publishes `@ai2070/net-sdk` (the pure-TypeScript SDK at
+# `sdk-ts/`) to npm. The napi binding `@ai2070/net` ships via
+# `release-npm.yml`; this is the higher-level wrapper on top.
+#
+# Tag schema: `npm-sdk-v<semver>` (e.g. `npm-sdk-v0.8.0`).
+#
+# Required repository secret: `NPM_TOKEN`
+#   Generate at https://www.npmjs.com/settings/<user>/tokens with
+#   the `Automation` token type so 2FA doesn't block CI publishes.
+
+on:
+  push:
+    tags:
+      - "npm-sdk-v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Build + publish
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net/sdk-ts
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check + compile
+        run: npm run build
+
+      - name: Verify dist/ was produced
+        run: |
+          test -f dist/index.js || (echo "dist/index.js missing"; exit 1)
+          test -f dist/index.d.ts || (echo "dist/index.d.ts missing"; exit 1)
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

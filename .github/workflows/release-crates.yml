@@ -1,0 +1,75 @@
+name: Release Rust crates
+
+# Publishes `ai2070-net` and `ai2070-net-sdk` to crates.io.
+#
+# Tag schema: `crates-v<semver>` (e.g. `crates-v0.8.0`). The two
+# crates publish in dependency order — `ai2070-net` first, then
+# `ai2070-net-sdk` once the index has caught up.
+#
+# Required repository secret: `CARGO_REGISTRY_TOKEN`
+#   Generate at https://crates.io/me with the `publish-update`
+#   scope restricted to `ai2070-net*` after both crates exist on
+#   crates.io. The first publish requires a wider scope (or a
+#   broader account-level token) because crates.io scopes can
+#   only be set on existing crates.
+
+on:
+  push:
+    tags:
+      - "crates-v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish ai2070-net + ai2070-net-sdk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
+
+      # Dry-run the root crate first so a packaging failure
+      # (missing license file, path-only deps, oversized package,
+      # etc.) fails fast before we touch the registry. The SDK
+      # can't be dry-run independently — `cargo publish --dry-run`
+      # tries to resolve every dep against crates.io, and the
+      # SDK's `ai2070-net` dep doesn't exist there until the step
+      # after this one publishes it. The actual SDK publish below
+      # carries its own packaging check.
+      - name: cargo publish --dry-run (ai2070-net)
+        working-directory: net/crates/net
+        run: cargo publish --dry-run
+
+      - name: Publish ai2070-net
+        working-directory: net/crates/net
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
+      # The crates.io sparse index needs a moment to expose the new
+      # version before a dependent crate's publish can resolve it.
+      # 30 s is conservative; raise if the next step starts failing
+      # with "no matching package named `ai2070-net` found".
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish ai2070-net-sdk
+        working-directory: net/crates/net/sdk
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish

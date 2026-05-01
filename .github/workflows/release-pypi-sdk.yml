@@ -1,0 +1,73 @@
+name: Release Python SDK
+
+# Publishes `ai2070-net-sdk` (the pure-Python SDK at `sdk-py/`) to
+# PyPI. The PyO3 binding wheels for `ai2070-net` ship via
+# `release-python.yml`; this is the higher-level setuptools
+# package on top.
+#
+# Tag schema: `pypi-sdk-v<semver>` (e.g. `pypi-sdk-v0.8.0`).
+#
+# Authentication: PyPI Trusted Publishing — the `pypi`
+# environment + `id-token: write` permission combination below.
+# Configure on PyPI under Account → Publishing → Add a new
+# pending publisher with:
+#   - PyPI project name: ai2070-net-sdk
+#   - Owner: ai-2070
+#   - Repository: cyberdeck
+#   - Workflow: release-pypi-sdk.yml
+#   - Environment: pypi
+# This MUST be done before the first run, otherwise publish fails
+# with "OIDC token has no associated publisher".
+
+on:
+  push:
+    tags:
+      - "pypi-sdk-v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net/sdk-py
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install --upgrade pip build
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: pypi-sdk-dist
+          path: net/crates/net/sdk-py/dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: pypi-sdk-dist
+          path: dist/
+
+      - name: List distributions
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

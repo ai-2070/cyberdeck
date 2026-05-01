@@ -4,6 +4,10 @@ version = "0.8.0"
 edition = "2021"
 description = "Ergonomic Rust SDK for the Net mesh network"
 license = "Apache-2.0"
+repository = "https://github.com/ai-2070/cyberdeck"
+readme = "README.md"
+keywords = ["net", "mesh", "event-bus", "streaming"]
+categories = ["asynchronous", "network-programming"]
 
 [lib]
 # Keep the crate name as `net_sdk` so `use net_sdk::...` resolves
@@ -12,7 +16,9 @@ license = "Apache-2.0"
 name = "net_sdk"
 
 [dependencies]
-net = { package = "ai2070-net", path = "..", features = [] }
+# `version` is required for `cargo publish` to resolve the dep on
+# crates.io; the `path` is preferred during local workspace builds.
+net = { package = "ai2070-net", version = "0.8.0", path = "..", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
