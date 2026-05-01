@@ -1,0 +1,25 @@
+net/crates/net/docs/BUG_AUDIT_2026_04_30_CORE.md
+  36b642b129ab4a5e 356
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  36b642b129ab4a5e 1492-1543
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b8b02dc86655028fe8d1f3596693da51f6a6f2bc",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 53,
+      "total_deletions": 0,
+      "accepted_lines": 53,
+      "overriden_lines": 0
+    }
+  }
+}
