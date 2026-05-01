@@ -43,7 +43,20 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter --features redis
           sccache: "true"
-          manylinux: auto
+          # Use manylinux_2_28 (Rocky 8, gcc 11+) instead of the
+          # default `auto` (which picks manylinux2014 with gcc 4.8).
+          # ring 0.17's ARM assembly fails to compile under the
+          # older toolchain because __ARM_ARCH is not defined for
+          # .S files.
+          manylinux: 2_28
+          # Belt-and-suspenders for the same ring/aarch64 issue:
+          # explicitly define __ARM_ARCH=8 for cross-compiled .S
+          # files. Harmless on x86_64 (the env var is only consumed
+          # by the aarch64 cross-toolchain) and a no-op on
+          # manylinux_2_28's modern gcc, but kept as a safety net
+          # in case the manylinux base ever rolls back.
+          before-script-linux: |
+            export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
           working-directory: net/crates/net/bindings/python
 
       - name: Upload wheels
