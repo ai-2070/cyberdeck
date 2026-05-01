@@ -942,7 +942,15 @@ impl ContextStore {
 
         self.sampled_count.fetch_add(1, Ordering::Relaxed);
 
-        self.contexts.insert(
+        // Two threads racing on the same `trace_id` both pass the
+        // `contains_key` check above (TOCTOU) and both reserve a
+        // slot via `try_reserve_slot`. `DashMap::insert` overwrites
+        // the existing entry and returns the prior value; the
+        // losing thread did not actually grow the map, so its
+        // reservation is a leak. Inspect the return: when a prior
+        // entry existed we release one slot to keep `active_count`
+        // in lockstep with the map size.
+        let prev = self.contexts.insert(
             ctx.trace_id,
             ContextEntry {
                 context: ctx.clone(),
@@ -950,6 +958,9 @@ impl ContextStore {
                 spans: Vec::new(),
             },
         );
+        if prev.is_some() {
+            self.release_slot();
+        }
 
         Ok(ctx)
     }
@@ -1480,6 +1491,49 @@ mod tests {
             stats.dropped_traces > 0,
             "with 128 attempts and a cap of 32, some inserts must have been dropped",
         );
+    }
+
+    /// Two threads calling `continue_context` with the SAME trace_id
+    /// must not strand `active_count` slots when `DashMap::insert`
+    /// overwrites a prior entry. Pre-fix the duplicate-insert path
+    /// reserved a slot but never released it on overwrite, so each
+    /// duplicate `continue_context` permanently consumed one slot
+    /// of capacity even though the map size never grew past 1. After
+    /// `n` duplicates against the same trace_id the store would
+    /// refuse new admissions despite `contexts.len() == 1`.
+    #[test]
+    fn continue_context_duplicate_trace_id_does_not_leak_capacity() {
+        const MAX_TRACES: usize = 4;
+        let store = ContextStore::new(MAX_TRACES, 10, Duration::from_secs(60))
+            .with_sampling(SamplingStrategy::AlwaysOn);
+        let node_id = test_node_id();
+
+        // Build a single context once and replay it `MAX_TRACES * 4`
+        // times. Pre-fix this stranded `MAX_TRACES * 4 - 1` slots and
+        // the next fresh `create_context` would hit CapacityExceeded.
+        let ctx = Context::new(node_id);
+        for _ in 0..(MAX_TRACES * 4) {
+            store
+                .continue_context(ctx.clone())
+                .expect("duplicate continue_context must succeed");
+        }
+
+        // Map only ever holds the one entry.
+        assert_eq!(
+            store.stats().active_traces,
+            1,
+            "duplicate continue_context must not grow the map",
+        );
+
+        // The store still has room for `MAX_TRACES - 1` brand-new
+        // traces. Pre-fix this loop tripped CapacityExceeded on the
+        // first iteration because every duplicate had silently
+        // consumed a slot.
+        for _ in 0..(MAX_TRACES - 1) {
+            store
+                .create_context(node_id)
+                .expect("active_count must reflect map size, not duplicate-insert count");
+        }
     }
 
     /// `complete_trace` releases an `active_count` slot so the

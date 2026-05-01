@@ -541,11 +541,45 @@ impl NodeMetadata {
                 MAX_HOP_DISTANCES
             )));
         }
+        // Cubic-ai P2: hop_distances keys are unbounded `String`s.
+        // Without a per-key length check a peer could ship a single
+        // multi-megabyte key inside a perfectly-counted map and
+        // smuggle the bound past validate_bounds.
+        for k in self.topology.hop_distances.keys() {
+            if k.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "hop_distances key exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
         if self.topology.public_addresses.len() > MAX_PUBLIC_ADDRESSES {
             return Err(MetadataError::Invalid(format!(
                 "public_addresses exceed {} entries",
                 MAX_PUBLIC_ADDRESSES
             )));
+        }
+        // Cubic-ai P2: nested LocationInfo strings (`zone`, `provider`,
+        // `datacenter`, `country_code`, `city`) were never length-
+        // checked. validate_bounds capped the top-level fields and
+        // collection counts, but a peer could pin oversized strings
+        // inside `location` and slip past every existing guard.
+        if let Some(loc) = &self.location {
+            for (label, field) in [
+                ("location.zone", &loc.zone),
+                ("location.provider", &loc.provider),
+                ("location.datacenter", &loc.datacenter),
+                ("location.country_code", &loc.country_code),
+                ("location.city", &loc.city),
+            ] {
+                if let Some(v) = field {
+                    if v.len() > MAX_METADATA_STRING_LEN {
+                        return Err(MetadataError::Invalid(format!(
+                            "{label} exceeds {MAX_METADATA_STRING_LEN} bytes",
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1829,5 +1863,94 @@ mod tests {
         assert_eq!(stats.by_status.get(&NodeStatus::Offline), Some(&2));
         assert_eq!(stats.queries, 2);
         assert_eq!(stats.updates, 5);
+    }
+
+    // ========================================================================
+    // Cubic-ai P2: validate_bounds must walk nested structs, not just
+    // top-level fields and collection counts
+    // ========================================================================
+
+    /// `validate_bounds` rejects metadata whose nested
+    /// `LocationInfo::provider` exceeds `MAX_METADATA_STRING_LEN`.
+    /// Pre-fix only top-level strings (`name`, `description`,
+    /// `owner`) and collection counts were checked, so a peer could
+    /// stuff arbitrary multi-megabyte data into `location.provider`
+    /// (or any other LocationInfo string) and slip past every guard.
+    #[test]
+    fn validate_bounds_rejects_oversized_location_string() {
+        let mut node = NodeMetadata::new(make_node_id(1));
+        node.location = Some(LocationInfo {
+            region: Region::NorthAmerica("us-east".into()),
+            zone: None,
+            latitude: None,
+            longitude: None,
+            asn: None,
+            provider: Some("p".repeat(MAX_METADATA_STRING_LEN + 1)),
+            datacenter: None,
+            country_code: None,
+            city: None,
+        });
+
+        match node.validate_bounds() {
+            Err(MetadataError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("location.provider"),
+                    "rejection must name the offending field; got: {msg}",
+                );
+            }
+            other => panic!("expected Invalid for oversized location.provider, got {other:?}"),
+        }
+    }
+
+    /// `validate_bounds` rejects metadata whose `hop_distances` contains
+    /// a key longer than `MAX_METADATA_STRING_LEN`. Pre-fix only the
+    /// map cardinality was capped — a single oversized key inside an
+    /// otherwise small map smuggled the check.
+    #[test]
+    fn validate_bounds_rejects_oversized_hop_distances_key() {
+        let mut topo = TopologyHints::new(NetworkTier::Consumer);
+        topo.hop_distances
+            .insert("k".repeat(MAX_METADATA_STRING_LEN + 1), 3);
+        let node = NodeMetadata::new(make_node_id(1)).with_topology(topo);
+
+        match node.validate_bounds() {
+            Err(MetadataError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("hop_distances key"),
+                    "rejection must name the offending field; got: {msg}",
+                );
+            }
+            other => {
+                panic!("expected Invalid for oversized hop_distances key, got {other:?}")
+            }
+        }
+    }
+
+    /// Belt-and-braces happy path: a complete metadata bundle with
+    /// every nested field at exactly `MAX_METADATA_STRING_LEN` must
+    /// pass — the new checks are bound-strict (`>`, not `>=`), so a
+    /// future tightening that flipped the comparator would lock out
+    /// legitimate boundary callers and this test would catch it.
+    #[test]
+    fn validate_bounds_accepts_at_boundary_lengths() {
+        let mut node = NodeMetadata::new(make_node_id(1));
+        node.location = Some(LocationInfo {
+            region: Region::Europe("uk".into()),
+            zone: Some("z".repeat(MAX_METADATA_STRING_LEN)),
+            latitude: None,
+            longitude: None,
+            asn: None,
+            provider: Some("p".repeat(MAX_METADATA_STRING_LEN)),
+            datacenter: Some("d".repeat(MAX_METADATA_STRING_LEN)),
+            country_code: Some("c".repeat(MAX_METADATA_STRING_LEN)),
+            city: Some("y".repeat(MAX_METADATA_STRING_LEN)),
+        });
+        let mut topo = TopologyHints::new(NetworkTier::Consumer);
+        topo.hop_distances
+            .insert("k".repeat(MAX_METADATA_STRING_LEN), 1);
+        node.topology = topo;
+
+        node.validate_bounds()
+            .expect("at-boundary nested strings must validate");
     }
 }
