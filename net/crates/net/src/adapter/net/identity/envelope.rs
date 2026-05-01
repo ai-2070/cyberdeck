@@ -300,13 +300,12 @@ impl IdentityEnvelope {
         chain_link: &CausalLink,
         expected_signer_pub: Option<&[u8; 32]>,
     ) -> Result<EntityKeypair, EnvelopeError> {
-        // Step 0 (BUG #127): early-reject if the caller knows
-        // which source identity they expected and this envelope's
-        // `signer_pub` doesn't match. Constant-time-ish compare not
-        // strictly needed (the field is public and an attacker
-        // can already inspect it), but avoiding the cryptographic
-        // work below for every wrong envelope is the load-bearing
-        // benefit.
+        // Step 0: early-reject if the caller knows which source
+        // identity they expected and this envelope's `signer_pub`
+        // doesn't match. Constant-time-ish compare not strictly
+        // needed (the field is public and an attacker can already
+        // inspect it), but avoiding the cryptographic work below
+        // for every wrong envelope is the load-bearing benefit.
         if let Some(expected) = expected_signer_pub {
             if &self.signer_pub != expected {
                 return Err(EnvelopeError::InvalidSignerKey);
@@ -343,15 +342,14 @@ impl IdentityEnvelope {
         let mut key = derive_key(shared.as_bytes(), KDF_DOMAIN_KEY);
         let nonce = derive_nonce(eph_pk.as_bytes(), &self.target_static_pub);
 
-        // BUG #127: AAD must match what `seal` used so the AEAD
-        // tag binds the chain_link to the ciphertext. A tampered
-        // link will fail the signature check above AND the AEAD
-        // tag here.
+        // AAD must match what `seal` used so the AEAD tag binds
+        // the chain_link to the ciphertext. A tampered link will
+        // fail the signature check above AND the AEAD tag here.
         //
-        // CR-5: rolling-upgrade compatibility. Pre-#127 envelopes
-        // were sealed with `aad = &[]`; post-#127 envelopes seal
-        // with `aad = chain_link.to_bytes()`. The on-the-wire shape
-        // is byte-identical (AAD is a hashed input to the AEAD tag,
+        // Rolling-upgrade compatibility: legacy envelopes were
+        // sealed with `aad = &[]`; current envelopes seal with
+        // `aad = chain_link.to_bytes()`. The on-the-wire shape is
+        // byte-identical (AAD is a hashed input to the AEAD tag,
         // not stored in the ciphertext), so we cannot distinguish
         // v0 from v1 by inspection. We try v1 first, and on AEAD
         // failure fall back to v0 — the legacy envelope opens
