@@ -1,0 +1,57 @@
+README.md
+  64958cb6fb55fe73 475-489
+net/crates/net/sdk-py/README.md
+  ec31799eca66c3d7 10,13
+net/crates/net/bindings/python/README.md
+  64958cb6fb55fe73 8,11
+net/crates/net/sdk/README.md
+  64958cb6fb55fe73 9-14,17,20-21,24-28
+net/crates/net/README.md
+  64958cb6fb55fe73 735-743
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d27eee9b00c15445a115b4e44b6bdc5b7723e5c2",
+  "prompts": {
+    "64958cb6fb55fe73": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81cf66b-69b3-455c-bab9-06a87305bb12",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 42,
+      "total_deletions": 16,
+      "accepted_lines": 711,
+      "overriden_lines": 0
+    },
+    "7cd1aa3948e2e296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad152adb-b4ac-4388-af9c-44b44434d029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1030,
+      "total_deletions": 7,
+      "accepted_lines": 1030,
+      "overriden_lines": 0
+    },
+    "ec31799eca66c3d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "924cf2e2-afc4-486f-89aa-7f72c08e2dc6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2,
+      "total_deletions": 2,
+      "accepted_lines": 2,
+      "overriden_lines": 0
+    }
+  }
+}
