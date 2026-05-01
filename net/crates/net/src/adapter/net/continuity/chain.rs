@@ -697,13 +697,13 @@ mod tests {
     /// when the real cause was "snapshot deserialized without
     /// out-of-band head_payload transfer."
     ///
-    /// CR-34 contract: `assess_continuity` distinguishes
-    ///   - genuine chain divergence (`Forked`),
-    ///   - missing context preventing verification (`Unverifiable`).
-    /// An empty `head_payload` for `chain_link.sequence > 0` falls
-    /// in the second bucket. Genesis snapshots
-    /// (`chain_link.sequence == 0`) legitimately carry empty
-    /// `head_payload` and continue through the standard hash path.
+    /// CR-34 contract: `assess_continuity` distinguishes genuine
+    /// chain divergence (`Forked`) from missing context preventing
+    /// verification (`Unverifiable`). An empty `head_payload` for
+    /// `chain_link.sequence > 0` falls in the second bucket.
+    /// Genesis snapshots (`chain_link.sequence == 0`) legitimately
+    /// carry empty `head_payload` and continue through the
+    /// standard hash path.
     #[test]
     fn assess_continuity_unverifiable_when_snapshot_head_payload_is_unpopulated() {
         use crate::adapter::net::state::horizon::ObservedHorizon;

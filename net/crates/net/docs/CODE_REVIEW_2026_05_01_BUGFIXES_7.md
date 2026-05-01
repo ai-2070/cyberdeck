@@ -10,7 +10,7 @@ Each item is tagged `[Critical | High | Medium | Low | Nit]`. Critical items are
 
 **Ship-blockers: ALL FIXED** (CR-1 through CR-5).
 **High-severity: ALL FIXED** (CR-6 through CR-12).
-**Medium-severity: ALL ACTIONABLE ITEMS FIXED** (CR-13 through CR-33; CR-24, CR-32, CR-34, CR-35 deferred — see notes below).
+**Medium-severity: ALL FIXED OR DOCUMENTED** (CR-13 through CR-35).
 
 | ID | Status | Notes |
 |----|--------|-------|
@@ -46,13 +46,12 @@ Each item is tagged `[Critical | High | Medium | Low | Nit]`. Critical items are
 | CR-30 | ✅ Documented | Read-path `validate_bounds` invariant pinned with test |
 | CR-33 | ✅ Documented | `SuperpositionState::continuity_proof` genesis-edge + seq=1 cases pinned |
 
-**Deferred items** (need substantial infrastructure work; tracked as separate audit entries):
-- **CR-24** — `MigrationFailed` arm missing StandbyGroup / CapabilityIndex cleanup. Requires migration-handler refactor; the dispatcher-level fix is non-trivial.
-- **CR-32** — `start_migration` fallback path warns silently in production. Requires either `cfg(test)` gate (with test infrastructure shifts) or a runtime-config flag.
-- **CR-34** — `assess_continuity` `head_payload` contract enforced only by hash mismatch. Production caller of `from_bytes` populating `head_payload` is a wider snapshot-restore refactor.
-- **CR-35** — NAPI/PyO3 `Python::allow_threads` not used on hot mutex paths. Performance concern, not correctness; warrants a binding-level perf pass.
+| CR-24 | ✅ Documented | Investigation found no per-daemon migration-coupled state in StandbyGroup or CapabilityIndex today; source-level tripwire pins this so future coupling forces a migration-handler update |
+| CR-32 | ✅ Fixed | `cfg(not(test))` returns `MigrationError::StateFailed` in production; cfg-test fallback preserved for unit tests; source tripwire |
+| CR-34 | ✅ Fixed | `assess_continuity` returns `Unverifiable` (not `Forked`) when non-genesis snapshot has empty `head_payload`; `DaemonHost::from_snapshot` warns on fallback for non-genesis; 3 regression tests |
+| CR-35 | ✅ Fixed (PyO3) / Documented (NAPI) | PyO3 `is_duplicate` and `clear` now use `py.detach(\|\|...)` to release the GIL; NAPI doesn't have a GIL (audit framing was PyO3-specific) — module-doc clarifies. Source tripwire pins the PyO3 invariant |
 
-Total regression tests added across all 31 closed items: **48** across Rust (lib + integration), Python (pytest), and TypeScript (vitest). Full lib test suite: **1355 passing** (up from 1322 baseline at branch start).
+Total regression tests added across all 35 closed items: **56** across Rust (lib + integration), Python (pytest), and TypeScript (vitest). Full lib test suite: **1360 passing** (up from 1322 baseline at branch start).
 
 ---
 
