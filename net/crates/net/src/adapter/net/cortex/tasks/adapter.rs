@@ -375,11 +375,11 @@ impl TasksAdapter {
     /// mismatch, and surfaces a phantom "concurrent ingest_typed
     /// produced duplicate app_seq" error even though no actual
     /// duplicate happened. Single-adapter timing usually has the
-    /// foreground CAS running first; dual-adapter timing (memories
-    /// + tasks under one NetDb) gives the fold task enough
-    /// head-room to land first and the bug surfaces
-    /// deterministically. The race is in the protocol: `fetch_add`
-    /// sidesteps it.
+    /// foreground CAS running first; dual-adapter timing
+    /// (memories + tasks under one NetDb) gives the fold task
+    /// enough head-room to land first and the bug surfaces
+    /// deterministically. The race is in the protocol:
+    /// `fetch_add` sidesteps it.
     ///
     /// **Why not `fetch_add` then ingest unconditionally?** A
     /// failing ingest must not permanently advance the local

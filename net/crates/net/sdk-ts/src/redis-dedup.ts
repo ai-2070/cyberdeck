@@ -3,16 +3,14 @@
  * class from `@ai2070/net`.
  *
  * The Redis adapter writes a stable `dedup_id` field on every XADD
- * entry — see [BUG #57] in the audit doc and the producer-side
- * contract in `sdk-ts/README.md`. The dedup helper filters
- * producer-retry-induced duplicates at consume time. Default
- * capacity is 4096; production callers should size to roughly
- * `events_per_sec * dedup_window_seconds`.
+ * entry — see the producer-side contract in `sdk-ts/README.md`.
+ * The dedup helper filters producer-retry-induced duplicates at
+ * consume time. Default capacity is 4096; production callers should
+ * size to roughly `events_per_sec * dedup_window_seconds`.
  *
- * CR-3: pre-fix the underlying NAPI class was buildable but the
- * `@ai2070/net-sdk` package never re-exported it, so users following
- * the README's `import { RedisStreamDedup } from '@ai2070/net-sdk'`
- * pattern hit a runtime undefined. This shim closes that gap.
+ * This shim re-exports the underlying NAPI class so users can
+ * `import { RedisStreamDedup } from '@ai2070/net-sdk'` directly
+ * instead of reaching into `@ai2070/net`.
  *
  * @example
  * ```typescript
@@ -33,11 +31,10 @@
  *   const entries = await r.xRange('net:shard:0', start, '+', { COUNT: 100 });
  *   if (entries.length === 0) break;
  *   for (const entry of entries) {
- *     // Cubic P2: advance the cursor BEFORE the duplicate check.
- *     // The earlier shape's `continue` skipped the `cursor = entry.id`
- *     // assignment when an entry was a duplicate, so on a window
- *     // full of duplicates the loop would spin forever re-reading
- *     // the same range.
+ *     // Advance the cursor BEFORE the duplicate check. Skipping
+ *     // the `cursor = entry.id` assignment on duplicate entries
+ *     // (via `continue`) makes the loop spin forever re-reading
+ *     // the same range when a window is full of duplicates.
  *     cursor = entry.id;
  *     const dedupId = entry.message.dedup_id;
  *     if (dedupId && dedup.isDuplicate(dedupId)) continue;

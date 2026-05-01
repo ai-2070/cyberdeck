@@ -167,9 +167,7 @@ impl PermissionToken {
             duration_secs,
             delegation_depth,
         )
-        .expect(
-            "PermissionToken::issue called with a public-only keypair — use try_issue",
-        )
+        .expect("PermissionToken::issue called with a public-only keypair — use try_issue")
     }
 
     /// Fallible counterpart to [`Self::issue`]: returns

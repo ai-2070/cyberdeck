@@ -151,13 +151,12 @@ for entry in stream {
 ```
 
 The helper is transport-agnostic — it answers a test-and-insert
-question against an in-memory LRU. Pre-fix the producer-side
-`MULTI/EXEC`-timeout race (BUG #57) silently produced duplicate
-stream entries with distinct server-generated `*` ids that
-consumers couldn't dedupe; the `dedup_id` field is now stable
-across retries (and across process restart when
-`producer_nonce_path` is configured) so this filter cleanly
-removes them.
+question against an in-memory LRU. The producer-side
+`MULTI/EXEC`-timeout race can otherwise produce duplicate stream
+entries with distinct server-generated `*` ids that consumers
+can't dedupe; the `dedup_id` field is stable across retries
+(and across process restart when `producer_nonce_path` is
+configured) so this filter cleanly removes them.
 
 The helper is also re-exported as `net_sdk::RedisStreamDedup`;
 the canonical impl lives in `net::adapter::RedisStreamDedup`.

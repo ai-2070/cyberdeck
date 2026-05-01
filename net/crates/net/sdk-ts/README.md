@@ -137,8 +137,8 @@ XADD, filterable via the helper below.
 The Redis adapter writes a stable `dedup_id` field on every XADD
 entry (`{producer_nonce:hex}:{shard_id}:{sequence_start}:{i}`).
 Combined with `producerNoncePath` above, the id is stable across
-both retries and process restart — the `MULTI/EXEC` timeout race
-(BUG #57) becomes filterable consumer-side.
+both retries and process restart, so the `MULTI/EXEC` timeout
+race becomes filterable consumer-side.
 
 `RedisStreamDedup` is exposed on the underlying `@ai2070/net`
 NAPI module:
@@ -196,9 +196,6 @@ question against an in-memory LRU. Concurrency: the underlying
 handle wraps a Rust mutex, so concurrent calls from worker
 threads serialize but are safe. Production-shape is one helper
 per consumer worker.
-
-Background: BUG #57 in
-[`docs/BUG_AUDIT_2026_04_30_CORE.md`](../docs/BUG_AUDIT_2026_04_30_CORE.md).
 
 ## NAT Traversal (optimization, not correctness)
 

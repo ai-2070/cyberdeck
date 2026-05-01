@@ -5873,7 +5873,7 @@ impl MeshNode {
         let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
         // Same warm-up rule as `find_nodes_by_filter_scoped` —
-        // see that doc-comment for the rationale (Cubic P1).
+        // see that doc-comment for the rationale.
         let policy_installed = self.local_subnet_policy.is_some();
         self.capability_index
             .find_best_node_scoped(req, scope, |nid| {
@@ -6404,10 +6404,9 @@ impl MeshNode {
         let mut builder = PacketBuilder::new(&[0u8; 32], 0);
         let packet = builder.build_handshake(&msg1);
 
-        // BUG #86: previously this polled `socket_arc.recv_from`
-        // directly, which races `spawn_receive_loop`'s consumer
-        // post-`start()` (tokio dispatches a UDP datagram to
-        // exactly one waiter). The fix:
+        // Polling `socket_arc.recv_from` directly would race
+        // `spawn_receive_loop`'s consumer post-`start()` (tokio
+        // dispatches a UDP datagram to exactly one waiter), so:
         //   - Pre-`start()`: use `recv_from`; the dispatcher isn't
         //     running, so there's no race. This preserves the
         //     existing init-time ordering where `connect()` is
@@ -6880,7 +6879,7 @@ impl MeshNode {
         // entry — a concurrent `request_punch` to the same
         // target installs a new entry (and drops our sender),
         // and that replacement must survive our timeout/send-
-        // failure remove. (Cubic P1.)
+        // failure remove.
         let (tx, rx) = oneshot::channel();
         let gen = self
             .next_waiter_gen

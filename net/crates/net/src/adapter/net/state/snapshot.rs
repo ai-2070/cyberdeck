@@ -271,9 +271,8 @@ impl StateSnapshot {
         // handler) should use `try_to_bytes` so an oversized snapshot
         // surfaces as a `MigrationError::StateFailed(...)` rather than a
         // panic that unwinds across the dispatch task.
-        self.try_to_bytes().expect(
-            "StateSnapshot::to_bytes — call try_to_bytes for fallible serialization",
-        )
+        self.try_to_bytes()
+            .expect("StateSnapshot::to_bytes — call try_to_bytes for fallible serialization")
     }
 
     /// Fallible serialization to bytes.

@@ -157,9 +157,6 @@ for entry_id, fields in r.xrange("net:shard:0", "0", "+"):
         process(entry_id, fields)
 ```
 
-Background: BUG #57 in
-[`docs/BUG_AUDIT_2026_04_30_CORE.md`](../docs/BUG_AUDIT_2026_04_30_CORE.md).
-
 ## NAT Traversal (optimization, not correctness)
 
 Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it; it's never required for connectivity. The surface is exposed on the underlying `net` PyO3 module and is a no-op when the native package was built without `--features nat-traversal`.

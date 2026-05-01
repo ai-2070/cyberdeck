@@ -1442,10 +1442,10 @@ mod tests {
     }
 
     /// CR-32: pin that the unwired-source-handler path emits a
-    /// loud `tracing::warn!` referencing `source_handler` and
-    /// `BUG #104`. Pre-CR-32 the path silently fell back to
-    /// `daemon_registry.snapshot` — events arriving between
-    /// snapshot capture and cutover got lost.
+    /// loud `tracing::warn!` referencing `source_handler`. Pre-fix
+    /// this path silently fell back to `daemon_registry.snapshot`
+    /// — events arriving between snapshot capture and cutover got
+    /// lost.
     ///
     /// History: an earlier attempt added a `cfg(not(test))` gate
     /// that returned `Err` in production. That broke integration
@@ -1458,13 +1458,13 @@ mod tests {
     ///
     /// Tripwire pins the warn-message shape so a future maintainer
     /// who removes the `tracing::warn!` (or drops the
-    /// `source_handler` / BUG #104 references) trips the test.
+    /// `source_handler` reference) trips the test.
     #[test]
     fn cr32_unwired_source_handler_must_emit_loud_warn() {
         let src = include_str!("orchestrator.rs");
 
-        // Cubic P2: anchor on a string we BUILD at runtime so this
-        // test's own source doesn't contain the verbatim anchor —
+        // Anchor on a string we BUILD at runtime so this test's
+        // own source doesn't contain the verbatim anchor —
         // otherwise `src.find(anchor)` would match the test's own
         // literal and the test would silently pass even after the
         // production warn block was removed.
@@ -1473,25 +1473,22 @@ mod tests {
         // production comment line, which writes the marker as
         // a plain English phrase rather than concatenating
         // fragments.
-        let anchor = format!(
-            "{}{}{}",
-            "CR-32: surface ", "the unwired-", "source-handler"
-        );
+        let anchor = format!("{}{}{}", "Surface ", "the unwired-", "source-handler");
         let anchor_idx = src.find(&anchor).expect(
-            "CR-32 regression: the production CR-32 marker in start_migration's None \
-             arm is gone — either the fix was reverted or the comment was rewritten. \
-             If the fix is intentionally being changed, update this test.",
+            "regression: the production unwired-source-handler marker in \
+             start_migration's None arm is gone — either the fix was reverted or \
+             the comment was rewritten. If the fix is intentionally being changed, \
+             update this test.",
         );
 
         // Sanity: the anchor must occur exactly ONCE so the
-        // production block is the only match (Cubic P2: the
-        // earlier shape would falsely pass if the anchor existed
-        // anywhere else in the file, including in this test's
-        // own source).
+        // production block is the only match. The earlier shape
+        // would falsely pass if the anchor existed anywhere else
+        // in the file, including in this test's own source.
         let occurrences = src.matches(&anchor).count();
         assert_eq!(
             occurrences, 1,
-            "CR-32 anchor must occur exactly once in orchestrator.rs (production \
+            "anchor must occur exactly once in orchestrator.rs (production \
              site). Got {occurrences} occurrences — the test source likely contains \
              a verbatim copy of the anchor, defeating the tripwire."
         );
@@ -1503,21 +1500,21 @@ mod tests {
             .join("\n");
         assert!(
             block.contains("tracing::warn!"),
-            "CR-32 regression: unwired-source-handler path must emit \
+            "regression: unwired-source-handler path must emit \
              tracing::warn!. Block:\n{}",
             block
         );
         assert!(
             block.contains("source_handler"),
-            "CR-32 regression: warn message must reference source_handler"
+            "regression: warn message must reference source_handler"
         );
-        // Build the BUG/CR-32 needles at runtime too, same reason.
-        let bug_needle = format!("{} {}", "BUG", "#104");
-        let cr32_needle = format!("{}-{}", "CR", "32");
         assert!(
-            block.contains(&bug_needle) || block.contains(&cr32_needle),
-            "CR-32 regression: warn message must reference BUG #104 or CR-32 \
-             so log scrapers can correlate the warn with the audit-doc context"
+            block.contains("MigrationDispatcher::new") || block.contains("with_source_handler"),
+            "regression: warn message must point operators at how to wire \
+             the handler (`MigrationDispatcher::new` or \
+             `MigrationOrchestrator::with_source_handler`) so the log line is \
+             actionable. Block:\n{}",
+            block
         );
     }
 
