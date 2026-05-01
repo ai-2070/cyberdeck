@@ -1,7 +1,5 @@
 # Net v0.8 — "Killing Moon"
 
-The first cut.
-
 Net is a mesh runtime. Identity is cryptographic, channels are hierarchical, state is causal, and compute moves. There is no broker, no leader, no central directory. Every node is its own keypair. Every event is signed into a chain you can verify without trusting the network underneath. The network is the substrate; the entities are what matter.
 
 This is what we have to show on day one.
