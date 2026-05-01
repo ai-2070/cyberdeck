@@ -67,18 +67,13 @@ impl BatchedTransport {
 
             addrs.push(unsafe { std::mem::zeroed() });
 
-            msgs.push(libc::mmsghdr {
-                msg_hdr: libc::msghdr {
-                    msg_name: std::ptr::null_mut(),
-                    msg_namelen: 0,
-                    msg_iov: std::ptr::null_mut(),
-                    msg_iovlen: 0,
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
-                    msg_flags: 0,
-                },
-                msg_len: 0,
-            });
+            // `mem::zeroed` rather than struct-literal: musl's
+            // `libc::msghdr` carries private `__pad1` / `__pad2`
+            // fields that aren't constructible from a literal,
+            // and zero-init is the correct initial state for all
+            // fields we use here. Same applies to every
+            // `self.msgs[i].msg_hdr = ...` assignment below.
+            msgs.push(unsafe { std::mem::zeroed() });
 
             if with_recv_buffers {
                 recv_buffers.push(BytesMut::with_capacity(MAX_PACKET_SIZE));
@@ -147,15 +142,16 @@ impl BatchedTransport {
 
             self.addrs[i] = target_addr;
 
-            self.msgs[i].msg_hdr = libc::msghdr {
-                msg_name: &mut self.addrs[i] as *mut _ as *mut _,
-                msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as u32,
-                msg_iov: &mut self.iovecs[i],
-                msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            };
+            // See `new_inner` for the rationale: musl's `msghdr`
+            // has private padding fields, so we zero the struct
+            // and overwrite the public fields rather than using a
+            // struct literal.
+            self.msgs[i].msg_hdr = unsafe { std::mem::zeroed() };
+            self.msgs[i].msg_hdr.msg_name = &mut self.addrs[i] as *mut _ as *mut _;
+            self.msgs[i].msg_hdr.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_in>() as u32;
+            self.msgs[i].msg_hdr.msg_iov = &mut self.iovecs[i];
+            self.msgs[i].msg_hdr.msg_iovlen = 1;
             self.msgs[i].msg_len = 0;
         }
 
@@ -233,15 +229,13 @@ impl BatchedTransport {
 
             self.addrs[i] = unsafe { std::mem::zeroed() };
 
-            self.msgs[i].msg_hdr = libc::msghdr {
-                msg_name: &mut self.addrs[i] as *mut _ as *mut _,
-                msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as u32,
-                msg_iov: &mut self.iovecs[i],
-                msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            };
+            // See `new_inner` for the zero-then-assign rationale.
+            self.msgs[i].msg_hdr = unsafe { std::mem::zeroed() };
+            self.msgs[i].msg_hdr.msg_name = &mut self.addrs[i] as *mut _ as *mut _;
+            self.msgs[i].msg_hdr.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_in>() as u32;
+            self.msgs[i].msg_hdr.msg_iov = &mut self.iovecs[i];
+            self.msgs[i].msg_hdr.msg_iovlen = 1;
             self.msgs[i].msg_len = 0;
         }
 
@@ -251,7 +245,10 @@ impl BatchedTransport {
                 self.socket_fd,
                 self.msgs.as_mut_ptr(),
                 count as u32,
-                libc::MSG_DONTWAIT, // Non-blocking
+                // `as _` so the constant matches `recvmmsg`'s
+                // flags-arg type — `c_int` on glibc, `c_uint` on
+                // musl.
+                libc::MSG_DONTWAIT as _,
                 std::ptr::null_mut(),
             )
         };
@@ -312,15 +309,13 @@ impl BatchedTransport {
 
             self.addrs[i] = unsafe { std::mem::zeroed() };
 
-            self.msgs[i].msg_hdr = libc::msghdr {
-                msg_name: &mut self.addrs[i] as *mut _ as *mut _,
-                msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as u32,
-                msg_iov: &mut self.iovecs[i],
-                msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            };
+            // See `new_inner` for the zero-then-assign rationale.
+            self.msgs[i].msg_hdr = unsafe { std::mem::zeroed() };
+            self.msgs[i].msg_hdr.msg_name = &mut self.addrs[i] as *mut _ as *mut _;
+            self.msgs[i].msg_hdr.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_in>() as u32;
+            self.msgs[i].msg_hdr.msg_iov = &mut self.iovecs[i];
+            self.msgs[i].msg_hdr.msg_iovlen = 1;
             self.msgs[i].msg_len = 0;
         }
 
@@ -330,7 +325,9 @@ impl BatchedTransport {
                 self.socket_fd,
                 self.msgs.as_mut_ptr(),
                 count as u32,
-                0, // Blocking
+                // Blocking. `as _` for the same flags-arg type
+                // mismatch between glibc/musl noted above.
+                0_i32 as _,
                 std::ptr::null_mut(),
             )
         };
