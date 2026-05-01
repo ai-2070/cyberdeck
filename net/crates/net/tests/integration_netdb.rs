@@ -301,6 +301,91 @@ async fn test_netdb_tasks_without_with_tasks_panics() {
     let _ = db.tasks();
 }
 
+/// Regression: under one `NetDb` with BOTH tasks and memories
+/// enabled, alternating ingests across the two adapters must
+/// not surface `concurrent ingest_typed produced duplicate
+/// app_seq` errors.
+///
+/// The pre-fix `ingest_typed` did `load → ingest → CAS-commit`
+/// on `app_seq`. When the `WatermarkingFold` task processed the
+/// just-ingested event before the foreground thread reached its
+/// CAS, the watermark advanced to the expected post-CAS value
+/// and the CAS surfaced a phantom-duplicate error. Single-
+/// adapter tests timed the foreground CAS first and didn't see
+/// the race; dual-adapter timing (tasks operations between two
+/// memories ingests) gave the memories fold task enough head-
+/// room to land first and the bug fired deterministically (the
+/// node-side `npm test` was the canary). Post-fix the adapter
+/// uses `fetch_add` to reserve `app_seq` atomically before
+/// ingest — the watermark and the foreground writer no longer
+/// fight over the same value.
+#[tokio::test]
+async fn test_regression_dual_model_alternating_ingests_do_not_produce_duplicate_app_seq() {
+    let redex = Redex::new();
+    let db = NetDb::builder(redex)
+        .origin(ORIGIN)
+        .with_tasks()
+        .with_memories()
+        .build()
+        .await
+        .unwrap();
+
+    db.tasks().create(1, "task", 100).unwrap();
+    db.memories()
+        .store(1, "mem", vec!["x".to_string()], "alice", 100)
+        .unwrap();
+    let t_seq = db.tasks().complete(1, 150).unwrap();
+    // Pre-fix this returned `Err(...concurrent ingest_typed produced
+    // duplicate app_seq=1...)` because the memories fold task had
+    // advanced `memories.app_seq` to 2 between the foreground
+    // load (1) and the foreground CAS, leaving the load value
+    // stale.
+    let m_seq = db
+        .memories()
+        .pin(1, 150)
+        .expect("dual-model ingest must not surface phantom-duplicate app_seq");
+
+    db.tasks().wait_for_seq(t_seq).await;
+    db.memories().wait_for_seq(m_seq).await;
+
+    assert_eq!(db.tasks().count(), 1);
+    assert_eq!(db.memories().count(), 1);
+}
+
+/// Stress companion to the alternating-ingests regression: a
+/// tighter loop hammers both adapters under one NetDb to maximize
+/// the WatermarkingFold-vs-foreground race window. Pre-fix this
+/// would surface `concurrent ingest_typed produced duplicate
+/// app_seq` on at least one of the iterations on most runs.
+#[tokio::test]
+async fn test_regression_dual_model_stress_no_phantom_duplicate_app_seq() {
+    let redex = Redex::new();
+    let db = NetDb::builder(redex)
+        .origin(ORIGIN)
+        .with_tasks()
+        .with_memories()
+        .build()
+        .await
+        .unwrap();
+
+    const N: u64 = 50;
+    for i in 1..=N {
+        db.tasks().create(i, "t", 100 * i).unwrap();
+        db.memories()
+            .store(i, "m", vec!["t".to_string()], "alice", 100 * i)
+            .unwrap();
+    }
+    // Final round-trip — each must succeed cleanly and the
+    // watermarks must converge.
+    let t_last = db.tasks().complete(N, 999).unwrap();
+    let m_last = db.memories().pin(N, 999).unwrap();
+    db.tasks().wait_for_seq(t_last).await;
+    db.memories().wait_for_seq(m_last).await;
+
+    assert_eq!(db.tasks().count(), N as usize);
+    assert_eq!(db.memories().count(), N as usize);
+}
+
 #[tokio::test]
 async fn test_regression_build_from_snapshot_error_path_is_clean() {
     // Regression: `build_from_snapshot` used to open the tasks

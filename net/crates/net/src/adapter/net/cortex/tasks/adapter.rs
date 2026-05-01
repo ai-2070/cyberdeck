@@ -367,13 +367,35 @@ impl TasksAdapter {
     /// same `origin_hash` recovered via on-disk scan).
     ///
     /// Now: load the current counter, build the envelope at that
-    /// value, attempt the ingest, and only if it succeeds do we
-    /// CAS-commit the counter advance. On CAS contention (a
-    /// concurrent ingest moved the counter past us), we retry with
-    /// the new value — the inner ingest IS retried because each
-    /// attempt produces a fresh `EventEnvelope` with the right
-    /// `seq_or_ts`. The Redex log is the source of truth; counter
-    /// drift never escapes this function.
+    /// BUG #126 + dual-model regression fix.
+    ///
+    /// `app_seq` is reserved with a single atomic `fetch_add`
+    /// before constructing the `EventEnvelope`. `inner.ingest`
+    /// then commits the envelope to the Redex log. If the ingest
+    /// fails, the reserved seq is "lost" — i.e. the per-origin
+    /// `seq_or_ts` space has a one-unit gap — which is harmless:
+    ///
+    ///   * `WatermarkingFold` (BUG #148) advances via `fetch_max`
+    ///     against events that actually landed in the log. The
+    ///     gap from a failed ingest is invisible to the watermark.
+    ///   * The next successful ingest gets a strictly-larger seq,
+    ///     so no duplicate is ever stamped.
+    ///   * `seq_or_ts` is not required to be contiguous — it's a
+    ///     monotonic per-origin tag, nothing more.
+    ///
+    /// **Why not load + ingest + CAS-commit?** That shape was the
+    /// pre-regression BUG #126 fix, but it races against the
+    /// `WatermarkingFold` task: when the fold processes the
+    /// just-ingested event before the foreground thread's CAS
+    /// runs, the watermark advances to the expected post-CAS
+    /// value, the CAS observes the now-stale `app_seq` mismatch,
+    /// and surfaces a phantom `concurrent ingest_typed produced
+    /// duplicate app_seq` error even though no actual duplicate
+    /// happened. Single-adapter timing usually had the foreground
+    /// CAS running first; dual-adapter timing (memories + tasks
+    /// under one NetDb) gave the fold task enough head-room to
+    /// land first and the bug surfaced deterministically. The
+    /// race is in the protocol: `fetch_add` sidesteps it.
     fn ingest_typed<T: serde::Serialize>(
         &self,
         dispatch: u8,
@@ -387,55 +409,10 @@ impl TasksAdapter {
         let checksum = compute_checksum(&tail);
         let payload_bytes = Bytes::from(tail);
 
-        // Load → build envelope → ingest → CAS-commit. Both
-        // branches of the CAS return immediately, so this is a
-        // single-pass block (not a `loop`); a CAS-failure here
-        // surfaces as a `RedexError::Encode` rather than a retry,
-        // because `inner.ingest` already committed the envelope
-        // to the log under our (now-stale) `app_seq`.
-        let app_seq = self.app_seq.load(Ordering::Acquire);
+        let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
         let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
         let env = EventEnvelope::new(meta, payload_bytes);
-        let seq = self.inner.ingest(env)?;
-
-        // Commit the counter advance now that the log has
-        // accepted the entry. CAS to defend against a concurrent
-        // ingest that moved the counter past `app_seq` between
-        // our load and the inner ingest — in that case we'd be
-        // stamping the SAME `seq_or_ts` as another envelope,
-        // producing a dup.
-        //
-        // In practice every external caller goes through a single
-        // shared `&TasksAdapter` instance and this function is
-        // the only counter writer, so contention is dominated by
-        // single-thread sequential ingest where the CAS always
-        // succeeds on the first try. Multi-threaded ingest
-        // produces ordering uncertainty regardless of counter
-        // primitive — the user-visible app_seq just tracks
-        // insertion order at the call site.
-        match self.app_seq.compare_exchange(
-            app_seq,
-            app_seq + 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(seq),
-            Err(_actual) => {
-                // A concurrent ingest stamped the same
-                // `seq_or_ts`. The log already has our event, so
-                // we can't roll back; surface a recoverable
-                // error. The caller's options are: rebuild the
-                // adapter from snapshot (scans the log to
-                // reconcile app_seq), or accept the duplicate.
-                Err(CortexAdapterError::Redex(
-                    super::super::super::redex::RedexError::Encode(format!(
-                        "concurrent ingest_typed produced duplicate app_seq={}; \
-                         rebuild adapter from snapshot to reconcile",
-                        app_seq
-                    )),
-                ))
-            }
-        }
+        self.inner.ingest(env)
     }
 }
 

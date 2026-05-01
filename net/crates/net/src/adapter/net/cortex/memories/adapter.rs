@@ -329,10 +329,12 @@ impl MemoriesAdapter {
     }
 
     /// BUG #126: see `tasks/adapter.rs::ingest_typed` for the full
-    /// rationale. Same hazard pattern: pre-fix `app_seq` advanced
-    /// before the inner ingest, leaving a phantom seq on
-    /// `inner.ingest` failure. Now: load → build envelope → ingest
-    /// → CAS-commit, mirroring the tasks adapter.
+    /// rationale. Same shape as the tasks adapter: a single
+    /// `fetch_add` reserves the next `app_seq` atomically before
+    /// ingest; on `inner.ingest` failure we leave a small gap in
+    /// the per-origin sequence space, which is harmless because
+    /// `WatermarkingFold` (BUG #148) advances via `fetch_max`
+    /// against events that actually landed in the log.
     fn ingest_typed<T: serde::Serialize>(
         &self,
         dispatch: u8,
@@ -347,27 +349,11 @@ impl MemoriesAdapter {
         let payload_bytes = Bytes::from(tail);
 
         // See `tasks/adapter.rs::ingest_typed` for the full
-        // load → ingest → CAS-commit rationale.
-        let app_seq = self.app_seq.load(Ordering::Acquire);
+        // fetch_add rationale.
+        let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
         let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
         let env = EventEnvelope::new(meta, payload_bytes);
-        let seq = self.inner.ingest(env)?;
-
-        match self.app_seq.compare_exchange(
-            app_seq,
-            app_seq + 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(seq),
-            Err(_actual) => Err(CortexAdapterError::Redex(
-                super::super::super::redex::RedexError::Encode(format!(
-                    "concurrent ingest_typed produced duplicate app_seq={}; \
-                     rebuild adapter from snapshot to reconcile",
-                    app_seq
-                )),
-            )),
-        }
+        self.inner.ingest(env)
     }
 }
 
