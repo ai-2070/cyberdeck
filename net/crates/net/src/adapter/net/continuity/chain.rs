@@ -596,88 +596,72 @@ mod tests {
     // not just its sequence slot
     // ========================================================================
 
-    /// A log starting at seq 1 whose first event has a forged
-    /// `parent_hash` (anything other than the canonical
-    /// genesis-successor hash) must be reported as `Forked` at the
-    /// anchor — pre-fix any first event with `sequence == 1` was
-    /// admitted regardless of its parent_hash, so an attacker who
-    /// knew the origin_hash could ship a fabricated genesis-successor
-    /// and have the chain accepted as continuous.
+    /// A real, post-prune log paired with a snapshot whose
+    /// `through_seq` matches but whose `chain_link` / `head_payload`
+    /// do NOT match the log's actual anchor must be reported as
+    /// `Forked` — not `Continuous`. Pre-fix the snapshot-anchor
+    /// check matched only on `through_seq`, so a caller (or attacker
+    /// supplying a snapshot) could pass any junk pair and have the
+    /// log accepted as anchored. With the anchor parent_hash check
+    /// in place, the log's seq-11 event reports its real parent_hash
+    /// (computed against the real seq-10 event), which doesn't match
+    /// the synthetic-genesis-link hash the snapshot supplies — so the
+    /// chain reads as a fork at the anchor.
     #[test]
-    fn assess_continuity_forked_when_genesis_first_event_parent_hash_mismatches() {
-        use crate::adapter::net::state::causal::CausalEvent;
+    fn assess_continuity_forked_when_snapshot_chain_link_mismatches_log_anchor() {
+        use crate::adapter::net::state::horizon::ObservedHorizon;
 
-        let (log, _) = build_log(5);
-        let real_first = log.range(1, 1)[0].clone();
+        let (mut log, _) = build_log(20);
+        log.prune_through(10);
 
-        // Build a forged log on the SAME origin (so the OriginMismatch
-        // path is not what's tripping). Replace the first event's
-        // parent_hash with junk; everything else stays valid.
-        let mut forged_log = EntityLog::new(log.entity_id().clone());
-        let mut forged_first = real_first.clone();
-        forged_first.link.parent_hash ^= 0xDEAD_BEEF_CAFE_F00D;
-        forged_log
-            .append(CausalEvent {
-                link: forged_first.link,
-                payload: forged_first.payload,
-                received_at: forged_first.received_at,
-            })
-            .unwrap();
+        // Synthetic snapshot: claims through_seq=10 but stamps a
+        // genesis-shaped chain_link instead of the real seq-10
+        // event. `head_payload` is also empty, so the expected
+        // anchor hash = xxh3(genesis_bytes ++ &[]) — completely
+        // different from the seq-11 event's actual parent_hash.
+        let snapshot = StateSnapshot {
+            version: 1,
+            entity_id: log.entity_id().clone(),
+            through_seq: 10,
+            chain_link: CausalLink::genesis(log.origin_hash(), 0),
+            state: bytes::Bytes::new(),
+            horizon: ObservedHorizon::default(),
+            created_at: 0,
+            bindings_bytes: Vec::new(),
+            identity_envelope: None,
+            head_payload: bytes::Bytes::new(),
+        };
 
-        let status = assess_continuity(&forged_log, None);
+        let status = assess_continuity(&log, Some(&snapshot));
         match status {
-            ContinuityStatus::Forked {
-                fork_point,
-                fork_hash,
-                ..
-            } => {
-                assert_eq!(fork_point, 1, "fork must point at the genesis successor");
+            ContinuityStatus::Forked { fork_point, .. } => {
                 assert_eq!(
-                    fork_hash, forged_first.link.parent_hash,
-                    "fork_hash must surface the forged parent_hash so callers can diagnose",
+                    fork_point, 11,
+                    "snapshot anchor parent_hash mismatch must surface as Forked \
+                     at first_seq (cubic-ai P1), got fork_point={}",
+                    fork_point,
                 );
             }
             other => panic!(
-                "expected Forked at seq 1 (forged parent_hash), got {:?}",
+                "expected Forked at the snapshot anchor — pre-fix this returned \
+                 Continuous because only `through_seq` was checked. Got {:?}",
                 other
             ),
         }
     }
 
-    /// A snapshot-anchored log whose first event's `parent_hash` does
-    /// NOT match `xxh3(snapshot.chain_link ++ snapshot.head_payload)`
-    /// must be reported as `Forked`. Pre-fix the snapshot anchor only
-    /// matched on `through_seq`, so a forged log carrying a
-    /// fabricated post-snapshot first event passed silently as long
-    /// as its sequence number was right.
+    /// Anchor parent_hash check must NOT lock out a snapshot whose
+    /// `chain_link` and `head_payload` legitimately match the log
+    /// (the success path for a real cross-node migration). Pins the
+    /// happy path so a future tightening can't flip the comparator
+    /// and silently reject every legitimate snapshot.
     #[test]
-    fn assess_continuity_forked_when_snapshot_anchored_first_event_parent_hash_mismatches() {
-        use crate::adapter::net::state::causal::CausalEvent;
+    fn assess_continuity_continuous_when_snapshot_chain_link_matches_log_anchor() {
         use crate::adapter::net::state::horizon::ObservedHorizon;
 
         let (mut log, _) = build_log(20);
         let event_at_10 = log.range(10, 10)[0].clone();
         log.prune_through(10);
-
-        // Replace the seq-11 event with a fabricated successor: same
-        // sequence and origin but a junk parent_hash. The log already
-        // contains the unmodified events 12..20, but the cross-pair
-        // walk doesn't get there if the anchor check fires first
-        // (which it must).
-        let mut forged_log = EntityLog::new(log.entity_id().clone());
-        let mut events: Vec<_> = log.range(11, u64::MAX).into_iter().cloned().collect();
-        events[0].link.parent_hash ^= 0x1234_5678_9ABC_DEF0;
-        // We'd also have to rewrite events 12..20 to chain to the
-        // forged 11, but for THIS test we only need the anchor check
-        // to fire. Append just the forged seq-11 event.
-        let forged_first = events.into_iter().next().unwrap();
-        forged_log
-            .append(CausalEvent {
-                link: forged_first.link,
-                payload: forged_first.payload,
-                received_at: forged_first.received_at,
-            })
-            .unwrap();
 
         let snapshot = StateSnapshot {
             version: 1,
@@ -692,20 +676,12 @@ mod tests {
             head_payload: event_at_10.payload.clone(),
         };
 
-        let status = assess_continuity(&forged_log, Some(&snapshot));
-        match status {
-            ContinuityStatus::Forked { fork_point, .. } => {
-                assert_eq!(
-                    fork_point, 11,
-                    "snapshot anchor mismatch must surface as Forked at first_seq, got fork_point={}",
-                    fork_point,
-                );
-            }
-            other => panic!(
-                "expected Forked at the snapshot anchor (forged seq-11 parent_hash), got {:?}",
-                other
-            ),
-        }
+        let status = assess_continuity(&log, Some(&snapshot));
+        assert!(
+            matches!(status, ContinuityStatus::Continuous { head_seq: 20, .. }),
+            "matching snapshot chain_link + head_payload must anchor cleanly, got {:?}",
+            status,
+        );
     }
 
     #[test]
