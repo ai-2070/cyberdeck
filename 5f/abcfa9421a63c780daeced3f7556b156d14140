@@ -1,0 +1,38 @@
+net/crates/net/tests/integration_netdb.rs
+  36b642b129ab4a5e 355-420
+net/crates/net/src/adapter/net/continuity/chain.rs
+  36b642b129ab4a5e 724-782
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "5fabcfa9421a63c780daeced3f7556b156d14140",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1920,
+      "total_deletions": 1795,
+      "accepted_lines": 129,
+      "overriden_lines": 0
+    },
+    "64958cb6fb55fe73": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81cf66b-69b3-455c-bab9-06a87305bb12",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 329,
+      "total_deletions": 0,
+      "accepted_lines": 4035,
+      "overriden_lines": 0
+    }
+  }
+}
