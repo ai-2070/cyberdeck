@@ -85,6 +85,19 @@ impl ObservedHorizon {
             .is_some_and(|&seq| seq >= sequence)
     }
 
+    /// Exact "have I observed ANY event from this origin?" query.
+    ///
+    /// CR-16 / BUG #130: the seq-less variant of [`Self::has_observed`].
+    /// Used by `CausalCone::is_concurrent_with` to bypass the
+    /// 64-bit bloom when both sides carry full horizons — the
+    /// bloom collapses toward constant-`false` past ~16 distinct
+    /// origins, silently mis-reporting genuinely concurrent
+    /// events as causally ordered.
+    #[inline]
+    pub fn contains_origin(&self, origin_hash: u32) -> bool {
+        self.entries.contains_key(&origin_hash)
+    }
+
     /// Number of entities in the horizon.
     pub fn entity_count(&self) -> usize {
         self.entries.len()

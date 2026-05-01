@@ -90,14 +90,51 @@ impl CausalCone {
         }
     }
 
-    /// Check if this event is concurrent with another (neither causally preceded the other).
+    /// Check if this event is concurrent with another (neither
+    /// causally preceded the other).
+    ///
+    /// CR-16: when BOTH cones carry the full [`ObservedHorizon`]
+    /// out-of-band (`horizon` is `Some` on both), use the exact
+    /// `has_observed` path. The compressed `horizon_encoded`
+    /// (64-bit bloom) saturates past ~16 distinct origins —
+    /// `potentially_concurrent` then collapses toward
+    /// constant-`false`, silently mis-reporting genuinely
+    /// concurrent events as causally ordered.
+    ///
+    /// We need head sequences to call `has_observed`. The
+    /// `CausalCone` model treats `(origin_hash, ?)` — without a
+    /// seq — so concurrency reduces to "neither has the other's
+    /// origin in its observed set" (the same bilateral check the
+    /// bloom approximates). The exact path uses
+    /// [`ObservedHorizon::contains_origin`] for that — answers
+    /// "have I observed any event from `origin_hash`" without
+    /// needing a seq.
+    ///
+    /// Pre-CR-16 callers above the bloom's cardinality ceiling
+    /// silently regressed to "every pair looks ordered." Fix:
+    /// honour the full horizon when both sides carry it.
     pub fn is_concurrent_with(&self, other: &CausalCone) -> bool {
-        HorizonEncoder::potentially_concurrent(
-            self.horizon_encoded,
-            other.origin_hash,
-            other.horizon_encoded,
-            self.origin_hash,
-        )
+        match (&self.horizon, &other.horizon) {
+            (Some(self_h), Some(other_h)) => {
+                // Exact path — bypass the bloom entirely.
+                !self_h.contains_origin(other.origin_hash)
+                    && !other_h.contains_origin(self.origin_hash)
+            }
+            _ => {
+                // Bloom fallback. Documented limitation: past
+                // ~16 distinct origins encoded into either side,
+                // this collapses toward constant-`false`.
+                // Production callers that need correctness past
+                // that ceiling MUST populate `horizon` on both
+                // cones (the `Some(_)` arm above).
+                HorizonEncoder::potentially_concurrent(
+                    self.horizon_encoded,
+                    other.origin_hash,
+                    other.horizon_encoded,
+                    self.origin_hash,
+                )
+            }
+        }
     }
 
     /// Merge multiple cones (for daemons with multiple inputs).
@@ -275,6 +312,85 @@ mod tests {
         assert!(
             !merged.is_exact(),
             "merged cone with mixed exact/approximate inputs must not be marked exact"
+        );
+    }
+
+    /// CR-16: when both cones carry the FULL horizon, concurrency
+    /// detection MUST use the exact `contains_origin` path rather
+    /// than the bloom. Pre-CR-16 callers that populated the full
+    /// horizon got the bloom path anyway — past ~16 distinct
+    /// origins encoded into either side, the bloom collapsed to
+    /// constant-`false` and concurrency detection silently
+    /// regressed to "every pair looks ordered."
+    ///
+    /// We construct two cones each with 32 observed origins (well
+    /// past the bloom's saturation point) where `A` has NOT
+    /// observed `B`'s origin and `B` has NOT observed `A`'s
+    /// origin. Pre-CR-16 the bloom path returned `false`
+    /// (constant-false collapse); post-CR-16 the exact path
+    /// correctly returns `true`.
+    #[test]
+    fn cr16_is_concurrent_with_uses_exact_horizon_when_both_populated() {
+        // Build A's horizon with 32 distinct origins, NOT including
+        // B's origin (0xBBBB).
+        let mut h_a = ObservedHorizon::new();
+        for i in 0u32..32 {
+            // Skip 0xBBBB so A genuinely hasn't observed B.
+            let origin = 0x10000u32 + i;
+            h_a.observe(origin, i as u64 + 1);
+        }
+        h_a.observe(0xAAAA, 100); // A's own origin
+
+        // Build B's horizon with 32 distinct origins, NOT including
+        // A's origin (0xAAAA).
+        let mut h_b = ObservedHorizon::new();
+        for i in 0u32..32 {
+            let origin = 0x20000u32 + i;
+            h_b.observe(origin, i as u64 + 1);
+        }
+        h_b.observe(0xBBBB, 100); // B's own origin
+
+        // Sanity: bloom is saturated — `might_contain` would
+        // return true for almost any origin queried against A's
+        // encoded horizon. We pin this so the test is meaningful:
+        // if the bloom WEREN'T saturated, the exact-vs-bloom
+        // outcomes might happen to agree.
+        let bloom_a = h_a.encode();
+        let bloom_b = h_b.encode();
+        let bloom_says_a_observed_b = HorizonEncoder::might_contain(bloom_a, 0xBBBB);
+        let bloom_says_b_observed_a = HorizonEncoder::might_contain(bloom_b, 0xAAAA);
+        // If both are true, the bloom thinks A observed B and B
+        // observed A — concurrency = false (bloom-saturation
+        // false-negative on concurrency). The exact path knows
+        // better.
+        let bloom_says_concurrent = !bloom_says_a_observed_b && !bloom_says_b_observed_a;
+
+        let link_a = make_link(0xAAAA, 100, bloom_a);
+        let link_b = make_link(0xBBBB, 100, bloom_b);
+        let cone_a_exact = CausalCone::from_link_with_horizon(&link_a, &h_a);
+        let cone_b_exact = CausalCone::from_link_with_horizon(&link_b, &h_b);
+
+        // Exact path MUST report concurrent.
+        assert!(
+            cone_a_exact.is_concurrent_with(&cone_b_exact),
+            "CR-16: with both full horizons populated, is_concurrent_with \
+             MUST use the exact path. A truly hasn't observed B and B \
+             hasn't observed A — concurrency = true."
+        );
+
+        // Demonstrate the bloom-fallback failure mode: if EITHER
+        // side lacks the full horizon, we fall back to the bloom.
+        // Under saturation, the bloom says everyone-observed-
+        // everyone, so `is_concurrent_with` returns `false`. This
+        // pins the documented limitation.
+        let cone_a_bloom = CausalCone::from_causal_link(&link_a);
+        let cone_b_bloom = CausalCone::from_causal_link(&link_b);
+        let bloom_result = cone_a_bloom.is_concurrent_with(&cone_b_bloom);
+        assert_eq!(
+            bloom_result, bloom_says_concurrent,
+            "bloom path must match the raw HorizonEncoder query — \
+             if this differs, the fallback diverged from the bloom \
+             primitive (CR-16 sanity)"
         );
     }
 }
