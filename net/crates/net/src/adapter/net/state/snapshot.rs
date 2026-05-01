@@ -771,11 +771,6 @@ mod tests {
         assert_eq!(retrieved.through_seq, 5);
     }
 
-    /// Equal `through_seq` is rejected too — a re-emission from a
-    /// stale producer shouldn't churn the entry. Callers that
-    /// genuinely need to refresh-at-same-seq (e.g. legitimate
-    /// rebind) must `remove` first.
-    #[test]
     /// CR-17: pin the ABA-via-retention behavior. `store` correctly
     /// rejects an older `through_seq` against a newer one, BUT
     /// `remove` does NOT carry forward the high-water mark — once
@@ -847,6 +842,11 @@ mod tests {
         assert_eq!(retrieved.state, Bytes::from_static(b"stale"));
     }
 
+    /// Equal `through_seq` is rejected too — a re-emission from a
+    /// stale producer shouldn't churn the entry. Callers that
+    /// genuinely need to refresh-at-same-seq (e.g. legitimate
+    /// rebind) must `remove` first.
+    #[test]
     fn store_rejects_equal_through_seq_against_existing_entry() {
         let store = SnapshotStore::new();
         let kp = EntityKeypair::generate();

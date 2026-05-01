@@ -456,7 +456,7 @@ impl EndpointState {
 /// ```
 ///
 /// Pre-CR-19 the success vs failure path was tracked by a `bool`
-/// + manual `release_half_open_probe` at every fall-through —
+/// plus a manual `release_half_open_probe` at every fall-through —
 /// easy to miss on a future-cancel where neither `Ok` nor `Err`
 /// runs to completion.
 #[allow(dead_code)]

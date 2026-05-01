@@ -248,13 +248,14 @@ impl CapabilityDiff {
 
     /// Serialize to bytes with explicit size-cap enforcement.
     ///
-    /// CR-10: returns `Err(DiffSizeError::TooManyOps)` if `ops.len()
-    /// > MAX_DIFF_OPS` and `Err(DiffSizeError::Encoded { … })` if
-    /// the serialized form exceeds [`MAX_DIFF_BYTES`]. Both checks
-    /// MUST mirror what [`Self::from_bytes`] enforces — otherwise
-    /// the sender produces bytes the receiver silently discards.
-    /// Production senders building diffs from peer-supplied or
-    /// large-cardinality input MUST use this entry point.
+    /// CR-10: returns `Err(DiffSizeError::TooManyOps)` when
+    /// `ops.len()` exceeds [`MAX_DIFF_OPS`], and
+    /// `Err(DiffSizeError::Encoded { … })` when the serialized form
+    /// exceeds [`MAX_DIFF_BYTES`]. Both checks MUST mirror what
+    /// [`Self::from_bytes`] enforces — otherwise the sender produces
+    /// bytes the receiver silently discards. Production senders
+    /// building diffs from peer-supplied or large-cardinality input
+    /// MUST use this entry point.
     pub fn try_to_bytes(&self) -> Result<Vec<u8>, DiffSizeError> {
         if self.ops.len() > MAX_DIFF_OPS {
             return Err(DiffSizeError::TooManyOps {

@@ -795,7 +795,7 @@ mod tests {
     #[test]
     fn insertion_ts_sort_breaks_tie_on_id_numerically() {
         // Same shard, same ts — only the id tiebreak fires.
-        let mut events = vec![
+        let mut events = [
             StoredEvent::from_value("10".to_string(), json!({}), 1000, 0),
             StoredEvent::from_value("9".to_string(), json!({}), 1000, 0),
             StoredEvent::from_value("11".to_string(), json!({}), 1000, 0),
