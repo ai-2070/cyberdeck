@@ -99,7 +99,7 @@ pub struct EventBus {
     config: EventBusConfig,
     /// Statistics.
     stats: Arc<EventBusStats>,
-    /// Producer nonce (BUG #56). Loaded from
+    /// Producer nonce. Loaded from
     /// `config.producer_nonce_path` on startup when the path is
     /// configured; otherwise falls back to the per-process default
     /// from `event::batch_process_nonce`. Stamped on every batch
@@ -124,8 +124,8 @@ struct ShardWorkers {
     /// to learn the worker's final post-flush sequence, then uses
     /// it as the `sequence_start` for the stranded-ring-buffer
     /// flush so the stranded msg-ids fall strictly past every
-    /// msg-id the worker emitted (BUG #153 — JetStream dedup
-    /// silently dropped the stranded batch when both used 0).
+    /// msg-id the worker emitted — without this, JetStream dedup
+    /// would silently drop the stranded batch when both used 0.
     next_sequence: Arc<AtomicU64>,
 }
 
@@ -246,7 +246,7 @@ impl EventBus {
         // — `flush()`'s Phase 2 progress probe gates on those.
         let stats = Arc::new(EventBusStats::default());
 
-        // Producer nonce (BUG #56). Persistent path → load-or-create
+        // Producer nonce. Persistent path → load-or-create
         // the durable u64 so cross-process retries dedup against the
         // prior incarnation. No path → per-process default (today's
         // at-most-once-across-restart behavior).
@@ -345,15 +345,15 @@ impl EventBus {
             return;
         }
 
-        // BUG #65: idempotency check. Pre-fix a second
-        // `start_scaling_monitor` call overwrote the slot without
-        // aborting the previous `JoinHandle` — the displaced task
-        // continued running, holding a `Weak<EventBus>`, only
-        // exiting when it next observed `shutdown` or failed to
-        // upgrade. Two concurrent monitors briefly competed for
+        // Idempotency check: no-op when a monitor is already
+        // installed. Otherwise a second `start_scaling_monitor`
+        // call would overwrite the slot without aborting the
+        // previous `JoinHandle` — the displaced task would keep
+        // running, holding a `Weak<EventBus>`, only exiting when it
+        // next observed `shutdown` or failed to upgrade. Two
+        // concurrent monitors would briefly compete for
         // `evaluate_scaling`'s lock, doubling the metrics-tick
-        // wakeup rate. Now we no-op when a monitor is already
-        // installed.
+        // wakeup rate.
         let mut slot = self.scaling_monitor.lock();
         if slot.is_some() {
             tracing::debug!("start_scaling_monitor: monitor already running, skipping");
@@ -433,17 +433,17 @@ impl EventBus {
         // Step 3: workers are live — flip the shard to Active so
         // `select_shard` will route to it.
         //
-        // BUG #75: pre-fix an `activate_shard` error returned
-        // immediately, leaving the new sender in `batch_senders`,
-        // both `JoinHandle`s in `batch_workers`, and the
-        // `Provisioning` mapper entry. The drain worker then
-        // looped indefinitely on an empty ring buffer (`with_shard`
-        // still found the entry; `select_shard` skipped it). Each
-        // retry of `add_shard_internal` allocated a fresh id while
-        // the dead one squatted. Now we mirror
-        // `remove_shard_internal`'s teardown: on Err, drop the
-        // sender, abort both join handles, unmap the provisioning
-        // entry, then return.
+        // On `activate_shard` failure we mirror
+        // `remove_shard_internal`'s teardown: drop the sender,
+        // abort both join handles, unmap the provisioning entry,
+        // then return. Returning immediately would leave the new
+        // sender in `batch_senders`, both `JoinHandle`s in
+        // `batch_workers`, and the `Provisioning` mapper entry
+        // behind. The drain worker would loop indefinitely on an
+        // empty ring buffer (`with_shard` still finds the entry;
+        // `select_shard` skips it), and each retry of
+        // `add_shard_internal` would allocate a fresh id while the
+        // dead one squats.
         if let Err(e) = self.shard_manager.activate_shard(new_id) {
             tracing::warn!(
                 shard_id = new_id,
@@ -523,16 +523,17 @@ impl EventBus {
         // via the standard `dispatch_batch` path with their PROPER
         // `next_sequence` values, and exits.
         //
-        // Awaiting both handles closes BUG #154's race: pre-fix the
-        // `JoinHandle`s were dropped without await, so a draining
-        // shard whose ring buffer transiently emptied could finalize
-        // and remove while the BatchWorker still had events in
-        // its `current_batch` or in the mpsc channel — those events
-        // would be dispatched (the worker keeps running on a dropped
-        // handle) but their dispatch could overlap with this
-        // function's own stranded-flush, racing through JetStream
-        // dedup with their msg-ids. Awaiting first means we observe
-        // a quiescent worker before constructing the stranded batch.
+        // Await both handles before constructing the stranded
+        // batch. Dropping the `JoinHandle`s without await would let
+        // a draining shard whose ring buffer transiently emptied
+        // finalize and remove while the BatchWorker still had
+        // events in its `current_batch` or in the mpsc channel —
+        // those events would be dispatched (the worker keeps
+        // running on a dropped handle) but their dispatch could
+        // overlap with this function's own stranded-flush, racing
+        // through JetStream dedup with their msg-ids. Awaiting
+        // first means we observe a quiescent worker before
+        // constructing the stranded batch.
         let workers = self.batch_workers.lock().remove(&shard_id);
         let final_next_sequence = if let Some(workers) = workers {
             // Errors here mean the task panicked or was cancelled.
@@ -571,19 +572,18 @@ impl EventBus {
 
         // Step 4: flush the stranded ring-buffer events through the
         // adapter in one shot, using `final_next_sequence` (NOT 0)
-        // as the `sequence_start`. This closes BUG #153's
-        // collision: pre-fix both this batch and the worker's very
-        // first batch wrote msg-ids `{nonce}:{shard_id}:0:{i}`,
-        // and JetStream's 2 min dedup window silently dropped the
-        // duplicate. Now the stranded batch's msg-ids are
-        // `{nonce}:{shard_id}:{final_next_sequence}:{i}` —
-        // strictly past every msg-id the worker emitted.
+        // as the `sequence_start`. The stranded batch's msg-ids
+        // are `{nonce}:{shard_id}:{final_next_sequence}:{i}` —
+        // strictly past every msg-id the worker emitted. Using 0
+        // would collide with the worker's very first batch
+        // (`{nonce}:{shard_id}:0:{i}`), and JetStream's 2 min dedup
+        // window would silently drop the duplicate.
         if !stranded.is_empty() {
             let count = stranded.len();
             // Use the bus's loaded producer nonce so the stranded
             // batch's msg-ids share the same producer-identity
             // segment as everything else this bus has emitted —
-            // critical for cross-process dedup (BUG #56).
+            // critical for cross-process dedup.
             let batch = crate::event::Batch::with_nonce(
                 shard_id,
                 stranded,
@@ -755,12 +755,12 @@ impl EventBus {
                 .events_ingested
                 .fetch_add(success as u64, AtomicOrdering::Relaxed);
         }
-        // BUG #155: subtract `unrouted` from the buffer-fullness drop
-        // count so the same event isn't tallied in both
-        // `events_unrouted` (bumped inside `ShardManager::ingest_raw_batch`)
-        // and `events_dropped` (which historically used `total -
-        // success`, double-counting unrouted events). Backpressure
-        // drops = events that reached a shard but failed to push.
+        // Subtract `unrouted` from the buffer-fullness drop count
+        // so the same event isn't tallied in both `events_unrouted`
+        // (bumped inside `ShardManager::ingest_raw_batch`) and
+        // `events_dropped` — using a plain `total - success` here
+        // would double-count unrouted events. Backpressure drops
+        // = events that reached a shard but failed to push.
         let dropped = total.saturating_sub(success).saturating_sub(unrouted);
         if dropped > 0 {
             self.stats
@@ -810,7 +810,7 @@ impl EventBus {
     /// inside each batch worker to time out and dispatch — and only
     /// then calls `adapter.flush()`.
     ///
-    /// # Latency bound (CR-26)
+    /// # Latency bound
     ///
     /// The total wall-clock budget is the sum of three phases:
     ///   * Phase 1 (ring-buffer drain): up to **5 s**.
@@ -868,11 +868,11 @@ impl EventBus {
         // This is a true delivery barrier — it doesn't rely on
         // "no progress this window" heuristics that race a
         // BatchWorker whose `batch_start` was set just before
-        // flush() ran (BUG #16 originally fixed the
-        // single-`max_delay` sleep, but the post-fix progress
-        // gate read `batches_dispatched` which was declared but
-        // never incremented anywhere — see BUG #157 — and Windows
-        // timer resolution made the race a frequent flake).
+        // flush() ran. A progress gate that reads
+        // `batches_dispatched` only works if that counter is
+        // actually incremented on every dispatch, and Windows
+        // timer resolution alone has historically made any
+        // single-`max_delay`-sleep approach a frequent flake.
         let target_ingested = self.stats.events_ingested.load(AtomicOrdering::Acquire);
         let dropped_at_start = self.stats.events_dropped.load(AtomicOrdering::Acquire);
 
@@ -993,28 +993,22 @@ impl EventBus {
             // `shutdown=true` but never sets `shutdown_completed`)
             // doesn't spin forever.
             //
-            // CR-25: distinguish the two outcomes for callers.
-            // Pre-CR-25 both branches returned `Ok(())`, so a
-            // caller that loses the CAS race had no way to tell
-            // whether the FIRST caller's shutdown had actually
-            // completed (drain workers done, adapter flush+
-            // shutdown ran) or whether the deadline timed out
-            // mid-shutdown. Returning `Ok` in both cases meant
-            // shutdown-done assumptions silently drifted under
-            // a slow adapter (`adapter_timeout` default 30s
-            // > the 10s spin deadline), letting subsequent code
-            // observe a partially-shut-down bus.
-            //
-            // Now: if `shutdown_completed` flips inside the
-            // window, we return `Ok(())` and the caller can be
-            // sure the first caller finished. If the deadline
-            // fires first, we surface
-            // `AdapterError::Transient(_)` — the bus IS being
-            // shut down (the flag is set), but completion is
+            // Distinguish the two outcomes for callers. If
+            // `shutdown_completed` flips inside the window, we
+            // return `Ok(())` and the caller can be sure the first
+            // caller finished. If the deadline fires first, we
+            // surface `AdapterError::Transient(_)` — the bus IS
+            // being shut down (the flag is set), but completion is
             // not yet observable; the caller can treat this as
             // "another thread is working on it, retry the
             // is_shutdown_completed() poll if you need a hard
             // barrier."
+            //
+            // Returning `Ok(())` in both branches would let
+            // shutdown-done assumptions silently drift under a slow
+            // adapter (`adapter_timeout` default 30 s > the 10 s
+            // spin deadline), letting subsequent code observe a
+            // partially-shut-down bus.
             // 10s in production builds; overridable via the
             // `_TEST_OVERRIDE_SHUTDOWN_VIA_REF_DEADLINE` thread-local
             // in test builds so the slow-first-caller test doesn't
@@ -1052,22 +1046,20 @@ impl EventBus {
         // decrements. Both paths take constant time; the total
         // wait is O(producer threads).
         //
-        // BUG #59: pre-fix this loop's documentation in `shutdown`
-        // promised "every observed in-flight ingest completes
-        // before the final sweep" — that's true under normal
-        // conditions, but the 5-second deadline below forces the
-        // gate open even when producers are still in their push
-        // window. A producer that has incremented
-        // `in_flight_ingests` (and so observed `shutdown=false`)
-        // but whose push is delayed past the deadline (heavy
-        // contention, debugger hit, etc.) will complete its push
-        // AFTER the final sweep — its event lands in the ring
-        // buffer and is never read. The deadline exists so a
-        // stuck producer can't deadlock shutdown indefinitely;
-        // the trade-off is documented data loss past the 5s
-        // window, surfaced via the `events_dropped` stat (so the
-        // loss is observable to operators) and the `WARN` log
-        // below (so it's diagnosable). The "no stranding"
+        // The "every observed in-flight ingest completes before
+        // the final sweep" property holds under normal conditions,
+        // but the 5-second deadline below forces the gate open
+        // even when producers are still in their push window. A
+        // producer that has incremented `in_flight_ingests` (and
+        // so observed `shutdown=false`) but whose push is delayed
+        // past the deadline (heavy contention, debugger hit, etc.)
+        // will complete its push AFTER the final sweep — its event
+        // lands in the ring buffer and is never read. The deadline
+        // exists so a stuck producer can't deadlock shutdown
+        // indefinitely; the trade-off is documented data loss past
+        // the 5 s window, surfaced via the `events_dropped` stat
+        // (so the loss is observable to operators) and the `WARN`
+        // log below (so it's diagnosable). The "no stranding"
         // promise on the happy path stands; the deadline path is
         // the documented escape hatch.
         let in_flight_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1078,7 +1070,7 @@ impl EventBus {
                     in_flight = stranded,
                     "shutdown timed out waiting for in-flight ingests after 5s; \
                      proceeding — up to {} events may strand in the ring buffer \
-                     past final drain (BUG #59 documented data-loss path)",
+                     past final drain (documented data-loss path)",
                     stranded,
                 );
                 // Surface the stranded count via `events_dropped`
@@ -1116,12 +1108,11 @@ impl EventBus {
         //    channel, and exits. After this loop, every event in
         //    the ring buffers has been pushed to its channel.
         //
-        // BUG #70: pre-fix this loop awaited each drain handle
-        // sequentially (`for ... { drain.await; }`), serializing
-        // shutdown wall-clock as N×T instead of max(T). The
-        // default 1024-shard config × per-shard final-drain time
-        // made shutdown painful. `join_all` lets the runtime
-        // overlap them.
+        // `join_all` lets the runtime overlap drain handles. A
+        // sequential `for ... { drain.await; }` would serialize
+        // shutdown wall-clock as N×T instead of max(T), which on
+        // the default 1024-shard config × per-shard final-drain
+        // time makes shutdown painful.
         let (drains, batch_handles): (Vec<_>, Vec<_>) = workers
             .into_iter()
             .map(|(_shard_id, ShardWorkers { batch, drain, .. })| (drain, batch))
@@ -1141,7 +1132,7 @@ impl EventBus {
         // 4. Await batch workers. They drain their channel until
         //    `recv() = None`, flush, and exit.
         //
-        // BUG #70: same parallelization as the drain phase.
+        // Same parallelization as the drain phase.
         let _ = futures::future::join_all(batch_handles).await;
 
         // Flush and shutdown adapter (with timeout to prevent hanging)
@@ -1204,13 +1195,13 @@ impl EventBus {
     /// successfully drained AND removed (subset of those marked
     /// Draining if any failed to empty within the deadline).
     ///
-    /// BUG #82: previously this only called `mapper.scale_down`,
-    /// which marks shards `Draining` but does NOT finalize them —
-    /// finalization was the scaling monitor's responsibility. Bus
-    /// configs without an active monitor (or callers that
-    /// shut down before the monitor's next tick) lost any events
-    /// queued in those shards' ring buffers. Now this method
-    /// drives the full lifecycle synchronously.
+    /// Drives the full scale-down lifecycle synchronously: a
+    /// plain `mapper.scale_down` call marks shards `Draining` but
+    /// does NOT finalize them — finalization is the scaling
+    /// monitor's responsibility. Bus configs without an active
+    /// monitor (or callers that shut down before the monitor's
+    /// next tick) would otherwise lose any events queued in those
+    /// shards' ring buffers.
     pub async fn manual_scale_down(&self, count: u16) -> Result<Vec<u16>, AdapterError> {
         let mapper = self
             .shard_manager

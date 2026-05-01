@@ -17,15 +17,15 @@ pub struct TasksFold;
 
 impl RedexFold<TasksState> for TasksFold {
     fn apply(&mut self, ev: &RedexEvent, state: &mut TasksState) -> Result<(), RedexError> {
-        // BUG #141: per-event decode failures use `RedexError::Decode`
-        // (a recoverable variant the fold-error-policy interpreter
-        // treats as skip-and-continue even under `Stop`). Pre-fix
-        // these all returned `Encode`, which halts the fold task
-        // under `Stop` — a single corrupt event could wedge the
-        // fold task forever, DoSing a multi-tenant cortex via one
-        // bad event past the 32-bit checksum (#135). User-level
-        // fold errors and storage-side encode failures still use
-        // `Encode` and properly halt under `Stop`.
+        // Per-event decode failures use `RedexError::Decode` (a
+        // recoverable variant the fold-error-policy interpreter
+        // treats as skip-and-continue even under `Stop`). Returning
+        // `Encode` would halt the fold task under `Stop` — a single
+        // corrupt event could wedge the fold task forever, DoSing a
+        // multi-tenant cortex via one bad event past the 32-bit
+        // checksum. User-level fold errors and storage-side encode
+        // failures still use `Encode` and properly halt under
+        // `Stop`.
         if ev.payload.len() < EVENT_META_SIZE {
             return Err(RedexError::Decode(format!(
                 "tasks payload too short: {} bytes (need >= {})",
@@ -40,14 +40,13 @@ impl RedexFold<TasksState> for TasksFold {
         // Verify the corruption-detection checksum stamped at
         // ingest against the tail we received from RedEX.
         //
-        // BUG #135: this catches accidental disk corruption
-        // (stray bit flips, truncated writes, mis-aligned
-        // reads). It is NOT a tamper detector — the 32-bit
-        // unkeyed xxh3 truncation is recomputable by any party
-        // that can write to the underlying file. See
-        // `compute_checksum`'s doc for the full scope. Tamper
-        // resistance must be layered higher (e.g. the AEAD-
-        // protected mesh envelope).
+        // This catches accidental disk corruption (stray bit
+        // flips, truncated writes, mis-aligned reads). It is NOT a
+        // tamper detector — the 32-bit unkeyed xxh3 truncation is
+        // recomputable by any party that can write to the
+        // underlying file. See `compute_checksum`'s doc for the
+        // full scope. Tamper resistance must be layered higher
+        // (e.g. the AEAD-protected mesh envelope).
         let expected = compute_checksum(tail);
         if meta.checksum != expected {
             return Err(RedexError::Decode(format!(

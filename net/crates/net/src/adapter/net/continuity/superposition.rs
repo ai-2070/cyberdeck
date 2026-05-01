@@ -131,23 +131,21 @@ impl SuperpositionState {
     /// Proves that the chain is intact from the source's snapshot point
     /// through the target's current head.
     ///
-    /// **Hash convention (BUG #99 fix):** `ContinuityProof::verify_against`
-    /// computes `compute_parent_hash(event.link, event.payload)` for the
-    /// event at `from_seq` / `to_seq` — i.e. the *forward* hash of the
-    /// event AT that sequence. A `CausalLink`'s `parent_hash` field is
-    /// the forward hash of the *previous* event (event at
-    /// `sequence - 1`). So if we use `head.parent_hash` as the proof's
-    /// hash, we must point `from_seq`/`to_seq` at `head.sequence - 1`
-    /// — that's the event whose forward hash equals `head.parent_hash`.
-    /// Pre-fix, the proof's seq was `head.sequence` while the hash was
-    /// `head.parent_hash`, producing a proof that could never verify
-    /// (`compute_parent_hash` of event at `head.sequence` is a different
-    /// hash than `head.parent_hash`).
+    /// **Hash convention.** `ContinuityProof::verify_against`
+    /// computes `compute_parent_hash(event.link, event.payload)` for
+    /// the event at `from_seq` / `to_seq` — i.e. the *forward* hash
+    /// of the event AT that sequence. A `CausalLink`'s `parent_hash`
+    /// field is the forward hash of the *previous* event (event at
+    /// `sequence - 1`). So when we use `head.parent_hash` as the
+    /// proof's hash, we must point `from_seq` / `to_seq` at
+    /// `head.sequence - 1` — that's the event whose forward hash
+    /// equals `head.parent_hash`.
     ///
-    /// Pre-fix also mixed identities when target's seq was less than
-    /// source's: `from_seq` was target's seq but `from_hash` was
-    /// source's parent_hash. The match-on-min/max pattern below picks
-    /// the head whose seq matches the from/to anchor.
+    /// The match-on-min/max pattern below picks the head whose seq
+    /// matches the from/to anchor, so that proofs spanning a
+    /// target-behind-source case never mix identities (using
+    /// target's seq with source's parent_hash would produce a proof
+    /// that could never verify).
     ///
     /// Note: head events with `sequence == 0` (genesis) have no
     /// previous event, so the proof anchors at seq=0 and the hash is

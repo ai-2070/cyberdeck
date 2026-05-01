@@ -210,12 +210,10 @@ impl BatchedTransport {
             return Ok(Vec::new());
         }
 
-        // BUG #90: a `BatchedTransport` constructed via
-        // `new_send_only` skipped the `recv_buffers` allocation,
-        // so indexing into them below would panic with
-        // index-out-of-bounds. Surface the misuse as an explicit
-        // error instead — the doc on `new_send_only` only stated
-        // the contract verbally before this guard.
+        // A `BatchedTransport` constructed via `new_send_only`
+        // skips the `recv_buffers` allocation, so indexing into them
+        // below would panic with index-out-of-bounds. Surface the
+        // misuse as an explicit error instead.
         if self.recv_buffers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -294,7 +292,7 @@ impl BatchedTransport {
             return Ok(Vec::new());
         }
 
-        // BUG #90: see `recv_batch` for context.
+        // See `recv_batch` for the rationale on this guard.
         if self.recv_buffers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,

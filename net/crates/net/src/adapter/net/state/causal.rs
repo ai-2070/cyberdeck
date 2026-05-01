@@ -15,12 +15,12 @@ pub const SUBPROTOCOL_SNAPSHOT: u16 = 0x0401;
 
 /// Wire size of a CausalLink.
 ///
-/// BUG #130: bumped 24 → 28 when `horizon_encoded` widened from
-/// `u32` to `u64`. The pre-fix 16-bit bloom packed into the high
-/// half of a u32 saturated at ~6-8 origins, defeating
-/// concurrency detection. The new 64-bit bloom is usable up to
-/// ~16 active origins per event; see `state/horizon.rs` for the
-/// FPR table and the out-of-band-fallback escape hatch.
+/// `horizon_encoded` is `u64`-wide so the 64-bit bloom is usable
+/// up to ~16 active origins per event. A narrower 16-bit bloom
+/// packed into the high half of a u32 would saturate at ~6-8
+/// origins, defeating concurrency detection. See
+/// `state/horizon.rs` for the FPR table and the
+/// out-of-band-fallback escape hatch.
 pub const CAUSAL_LINK_SIZE: usize = 28;
 
 /// Causal link — 28 bytes prepended to each event in causal-framed EventFrames.
@@ -28,7 +28,7 @@ pub const CAUSAL_LINK_SIZE: usize = 28;
 /// Wire format (28 bytes, no padding):
 /// ```text
 /// origin_hash:      4 bytes (u32) — entity identity
-/// horizon_encoded:  8 bytes (u64) — compressed observed horizon (BUG #130)
+/// horizon_encoded:  8 bytes (u64) — compressed observed horizon
 /// sequence:         8 bytes (u64) — monotonic per-entity
 /// parent_hash:      8 bytes (u64) — xxh3 of (prev link ++ prev payload)
 /// ```

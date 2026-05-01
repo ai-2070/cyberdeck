@@ -107,9 +107,9 @@ impl EventMeta {
 /// the xxh3 hash truncated to the low 32 bits. Stamped into
 /// [`EventMeta::checksum`].
 ///
-/// **Scope (BUG #135):** this is an *accidental-corruption*
-/// detector, NOT a tamper detector. Two specific limits make it
-/// unsuitable for tamper-resistance:
+/// **Scope:** this is an *accidental-corruption* detector, NOT a
+/// tamper detector. Two specific limits make it unsuitable for
+/// tamper-resistance:
 ///
 /// 1. **32-bit truncation.** A 32-bit unkeyed hash has roughly
 ///    1-in-2³² collision probability per pair of distinct
@@ -127,8 +127,7 @@ impl EventMeta {
 /// detection) must layer a keyed MAC at a higher level — e.g.
 /// the AEAD-protected mesh packet envelope. The cortex fold
 /// paths use this value only to surface obviously-broken on-disk
-/// records as `RedexError::Decode` (see BUG #141), not as a
-/// security boundary.
+/// records as `RedexError::Decode`, not as a security boundary.
 ///
 /// Disk-recovery / external inspection tools can reproduce the
 /// value by hashing the bytes after the 20-byte prefix.

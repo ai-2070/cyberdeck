@@ -64,7 +64,7 @@ pub(crate) const NET_ERR_STREAM_ENDED: c_int = 2;
 /// One tokio runtime, lazily initialized, used by every CortEX /
 /// RedEX FFI call. The watch / tail cursors rely on a single runtime
 /// so the spawned forwarding tasks survive across cursor calls.
-/// BUG #61: `eprintln! + std::process::abort()` on builder failure
+/// Uses `eprintln! + std::process::abort()` on builder failure
 /// instead of `expect`-panic. See `ffi/mesh.rs::runtime()` for the
 /// full rationale.
 fn runtime() -> &'static Arc<Runtime> {

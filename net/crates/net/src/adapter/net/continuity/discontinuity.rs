@@ -159,9 +159,7 @@ impl ForkRecord {
             && self.original_origin != self.forked_origin
     }
 
-    /// Wire size: 4 + 4 + 8 + CAUSAL_LINK_SIZE + 1 + 8.
-    /// Since BUG #130 widened `horizon_encoded`, this is 53 bytes
-    /// (was 49 when CausalLink was 24 bytes).
+    /// Wire size: 4 + 4 + 8 + CAUSAL_LINK_SIZE + 1 + 8 = 53 bytes.
     pub const WIRE_SIZE: usize = 4 + 4 + 8 + CAUSAL_LINK_SIZE + 1 + 8;
 
     /// Serialize to bytes.

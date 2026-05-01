@@ -510,13 +510,11 @@ impl NetRouter {
         let mut new_data = BytesMut::with_capacity(data.len());
         let mut fwd_header = routing_header;
         fwd_header.forward();
-        // BUG #119: pre-fix the post-forward expired check was
-        // missing — if `forward()` decremented TTL to 0, the
-        // packet was still queued and sent to next_hop, which
-        // would then drop it on its own `is_expired()` check.
-        // Wasted one forward + bandwidth + queue slot per
-        // last-hop packet. Drop locally here so the next hop
-        // never sees the doomed packet.
+        // Re-check expiry after `forward()` decrements the TTL: if
+        // TTL hit 0, the next hop would just drop the packet on its
+        // own `is_expired()` check — wasting one forward, bandwidth,
+        // and a queue slot per last-hop packet. Drop locally here so
+        // the next hop never sees the doomed packet.
         if fwd_header.is_expired() {
             self.packets_dropped.fetch_add(1, Ordering::Relaxed);
             self.routing_table.record_drop(stream_id);

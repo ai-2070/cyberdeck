@@ -34,7 +34,8 @@ use std::sync::Mutex;
 /// Consumer-side dedup helper for the Redis Streams adapter.
 ///
 /// See `net::adapter::redis` module docs for the producer-side
-/// contract and BUG #57 background.
+/// contract that produces the `dedup_id` field this helper
+/// filters on.
 #[pyclass(name = "RedisStreamDedup")]
 pub struct PyRedisStreamDedup {
     // The inner LRU is `!Sync` (it owns mutable state behind a
@@ -70,15 +71,12 @@ impl PyRedisStreamDedup {
     ///
     /// Maps to the Rust `is_duplicate(&mut self, &str) -> bool`.
     ///
-    /// CR-35: releases the GIL via `Python::allow_threads` while
-    /// the inner mutex is held. Pre-CR-35 the GIL was held across
-    /// the entire mutex-acquire + lookup + insert sequence; under
-    /// contention (multiple Python threads sharing one handle,
-    /// which is supported but discouraged) this serialized the
-    /// asyncio event loop unnecessarily even when the underlying
-    /// work was bounded by the Rust mutex. The closure body is
-    /// pure Rust + a borrowed `&str`, so no Python state is
-    /// touched while the GIL is released.
+    /// Releases the GIL via `Python::detach` while the inner
+    /// mutex is held — under multi-thread contention this lets
+    /// other Python threads keep running while the lookup/insert
+    /// happens on the Rust side. The closure body is pure Rust
+    /// + a borrowed `&str`, so no Python state is touched while
+    /// the GIL is released.
     fn is_duplicate(&self, py: Python<'_>, dedup_id: &str) -> bool {
         py.detach(|| {
             let mut guard = self
@@ -123,11 +121,10 @@ impl PyRedisStreamDedup {
     /// rebalance to reset the dedup window without losing the
     /// helper instance.
     ///
-    /// CR-35: releases the GIL — clear() can drop up to
-    /// `capacity` heap allocations (the `Arc<str>` ids), which
-    /// for a 600K-capacity helper means ~600K `Drop`s on the
-    /// caller's thread. No reason to hold the GIL during that
-    /// work.
+    /// Releases the GIL — clear() can drop up to `capacity` heap
+    /// allocations (the `Arc<str>` ids), which for a 600K-capacity
+    /// helper means ~600K `Drop`s on the caller's thread. No
+    /// reason to hold the GIL during that work.
     fn clear(&self, py: Python<'_>) {
         py.detach(|| {
             let mut guard = self

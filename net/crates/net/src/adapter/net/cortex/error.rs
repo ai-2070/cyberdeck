@@ -31,11 +31,11 @@ pub enum CortexAdapterError {
     /// instead so the watermark and `state` are properly anchored
     /// to the prior events the adapter is going to skip.
     ///
-    /// BUG #134: pre-fix `open` accepted these positions and set
+    /// Accepting these positions in `open` would set
     /// `initial_watermark = start_seq - 1`, making
     /// `wait_for_seq(k)` for `k <= start_seq-1` return immediately
-    /// — the adapter claimed those seqs were "applied" while
+    /// — the adapter would claim those seqs were "applied" while
     /// `state` had never seen them.
-    #[error("StartPosition::{0} requires open_from_snapshot, not open (BUG #134)")]
+    #[error("StartPosition::{0} requires open_from_snapshot, not open")]
     InvalidStartPosition(&'static str),
 }

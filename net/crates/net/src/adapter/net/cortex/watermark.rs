@@ -9,21 +9,22 @@
 //! can stamp a duplicate `seq_or_ts` (data corruption — two distinct
 //! events with the same per-origin sequence number).
 //!
-//! Pre-fix the typed adapters did that discovery via a synchronous
-//! `read_range` walk that re-materialized every event after the inner
-//! fold task had already done so. For an N-event log on disk this was
-//! N redundant payload reads + N redundant checksum verifications + 2N
-//! `Bytes` copies (BUG #148 in `BUG_AUDIT_2026_04_30_CORE.md`).
+//! The typed adapters install this wrapper around the user fold so
+//! discovery piggybacks on the fold task's traversal. The fold task
+//! reads each event exactly once; on every successful inner-fold
+//! `apply` we parse the leading [`EventMeta`] and, if the event
+//! matches our `origin_hash`, advance the shared `Arc<AtomicU64>` via
+//! `fetch_max(meta.seq_or_ts + 1)`. The typed constructors then
+//! `wait_for_seq(replay_end - 1).await` before returning so callers
+//! see a fully-ready adapter — `app_seq` is correct synchronously
+//! from the caller's perspective even though it was assembled
+//! asynchronously by the fold task.
 //!
-//! Post-fix the typed adapters install this wrapper around the user
-//! fold. The fold task reads each event exactly once; on every
-//! successful inner-fold `apply` we parse the leading [`EventMeta`]
-//! and, if the event matches our `origin_hash`, advance the shared
-//! `Arc<AtomicU64>` via `fetch_max(meta.seq_or_ts + 1)`. The typed
-//! constructors then `wait_for_seq(replay_end - 1).await` before
-//! returning so callers see a fully-ready adapter — `app_seq` is
-//! correct synchronously from the caller's perspective even though
-//! it was assembled asynchronously by the fold task.
+//! A naïve alternative — a separate synchronous `read_range` walk
+//! that re-materializes every event after the inner fold task has
+//! already done so — costs N redundant payload reads + N redundant
+//! checksum verifications + 2N `Bytes` copies on an N-event log, and
+//! is deliberately avoided here.
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};

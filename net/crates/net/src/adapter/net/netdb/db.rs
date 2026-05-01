@@ -93,17 +93,12 @@ impl NetDb {
     /// against the same `Redex` instance replays or snapshots them.
     /// Idempotent.
     ///
-    /// BUG #133: pre-fix this used `?` after `tasks.close()`, which
-    /// short-circuited and left `memories.close()` un-invoked when
-    /// the tasks-side close errored — the memories adapter retained
-    /// its fold task and kept consuming events even though the
-    /// caller had been told `close` failed and likely treated the
-    /// whole NetDb as torn down. Now both closes are attempted
-    /// regardless and the FIRST error is surfaced; the second
-    /// error (if any) is dropped silently — `close` is best-effort
-    /// teardown and the dominant failure mode is "underlying redex
-    /// already closed," which produces the same error from both
-    /// adapters and is uninteresting to disambiguate.
+    /// Both closes are attempted regardless of failure and the FIRST
+    /// error is surfaced; the second error (if any) is dropped
+    /// silently — `close` is best-effort teardown and the dominant
+    /// failure mode is "underlying redex already closed," which
+    /// produces the same error from both adapters and is
+    /// uninteresting to disambiguate.
     pub fn close(&self) -> Result<(), NetDbError> {
         let tasks_result = self.tasks.as_ref().map(|t| t.close()).unwrap_or(Ok(()));
         let memories_result = self.memories.as_ref().map(|m| m.close()).unwrap_or(Ok(()));

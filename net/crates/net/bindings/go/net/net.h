@@ -21,11 +21,9 @@ typedef void* net_handle_t;
 /*
  * Error codes.
  *
- * MUST stay in sync with `src/ffi/mod.rs::NetError` and
- * `include/net.h`. CR-22 added `-9` (IntOverflow) and `-10`
- * (MismatchedHandles); the Rust-side parity test
- * `cr22_c_header_parity_with_rust_neterror` scans this file and
- * the canonical `include/net.h` to catch future drift.
+ * Kept in sync with the Rust-side `NetError` enum and the
+ * canonical `include/net.h`. The library has a regression test
+ * that scans both headers to detect drift.
  */
 typedef enum {
     NET_SUCCESS = 0,
@@ -37,9 +35,9 @@ typedef enum {
     NET_ERR_POLL_FAILED = -6,
     NET_ERR_BUFFER_TOO_SMALL = -7,
     NET_ERR_SHUTTING_DOWN = -8,
-    /* CR-22: response byte count exceeds c_int::MAX. */
+    /* Response byte count exceeds c_int::MAX. */
     NET_ERR_INT_OVERFLOW = -9,
-    /* CR-22: stream handle does not belong to the supplied node. */
+    /* Stream handle does not belong to the supplied node. */
     NET_ERR_MISMATCHED_HANDLES = -10,
     NET_ERR_UNKNOWN = -99,
     /* CortEX / RedEX surface (compiled when the Rust cdylib has
@@ -346,8 +344,8 @@ void net_memories_watch_free(net_memories_watch_t* cursor);
  * stable `dedup_id` field on every XADD entry
  * (`"{producer_nonce:hex}:{shard_id}:{sequence_start}:{i}"`); this
  * helper filters duplicates whose `dedup_id`s repeat — handling the
- * BUG #57 producer-side `MULTI/EXEC`-timeout race that lands two
- * stream entries for one logical event.
+ * producer-side `MULTI/EXEC`-timeout race that lands two stream
+ * entries for one logical event.
  *
  * Each handle wraps an LRU-bounded set of seen ids; the LRU is
  * mutex-protected so concurrent calls from multiple goroutines /

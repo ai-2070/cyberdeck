@@ -6,8 +6,8 @@
 //! helper filters duplicates by maintaining an LRU-bounded set of
 //! seen ids.
 //!
-//! Wire shape from the JS side. CR-3: post-fix users can import
-//! either from `@ai2070/net` (the NAPI module directly) or from
+//! Wire shape from the JS side. Users can import either from
+//! `@ai2070/net` (the NAPI module directly) or from
 //! `@ai2070/net-sdk` (which re-exports the same class via
 //! `sdk-ts/src/redis-dedup.ts`):
 //!
@@ -32,24 +32,23 @@
 //! }
 //! ```
 //!
-//! `RedisStreamDedup` is now `Send + Sync` (CR-2 — switched the
-//! internal storage from `Rc<str>` to `Arc<str>`); concurrent
-//! `isDuplicate` calls from multiple NAPI worker threads serialize
-//! safely on the underlying mutex. Production-shape is still one
-//! helper per consumer thread (each consuming a disjoint partition)
-//! to avoid the contention; sharing one handle is supported but
-//! costs lock time on the hot path.
+//! `RedisStreamDedup` is `Send + Sync`; concurrent `isDuplicate`
+//! calls from multiple NAPI worker threads serialize safely on
+//! the underlying mutex. Production-shape is still one helper per
+//! consumer thread (each consuming a disjoint partition) to avoid
+//! the contention; sharing one handle is supported but costs lock
+//! time on the hot path.
 //!
-//! CR-35 note: PyO3's audit suggested "GIL release on the hot path."
-//! NAPI doesn't have a GIL — Node's JS thread is single-threaded and
-//! NAPI worker threads (libuv) don't share an interpreter lock with
-//! it. The PyO3 binding (`bindings/python/src/redis_dedup.rs`)
-//! releases the GIL via `Python::detach` because the GIL serializes
-//! all Python threads through the interpreter; that's the right move
-//! there. Here, the only contention concern is the inner Rust
-//! mutex, which a `Python::detach`-equivalent wouldn't help with.
-//! For the cross-worker shared-handle case the answer is "use one
-//! handle per worker" — the documented production shape.
+//! NAPI doesn't have a GIL — Node's JS thread is single-threaded
+//! and NAPI worker threads (libuv) don't share an interpreter
+//! lock with it. The PyO3 binding
+//! (`bindings/python/src/redis_dedup.rs`) releases the GIL via
+//! `Python::detach` because the GIL serializes all Python threads
+//! through the interpreter; that's the right move there. Here,
+//! the only contention concern is the inner Rust mutex, which a
+//! `Python::detach`-equivalent wouldn't help with. For the
+//! cross-worker shared-handle case the answer is "use one handle
+//! per worker" — the documented production shape.
 
 #![allow(dead_code)]
 
@@ -59,7 +58,8 @@ use std::sync::Mutex;
 /// Consumer-side dedup helper for the Redis Streams adapter.
 ///
 /// See `net::adapter::redis` module docs for the producer-side
-/// contract and BUG #57 background.
+/// contract that produces the `dedup_id` field this helper
+/// filters on.
 #[napi]
 pub struct RedisStreamDedup {
     // The inner LRU is `!Sync` (it owns mutable state behind a

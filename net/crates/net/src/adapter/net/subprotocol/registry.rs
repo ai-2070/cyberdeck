@@ -114,12 +114,11 @@ impl SubprotocolRegistry {
     /// Add these to the local node's `CapabilitySet` and re-broadcast
     /// via `CapabilityAd` so other nodes can discover support.
     ///
-    /// CR-31 + Cubic P2: returned in ascending subprotocol-id
-    /// order, matching `SubprotocolManifest::from_registry`'s
-    /// (BUG #149) sort. Without this, the two channels' byte
-    /// streams diverge — fine today, but a future digest-dedup
-    /// optimisation that hashes either output would silently
-    /// disagree with the other side.
+    /// Returned in ascending subprotocol-id order, matching
+    /// `SubprotocolManifest::from_registry`'s sort. Without this,
+    /// the two channels' byte streams diverge — fine today, but a
+    /// future digest-dedup optimisation that hashes either output
+    /// would silently disagree with the other side.
     pub fn capability_tags(&self) -> Vec<String> {
         let mut entries: Vec<_> = self
             .entries

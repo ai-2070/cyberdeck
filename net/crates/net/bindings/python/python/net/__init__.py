@@ -54,10 +54,7 @@ __all__ = [
 ]
 
 # Redis Streams consumer-side dedup helper. Present iff the native
-# module was built with the `redis` feature. CR-3: pre-fix the class
-# was registered in the native module but never re-exported through
-# the public Python API, so `from net import RedisStreamDedup` raised
-# ImportError.
+# module was built with the `redis` feature.
 try:
     from ._net import RedisStreamDedup
 except ImportError:

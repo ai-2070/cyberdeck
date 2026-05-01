@@ -24,8 +24,8 @@ pub const MAX_DEPTH: u8 = 4;
 /// ancestor/descendant relationships); it exists purely as a
 /// deterministic tiebreaker for callers that need a total order
 /// over `SubnetId`s — e.g. `correlation.rs::analyze_subnet_correlation`
-/// (BUG #91) needs ties at the same depth to resolve consistently
-/// across runs rather than depending on `HashMap` iteration order.
+/// needs ties at the same depth to resolve consistently across runs
+/// rather than depending on `HashMap` iteration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct SubnetId(u32);
 

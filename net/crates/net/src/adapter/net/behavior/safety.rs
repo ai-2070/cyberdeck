@@ -1243,19 +1243,18 @@ impl SafetyEnforcer {
 
     /// Release resources (called by ResourceGuard on drop)
     fn release(&self, claim: &ResourceClaim) {
-        // BUG #102: previously this used raw `fetch_sub` on
-        // `concurrent` and `memory_mb`. `acquire()` short-circuits
-        // in `EnforcementMode::Disabled` and returns a guard
-        // WITHOUT incrementing those counters; the matching
-        // release would then `fetch_sub` from a counter at 0,
-        // wrapping it to ~`u32::MAX`. The next `Enforce`-mode
-        // `acquire` would see `current.saturating_add(claim) >
-        // max_concurrent` and reject every request forever (mode
-        // is hot-swappable via `update_envelope`, so warm-up in
-        // `Disabled` then flip to `Enforce` was the real-world
-        // trigger). The matching tokens/cost paths already use
-        // `fetch_update` + `saturating_sub` for exactly this
-        // reason; mirror that here.
+        // Use `fetch_update` + `saturating_sub` rather than raw
+        // `fetch_sub` on `concurrent` and `memory_mb`. `acquire()`
+        // short-circuits in `EnforcementMode::Disabled` and returns
+        // a guard WITHOUT incrementing those counters; a raw
+        // `fetch_sub` from a counter at 0 would wrap to ~`u32::MAX`,
+        // and the next `Enforce`-mode `acquire` would see
+        // `current.saturating_add(claim) > max_concurrent` and reject
+        // every request forever (mode is hot-swappable via
+        // `update_envelope`, so warm-up in `Disabled` then flip to
+        // `Enforce` is the real-world trigger). The matching
+        // tokens/cost paths already use `fetch_update` +
+        // `saturating_sub` for exactly this reason.
         let _ =
             self.usage
                 .concurrent

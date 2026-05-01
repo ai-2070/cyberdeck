@@ -110,19 +110,16 @@ impl SubnetGateway {
     ) -> ForwardDecision {
         // TTL check.
         //
-        // BUG #88: previously this was `hop_ttl > 0 && hop_count >=
-        // hop_ttl`, which short-circuited to "always forward" when
-        // `hop_ttl == 0`. `NetHeader::new` defaults `hop_ttl` to 0
-        // and `hop_count` is excluded from AAD (mutable in transit),
-        // so a malicious or buggy peer could craft `hop_ttl=0`
-        // packets that loop through gateways with no Net-layer
-        // bound. Routing-layer TTL still bounds end-to-end loops
-        // for routed packets, but pure subnet-gateway forwarding
-        // paths (no routing header) had no cap.
-        //
-        // Treating `hop_ttl == 0` as "expired" closes the loop:
-        // any header that hasn't explicitly set `hop_ttl` via
-        // `NetHeader::with_hops(ttl)` is dropped at the gateway.
+        // Treating `hop_ttl == 0` as "expired" is critical:
+        // `NetHeader::new` defaults `hop_ttl` to 0 and `hop_count`
+        // is excluded from AAD (mutable in transit), so a malicious
+        // or buggy peer could craft `hop_ttl=0` packets that loop
+        // through gateways with no Net-layer bound. Routing-layer
+        // TTL still bounds end-to-end loops for routed packets, but
+        // pure subnet-gateway forwarding paths (no routing header)
+        // would have no cap. Any header that hasn't explicitly set
+        // `hop_ttl` via `NetHeader::with_hops(ttl)` is dropped at
+        // the gateway.
         if hop_ttl == 0 || hop_count >= hop_ttl {
             self.dropped
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

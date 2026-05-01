@@ -18,17 +18,14 @@ use super::route::RoutingTable;
 
 /// Saved original route before reroute, for recovery.
 ///
-/// BUG #117: pre-fix this stored the original `next_hop:
-/// SocketAddr` and `on_recovery` filtered by
-/// `entry.next_hop == recovered_addr`. After a NAT rebind / peer
-/// reconnect on a different port / mobile-network change, the
-/// peer's entry in `peer_addrs` reflects the NEW address but the
-/// saved entry was keyed on the OLD address — the filter returned
-/// empty, no routes were restored, and the saved entry persisted
-/// indefinitely (DashMap entries were only dropped on successful
-/// match). Now we store the peer's stable `node_id` instead;
-/// `on_recovery` re-resolves the current addr from `peer_addrs` at
-/// recovery time, surviving NAT rebinds.
+/// We key on the peer's stable `node_id` rather than the original
+/// `next_hop: SocketAddr`. After a NAT rebind / peer reconnect on
+/// a different port / mobile-network change, `peer_addrs` reflects
+/// the NEW address; an addr-keyed filter would return empty,
+/// nothing would be restored, and the saved entry would persist
+/// indefinitely. `on_recovery` re-resolves the current addr from
+/// `peer_addrs[failed_node_id]` at recovery time, surviving NAT
+/// rebinds.
 struct SavedRoute {
     /// Node ID of the peer whose failure caused this reroute. The
     /// concrete `next_hop` SocketAddr at the time of saving may
@@ -234,17 +231,17 @@ impl ReroutePolicy {
     /// The direct path is typically better (fewer hops, lower latency)
     /// than the alternate.
     ///
-    /// BUG #117: filter is now `entry.failed_node_id ==
-    /// recovered_node_id` rather than `entry.next_hop ==
-    /// recovered_addr`. The pre-fix addr-based filter missed every
-    /// reroute when the peer reconnected from a different
-    /// SocketAddr (NAT rebind, mobile network change, reconnect on
-    /// different port) — `saved_routes` then accumulated
-    /// indefinitely across mobile / NAT-changing peers, and routes
-    /// stayed pinned to alternates after the peer had actually
-    /// recovered. Identity-based filter survives addr changes;
-    /// `recovered_addr` is re-resolved from `peer_addrs` at
-    /// recovery time so the restored route uses the current addr.
+    /// The filter is `entry.failed_node_id == recovered_node_id`
+    /// rather than `entry.next_hop == recovered_addr`. An addr-based
+    /// filter would miss every reroute when the peer reconnected
+    /// from a different SocketAddr (NAT rebind, mobile network
+    /// change, reconnect on different port) — `saved_routes` would
+    /// accumulate indefinitely across mobile / NAT-changing peers,
+    /// and routes would stay pinned to alternates after the peer
+    /// had actually recovered. The identity-based filter survives
+    /// addr changes; `recovered_addr` is re-resolved from
+    /// `peer_addrs` at recovery time so the restored route uses the
+    /// current addr.
     pub fn on_recovery(&self, recovered_node_id: u64) {
         let recovered_addr = match self.peer_addrs.get(&recovered_node_id) {
             Some(addr) => *addr,

@@ -279,15 +279,14 @@ impl Clone for ProximityNode {
 impl ProximityNode {
     /// Create new proximity node from pingwave
     pub fn from_pingwave(pw: &EnhancedPingwave, addr: SocketAddr) -> Self {
-        // BUG #108: pre-fix used `pw.hop_count + 1` which
-        // panics in debug at u8::MAX and silently wraps to 0 in
-        // release. A buggy or malicious peer can advertise
-        // `hop_count == 255`, after which:
-        //   - Debug builds panic the receive loop.
-        //   - Release builds record `hops=0`, falsely promoting
-        //     the node to "directly connected" status — a
-        //     proximity-routing poisoning vector.
-        // saturating_add(1) keeps hops at 255 in the overflow
+        // `pw.hop_count + 1` would panic in debug at u8::MAX and
+        // silently wrap to 0 in release. A buggy or malicious peer
+        // can advertise `hop_count == 255`, after which:
+        //   - Debug builds would panic the receive loop.
+        //   - Release builds would record `hops=0`, falsely
+        //     promoting the node to "directly connected" status —
+        //     a proximity-routing poisoning vector.
+        // `saturating_add(1)` keeps hops at 255 in the overflow
         // case; combined with `MAX_HOPS` cap on routing
         // installation, this is a non-poisoning floor.
         Self {
@@ -308,7 +307,7 @@ impl ProximityNode {
 
     /// Update from new pingwave
     pub fn update_from_pingwave(&mut self, pw: &EnhancedPingwave, addr: SocketAddr) {
-        // BUG #108: same `+ 1` overflow as `from_pingwave`. Use
+        // Same `+ 1` overflow concern as `from_pingwave`. Use
         // `saturating_add` here too. The "better path" comparison
         // also uses the saturated value so a 255-hop pingwave
         // can never falsely beat a real path.

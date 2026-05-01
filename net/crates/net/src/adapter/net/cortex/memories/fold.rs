@@ -18,8 +18,8 @@ pub struct MemoriesFold;
 
 impl RedexFold<MemoriesState> for MemoriesFold {
     fn apply(&mut self, ev: &RedexEvent, state: &mut MemoriesState) -> Result<(), RedexError> {
-        // BUG #141: per-event decode failures use `RedexError::Decode`
-        // (a recoverable variant) so the `Stop` fold policy
+        // Per-event decode failures use `RedexError::Decode` (a
+        // recoverable variant) so the `Stop` fold policy
         // skip-and-continues instead of permanently halting on a
         // single bad event. See `tasks/fold.rs` for the full
         // rationale.
@@ -37,12 +37,12 @@ impl RedexFold<MemoriesState> for MemoriesFold {
         // Verify the corruption-detection checksum stamped at
         // ingest against the tail we received from RedEX.
         //
-        // BUG #135: this catches accidental disk corruption
-        // (stray bit flips, truncated writes, mis-aligned
-        // reads). It is NOT a tamper detector — the 32-bit
-        // unkeyed xxh3 truncation is recomputable by any party
-        // that can write to the underlying file. See
-        // `compute_checksum`'s doc for the full scope.
+        // This catches accidental disk corruption (stray bit
+        // flips, truncated writes, mis-aligned reads). It is NOT a
+        // tamper detector — the 32-bit unkeyed xxh3 truncation is
+        // recomputable by any party that can write to the
+        // underlying file. See `compute_checksum`'s doc for the
+        // full scope.
         let expected = compute_checksum(tail);
         if meta.checksum != expected {
             return Err(RedexError::Decode(format!(
@@ -55,17 +55,15 @@ impl RedexFold<MemoriesState> for MemoriesFold {
             DISPATCH_MEMORY_STORED => {
                 let p: MemoryStoredPayload =
                     postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
-                // BUG #115: pre-fix this constructed a fresh
-                // `Memory { pinned: false, created_ns: p.now_ns,
-                // ... }` and `insert`ed it, silently replacing
-                // any existing entry. So `memories.store(42,
-                // "updated", ...)` after `memories.pin(42)`
-                // dropped the pin flag and overwrote the
-                // original creation timestamp — operator had no
-                // observable signal. Treat STORED as a content-
-                // update for an existing id: preserve `pinned`
-                // and `created_ns`, advance `updated_ns`, and
-                // overwrite the rest.
+                // Treat STORED as a content-update for an
+                // existing id: preserve `pinned` and `created_ns`,
+                // advance `updated_ns`, and overwrite the rest. A
+                // blanket `insert` would silently replace any
+                // existing entry, so `memories.store(42, "updated",
+                // ...)` after `memories.pin(42)` would drop the pin
+                // flag and overwrite the original creation
+                // timestamp with no observable signal to the
+                // operator.
                 if let Some(existing) = state.memories.get_mut(&p.id) {
                     existing.content = p.content;
                     existing.tags = p.tags;

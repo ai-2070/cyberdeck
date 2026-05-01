@@ -53,14 +53,12 @@ impl ObservedHorizon {
 
     /// Record an observation of an entity at a given sequence.
     ///
-    /// BUG #140: pre-fix this used `self.logical_time += 1`,
-    /// which debug-panics on overflow (u64::MAX → wrap) and
-    /// silently wraps to 0 in release. The `merge` path at
-    /// line 75 already uses `saturating_add(1)` and the comment
-    /// there acknowledges the convention; observe was the
-    /// outlier. Adversarial high-cardinality observe streams
-    /// could panic the receive loop in debug builds.
-    /// `saturating_add(1)` makes both paths consistent.
+    /// `logical_time` advances via `saturating_add(1)`; raw `+= 1`
+    /// would debug-panic on overflow (u64::MAX → wrap) and silently
+    /// wrap to 0 in release. Adversarial high-cardinality observe
+    /// streams could otherwise panic the receive loop in debug
+    /// builds. The `merge` path at line 75 uses the same
+    /// convention.
     pub fn observe(&mut self, origin_hash: u32, sequence: u64) {
         let entry = self.entries.entry(origin_hash).or_insert(0);
         if sequence > *entry {
@@ -87,12 +85,12 @@ impl ObservedHorizon {
 
     /// Exact "have I observed ANY event from this origin?" query.
     ///
-    /// CR-16 / BUG #130: the seq-less variant of [`Self::has_observed`].
-    /// Used by `CausalCone::is_concurrent_with` to bypass the
-    /// 64-bit bloom when both sides carry full horizons — the
-    /// bloom collapses toward constant-`false` past ~16 distinct
-    /// origins, silently mis-reporting genuinely concurrent
-    /// events as causally ordered.
+    /// The seq-less variant of [`Self::has_observed`]. Used by
+    /// `CausalCone::is_concurrent_with` to bypass the 64-bit bloom
+    /// when both sides carry full horizons — the bloom collapses
+    /// toward constant-`false` past ~16 distinct origins, silently
+    /// mis-reporting genuinely concurrent events as causally
+    /// ordered.
     #[inline]
     pub fn contains_origin(&self, origin_hash: u32) -> bool {
         self.entries.contains_key(&origin_hash)

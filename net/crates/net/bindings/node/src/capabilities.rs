@@ -520,7 +520,7 @@ pub fn scope_filter_from_js(f: ScopeFilterJs) -> ScopeFilterOwned {
                 // empty announcements, so passing `[""]` through as a
                 // query would never match real tenants and would only
                 // pin to Global candidates (since `Tenants(["",])` is
-                // a valid filter that matches no tenant tag). Cubic P2.
+                // a valid filter that matches no tenant tag).
                 let cleaned: Vec<String> = ts.into_iter().filter(|t| !t.is_empty()).collect();
                 if cleaned.is_empty() {
                     ScopeFilterOwned::Any
@@ -535,7 +535,7 @@ pub fn scope_filter_from_js(f: ScopeFilterJs) -> ScopeFilterOwned {
             _ => ScopeFilterOwned::Any,
         },
         "regions" => match f.regions {
-            // Same reasoning as `tenants` above (Cubic P2).
+            // Same reasoning as `tenants` above.
             Some(rs) => {
                 let cleaned: Vec<String> = rs.into_iter().filter(|r| !r.is_empty()).collect();
                 if cleaned.is_empty() {

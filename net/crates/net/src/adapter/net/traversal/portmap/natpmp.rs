@@ -459,16 +459,13 @@ impl PortMapperClient for NatPmpMapper {
         internal_port: u16,
         ttl: Duration,
     ) -> Result<PortMapping, PortMappingError> {
-        // BUG #113: pre-fix this turned `ttl == Duration::ZERO`
-        // into `lifetime = 0` and sent the request. Per RFC 6886
-        // §3.3, lifetime=0 is the "remove this mapping" signal —
-        // the same wire format `remove()` sends. So an "install"
-        // with zero TTL silently REMOVED the mapping instead of
-        // creating one. Compounded with the renewal loop:
-        // `mapping.ttl = ZERO` propagated, and the next renewal
-        // sent another remove ("succeeding" while the router
-        // had nothing mapped). Reject zero TTL up-front so the
-        // caller sees an error instead of a silent removal.
+        // Reject zero TTL up-front. Per RFC 6886 §3.3, lifetime=0
+        // is the "remove this mapping" wire signal — the same
+        // format `remove()` sends. Allowing `ttl == Duration::ZERO`
+        // here would silently REMOVE the mapping instead of
+        // creating one, and the renewal loop would then propagate
+        // `mapping.ttl = ZERO` and keep sending removes
+        // ("succeeding" while the router had nothing mapped).
         if ttl.is_zero() {
             return Err(PortMappingError::Transport(
                 "NAT-PMP install with ttl=0 would unmap; \

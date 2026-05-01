@@ -246,19 +246,16 @@ impl CorrelatedFailureDetector {
         let threshold =
             (with_subnet as f32 * self.config.subnet_correlation_threshold).ceil() as usize;
 
-        // BUG #91: previously this iterated `subnet_counts` (a
-        // `HashMap`) directly with `>=` on depth as the
-        // tiebreaker, so on tied `best_depth` the chosen subnet
-        // depended on hash iteration order — randomized per
-        // process. Downstream `partition.rs::detect` brands the
-        // partition record with this subnet, and recovery scope
-        // would flip between runs given identical inputs.
-        //
         // Iterate a sorted snapshot so ties resolve deterministically:
         // higher `depth` wins; on equal depth, the lower `SubnetId`
         // wins (the inner `u32` comparison is a stable total order
         // without semantic hierarchy meaning — see `SubnetId`'s
-        // `Ord` rustdoc).
+        // `Ord` rustdoc). Iterating a `HashMap` directly with `>=` on
+        // depth as the tiebreaker would let hash iteration order
+        // (randomized per process) pick the winner, and downstream
+        // `partition.rs::detect` would brand the partition record
+        // with a subnet that flips between runs given identical
+        // inputs.
         let mut entries: Vec<(SubnetId, usize)> =
             subnet_counts.iter().map(|(&s, &c)| (s, c)).collect();
         entries.sort_by(|a, b| b.0.depth().cmp(&a.0.depth()).then_with(|| a.0.cmp(&b.0)));

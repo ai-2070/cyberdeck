@@ -33,11 +33,9 @@ typedef void* net_handle_t;
 /*
  * Error codes.
  *
- * MUST stay in sync with `src/ffi/mod.rs::NetError`. CR-22 added the
- * `-9` and `-10` values that were defined in Rust but missing here;
- * the `cr22_c_header_parity_with_rust_neterror` test (Rust-side)
- * scans this header and the Go-side copy at `bindings/go/net/net.h`
- * to catch future drift.
+ * Kept in sync with the Rust-side `NetError` enum and with the Go
+ * binding's copy at `bindings/go/net/net.h`. The library has a
+ * regression test that scans both headers to detect drift.
  */
 typedef enum {
     NET_SUCCESS              =  0,
@@ -50,18 +48,18 @@ typedef enum {
     NET_ERR_BUFFER_TOO_SMALL = -7,
     NET_ERR_SHUTTING_DOWN    = -8,
     /*
-     * CR-22: response byte count exceeds c_int::MAX. The data was
-     * already copied into the caller's buffer (so resizing won't
-     * help — that's BUFFER_TOO_SMALL); the caller's int counter
-     * just can't represent the count. Surfaced by net_poll /
-     * net_stats when their JSON output is multi-gigabyte.
+     * Response byte count exceeds `c_int::MAX`. The data was already
+     * copied into the caller's buffer (so resizing won't help — that
+     * is BUFFER_TOO_SMALL); the caller's int counter just can't
+     * represent the count. Surfaced by net_poll / net_stats when
+     * their JSON output is multi-gigabyte.
      */
     NET_ERR_INT_OVERFLOW     = -9,
     /*
-     * CR-22: a stream handle was passed to a send-family FFI for a
-     * NetHandle that did not create it. Pre-fix the FFI layer
-     * accepted any (stream, node) pair, allowing silent cross-
-     * session traffic when a caller bug crossed handles.
+     * A stream handle was passed to a send-family FFI for a
+     * net_handle_t that did not create it. The FFI layer rejects
+     * such cross-handle traffic to prevent silent leaks between
+     * sessions when a caller bug crosses handles.
      */
     NET_ERR_MISMATCHED_HANDLES = -10,
     NET_ERR_UNKNOWN          = -99
@@ -293,9 +291,6 @@ void net_free_string(char* s);
  * one helper per consumer thread and key on the `dedup_id` field
  * extracted from each XRANGE / XREAD entry. See `include/README.md`
  * and the language-specific binding READMEs for runnable examples.
- *
- * BUG #57 background and full producer-side contract:
- * `docs/BUG_AUDIT_2026_04_30_CORE.md`.
  * ========================================================================= */
 
 typedef struct net_redis_dedup_s net_redis_dedup_t;

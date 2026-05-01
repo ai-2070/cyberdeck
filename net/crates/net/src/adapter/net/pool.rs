@@ -35,14 +35,14 @@ impl PacketBuilder {
     ///
     /// `pub(crate)` not `pub`: every legitimate caller is inside
     /// `adapter/net/`. Demoted as part of the heartbeat-unification
-    /// pass — see [`HEARTBEAT_UNIFICATION_PLAN.md`] — to lock the
-    /// surface that admitted BUG #97 (a caller substituting
-    /// `&[0u8; 32]` for the session's real TX key produced
-    /// AEAD-tagged heartbeats whose tag the receiver could never
-    /// verify against the session's actual key). Heartbeats now go
-    /// through [`NetSession::build_heartbeat`]; data-path packets
-    /// go through the pool. No external caller should be
-    /// constructing raw-key builders.
+    /// pass — see [`HEARTBEAT_UNIFICATION_PLAN.md`] — to prevent a
+    /// caller from substituting `&[0u8; 32]` for the session's real
+    /// TX key, which would produce AEAD-tagged heartbeats whose tag
+    /// the receiver could never verify against the session's actual
+    /// key. Heartbeats now go through
+    /// [`NetSession::build_heartbeat`]; data-path packets go
+    /// through the pool. No external caller should be constructing
+    /// raw-key builders.
     pub(crate) fn new(key: &[u8; 32], session_id: u64) -> Self {
         Self {
             payload: BytesMut::with_capacity(MAX_PAYLOAD_SIZE),
@@ -513,13 +513,12 @@ impl std::fmt::Debug for PooledBuilder<'_> {
     }
 }
 
-// BUG #106: `SharedPacketPool` and `shared_pool` removed.
-// They were the wrappers around `PacketPool`; the audit's
-// remove-the-unused-getters fix dropped `NetSession::packet_pool`
-// (which was their only consumer). `PacketPool` itself is still
-// the underlying type used by the thread-local pool internally.
-// Keeping those wrappers with no caller would re-invite the
-// cross-pool nonce-reuse hazard described in BUG #106.
+// `SharedPacketPool` and `shared_pool` are intentionally absent:
+// they were the wrappers around `PacketPool`, and dropping the
+// unused `NetSession::packet_pool` getter removed their only
+// consumer. `PacketPool` itself is still the underlying type used
+// by the thread-local pool internally. Keeping those wrappers with
+// no caller would re-invite a cross-pool nonce-reuse hazard.
 
 // ============================================================================
 // Thread-Local Pool (Zero-Contention Hot Path)

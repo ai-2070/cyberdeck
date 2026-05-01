@@ -897,7 +897,8 @@ export declare class RedexTailIter {
  * Consumer-side dedup helper for the Redis Streams adapter.
  *
  * See `net::adapter::redis` module docs for the producer-side
- * contract and BUG #57 background.
+ * contract that produces the `dedup_id` field this helper filters
+ * on.
  */
 export declare class RedisStreamDedup {
   /**

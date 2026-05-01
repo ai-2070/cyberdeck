@@ -266,16 +266,15 @@ impl StandbyGroup {
     ) -> Result<u32, GroupError> {
         let old_active = self.active_index;
 
-        // BUG #103: previously this called `mark_unhealthy(old_active)`
-        // and demoted the old active to `Standby` BEFORE searching
-        // for `best_standby`. If the search returned `NoHealthyMember`
-        // the function exited with `Err` but left `self.active_index`
-        // pointing at the now-unhealthy, now-`Standby`-roled
-        // `old_active`. A subsequent `on_node_recovery` for that
-        // member only marks it healthy — it doesn't restore the
-        // `Active` role — so the group would be silently demoted
-        // forever. Now the search runs FIRST; only if it succeeds
-        // do we mutate the old active's state.
+        // The search for a replacement runs FIRST; only if it
+        // succeeds do we mutate the old active's state. If we instead
+        // demoted `old_active` first and the search then returned
+        // `NoHealthyMember`, the function would exit with `Err` but
+        // leave `self.active_index` pointing at the now-unhealthy,
+        // now-`Standby`-roled `old_active`. A subsequent
+        // `on_node_recovery` for that member only marks it healthy —
+        // it doesn't restore the `Active` role — so the group would
+        // be silently demoted forever.
         let best_standby = self
             .members
             .iter()

@@ -232,12 +232,11 @@ impl NetProxy {
 
     /// Remove a route.
     ///
-    /// BUG #116: pre-fix this only removed the next_hop entry
-    /// and left `hop_stats[dest_id]` in place. A peer churning
-    /// through many destinations grew `hop_stats` indefinitely
-    /// (memory ∝ total-distinct-dest-ids-ever-seen, not active
-    /// dest count). Now `remove_route` also drops the matching
-    /// `hop_stats` entry.
+    /// Drops both the next_hop entry and the matching `hop_stats`
+    /// entry. Removing only the former would let `hop_stats` grow
+    /// indefinitely (memory ∝ total-distinct-dest-ids-ever-seen,
+    /// not active dest count) for a peer churning through many
+    /// destinations.
     pub fn remove_route(&self, dest_id: u64) {
         self.next_hop.remove(&dest_id);
         self.hop_stats.remove(&dest_id);
@@ -298,10 +297,9 @@ impl NetProxy {
         // Update routing header (decrement TTL, increment hop count)
         let mut new_header = header;
         new_header.forward();
-        // BUG #119 (mirror of `router.rs:512` fix): drop here if
-        // forwarding made the TTL 0 — the next hop would just
-        // drop it on its own `is_expired()` check, wasting
-        // bandwidth and a queue slot.
+        // Drop here if forwarding made the TTL 0 — the next hop
+        // would just drop it on its own `is_expired()` check,
+        // wasting bandwidth and a queue slot.
         if new_header.is_expired() {
             self.packets_dropped.fetch_add(1, Ordering::Relaxed);
             self.record_hop_drop(header.dest_id);

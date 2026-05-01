@@ -143,15 +143,14 @@ impl DaemonHost {
         // the prior behavior — but this fallback only works when
         // the source side made the same choice.
         //
-        // CR-34 + Cubic P2: `head_payload` is `Option<Bytes>`.
-        // `Some(bytes)` is the legitimate "caller populated the
-        // head event payload" path; `None` is the unambiguous
-        // "context missing" sentinel. Pre-Cubic-P2 the
-        // empty-Bytes sentinel conflated empty payloads with
-        // missing context. For genesis snapshots (sequence == 0)
-        // a missing payload is fine — there's no predecessor.
-        // For non-genesis with no payload, fall back to
-        // snapshot.state and warn loudly.
+        // `head_payload` is `Option<Bytes>`. `Some(bytes)` is the
+        // legitimate "caller populated the head event payload" path;
+        // `None` is the unambiguous "context missing" sentinel — an
+        // empty-`Bytes` sentinel would conflate empty payloads with
+        // missing context. For genesis snapshots (sequence == 0) a
+        // missing payload is fine — there's no predecessor. For
+        // non-genesis with no payload, fall back to snapshot.state
+        // and warn loudly.
         let head_payload = match &snapshot.head_payload {
             Some(payload) => payload.clone(),
             None => {
@@ -164,7 +163,7 @@ impl DaemonHost {
                          only validates against subsequent events if the source side \
                          made the same choice. Production callers MUST populate \
                          head_payload via `StateSnapshot::with_head_payload` before \
-                         passing to from_snapshot. (CR-34 / Cubic P2)"
+                         passing to from_snapshot."
                     );
                 }
                 snapshot.state.clone()
@@ -284,9 +283,9 @@ impl DaemonHost {
         // logic as `from_snapshot` for the runtime-only
         // `head_payload`.
         //
-        // CR-34 + Cubic P2: see `from_snapshot` for full
-        // rationale. `head_payload: Option<Bytes>` distinguishes
-        // legitimate empty payloads from missing context.
+        // See `from_snapshot` for full rationale.
+        // `head_payload: Option<Bytes>` distinguishes legitimate
+        // empty payloads from missing context.
         let head_payload = match &snapshot.head_payload {
             Some(payload) => payload.clone(),
             None => {
@@ -297,7 +296,7 @@ impl DaemonHost {
                         "DaemonHost::restore_from_snapshot: head_payload not populated \
                          for non-genesis snapshot — falling back to snapshot.state. \
                          Production callers MUST populate head_payload via \
-                         `StateSnapshot::with_head_payload`. (CR-34 / Cubic P2)"
+                         `StateSnapshot::with_head_payload`."
                     );
                 }
                 snapshot.state.clone()

@@ -16,19 +16,13 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["redis", "net"]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
-# `RedisStreamDedup` consumer helper (BUG #57). The redis feature
-# was originally just `net/redis`; the SDK dep is added here so
-# the dedup helper is a thin PyO3 wrapper around the canonical
-# Rust implementation.
+# `RedisStreamDedup` consumer helper. The dedup helper is a thin
+# PyO3 wrapper around the canonical Rust implementation.
 #
-# Cubic-ai P2 (parallel to the Node binding fix): pre-fix the
-# `[dependencies]` declaration of `net-sdk` had
-# `features = ["net", "compute", "groups"]` baked in, so enabling
-# this `redis` feature transitively compiled the entire net +
-# compute + groups surface into a Redis-only consumer build.
-# Fixed by clearing the baseline features on the dep and having
-# each Python feature opt in explicitly via its own `net-sdk/<sub>`
-# activation below.
+# Each Python feature opts in explicitly via its own
+# `net-sdk/<sub>` activation; the `[dependencies]` line clears
+# the dep's default features so a Redis-only consumer build does
+# not transitively compile the net + compute + groups surfaces.
 redis = ["net/redis", "dep:net-sdk", "net-sdk/redis"]
 jetstream = ["net/jetstream"]
 net = ["net/net", "dep:hex"]
@@ -45,14 +39,10 @@ nat-traversal = ["net", "net/nat-traversal"]
 # on `nat-traversal`.
 port-mapping = ["nat-traversal", "net/port-mapping"]
 cortex = ["net/netdb", "net/redex-disk"]
-# Stage 5 of `SDK_COMPUTE_SURFACE_PLAN.md` — Python surface for
-# the `MeshDaemon` / migration runtime. Requires the `net` feature
-# (for `NetMesh`) + the net-sdk compute feature.
-#
-# Cubic-ai P2: explicitly forwards `net-sdk/compute` so the SDK's
-# compute code only compiles when this feature is active. Pre-fix
-# the dep declaration's baseline features pulled it in for every
-# feature.
+# Python surface for the `MeshDaemon` / migration runtime.
+# Requires the `net` feature (for `NetMesh`) + the net-sdk
+# compute feature. Forwards `net-sdk/compute` explicitly so the
+# SDK's compute code only compiles when this feature is active.
 compute = ["net", "dep:net-sdk", "net-sdk/compute", "dep:dashmap"]
 # Stage 3 of `SDK_GROUPS_SURFACE_PLAN.md` — HA/scaling overlays
 # (ReplicaGroup, ForkGroup, StandbyGroup). Sits on top of compute.
