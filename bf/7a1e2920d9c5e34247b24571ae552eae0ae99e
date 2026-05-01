@@ -1,0 +1,33 @@
+.claude/skills/net-event-bus/SKILL.md
+  64958cb6fb55fe73 22-24,26-27,54,56-64,79-80
+.claude/skills/net-event-bus/observability.md
+  64958cb6fb55fe73 1-243
+.claude/skills/net-event-bus/streams.md
+  64958cb6fb55fe73 1-327
+.claude/skills/net-event-bus/payloads.md
+  64958cb6fb55fe73 65-93
+.claude/skills/net-event-bus/capabilities.md
+  64958cb6fb55fe73 1-288
+.claude/skills/net-event-bus/mesh.md
+  64958cb6fb55fe73 1-286
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "bf7a1e2920d9c5e34247b24571ae552eae0ae99e",
+  "prompts": {
+    "64958cb6fb55fe73": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81cf66b-69b3-455c-bab9-06a87305bb12",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1354,
+      "total_deletions": 174,
+      "accepted_lines": 1865,
+      "overriden_lines": 0
+    }
+  }
+}
