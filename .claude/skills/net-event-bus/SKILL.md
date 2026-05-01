@@ -19,8 +19,12 @@ You have several reference files in this directory. Load them on demand — do n
 | `concepts.md` | **Always** — before writing any integration code. The mental model. ~5 min read. |
 | `apis.md` | When generating actual code. Verified per-SDK templates for publish, subscribe, lifecycle. |
 | `patterns.md` | When the user describes a task ("I need a relay", "I need persistence", "I need fan-out across machines"). Maps tasks to recipes. |
+| `mesh.md` | When the user is deploying multi-host. Production transport recipe — PSK / identity bootstrap, peer discovery, NAT traversal toggles, port mapping, 2-node and 3-node working configs. |
+| `capabilities.md` | When the user wants to route to "the GPU node" or "a node that has model X loaded". `find_nodes` / `find_best_node` / scope filters. The differentiator vs Kafka/NATS/Redis. |
+| `streams.md` | When the user needs ordered point-to-point delivery (large payloads, telemetry-to-one-peer, credit-grant backpressure). Per-peer streams — different surface from the bus despite overlapping vocabulary. |
 | `runtime.md` | When writing a `shutdown` path, handling errors, integrating into an existing async runtime (axum, FastAPI, Express), or debugging "why are my events missing?" |
-| `payloads.md` | When the user is shaping their event schema or asking about size limits, large blobs, or batching. |
+| `observability.md` | When the user asks "how do I know events are being dropped?" or wires Prometheus/OTel. Stat fields per SDK, the silent-drop trap, tuning knobs. |
+| `payloads.md` | When the user is shaping their event schema or asking about size limits, large blobs, batching, or cross-language schema interop (u64/BigInt edges, casing, optional/null, schema evolution). |
 | `testing.md` | When writing unit/integration tests against the SDK. Covers fixtures, race conditions, CI gotchas. |
 | `gotchas.md` | When the user is migrating from Kafka / NATS / Redis Streams / Pulsar, or when their question reveals broker-thinking. |
 | `examples/` | When the user is starting from scratch — minimal, runnable hello-world for each SDK. Use as the first thing they run after install, before they write application code. |
@@ -47,14 +51,17 @@ If the user's design language conflicts with any of these (e.g. "the broker", "t
 2. **Read `concepts.md`** if this is your first invocation in the session.
 3. **If the user is starting from scratch**, run the matching script in `examples/` first. Confirm the SDK is installed and working before writing application code.
 4. **Clarify the task shape** — single-process or multi-host? Channels (named topics) or raw firehose? Need persistence? Need typed payloads? Read `patterns.md` for the recipe that matches.
-5. **Pick the transport** — memory (single process), mesh (peer-to-peer over UDP), Redis, or JetStream. `concepts.md` covers the trade-offs. Default to `memory` for single-process tests and `mesh` for production.
+5. **Pick the transport** — memory (single process), mesh (peer-to-peer over UDP), Redis, or JetStream. `concepts.md` covers the trade-offs. Default to `memory` for single-process tests and `mesh` for production. **For mesh production deploys, read `mesh.md`** — PSK / identity bootstrap, peer discovery, NAT-traversal opt-ins.
 6. **Generate code from `apis.md`** — these templates are verified against the SDK source. Adapt the payload type and channel name; do not invent new methods.
-7. **Wire the lifecycle correctly** — read `runtime.md` for the shutdown contract and async-runtime integration before plugging into the user's existing app. Always add a `shutdown` path. The ring buffer needs a clean drain.
-8. **Handle errors per `runtime.md`** — `Backpressure` is the only retry-safe error; everything else indicates state change, bug, or config issue.
-9. **Shape the payload using `payloads.md`** — small JSON events on the bus, references for large blobs, batched events for telemetry streams.
-10. **Write tests using `testing.md`** — memory transport, two in-process nodes, subscribe-before-publish, clean shutdown in teardown.
-11. **If the user is migrating** from Kafka / NATS / Redis Streams / Pulsar, read `gotchas.md` first — broker assumptions will produce broken-but-compiling code.
-12. **If you're unsure about an API**, read the SDK source directly:
+7. **If the task is "route to a specific kind of node"** (GPU box, machine with model X loaded, particular tenant), read `capabilities.md`. Capability filters replace topic-based routing for placement.
+8. **If the task is "ordered point-to-point" or "large payload with backpressure"**, read `streams.md`. The bus is fan-out + transient; per-peer streams are the right primitive when you need order + credit-grant flow control.
+9. **Wire the lifecycle correctly** — read `runtime.md` for the shutdown contract and async-runtime integration before plugging into the user's existing app. Always add a `shutdown` path. The ring buffer needs a clean drain.
+10. **Handle errors per `runtime.md`** — `Backpressure` is the only retry-safe error; everything else indicates state change, bug, or config issue.
+11. **Shape the payload using `payloads.md`** — small JSON events on the bus, references for large blobs, batched events for telemetry streams. The Schema-interop section covers cross-language traps (u64/BigInt, casing, optional/null, schema evolution).
+12. **Wire observability per `observability.md`** — under default backpressure modes, drops are silent. Always alert on `events_dropped`. The file lists stat fields per SDK and Prometheus/OTel wiring patterns.
+13. **Write tests using `testing.md`** — memory transport, two in-process nodes, subscribe-before-publish, clean shutdown in teardown.
+14. **If the user is migrating** from Kafka / NATS / Redis Streams / Pulsar, read `gotchas.md` first — broker assumptions will produce broken-but-compiling code.
+15. **If you're unsure about an API**, read the SDK source directly:
    - Rust: `net/crates/net/sdk/src/` and `net/crates/net/sdk/examples/`
    - TypeScript: `net/crates/net/sdk-ts/src/`
    - Python: `net/crates/net/sdk-py/src/net_sdk/`
@@ -69,7 +76,7 @@ The event-bus surface is a small slice of Net. The following exist but are out o
 - **Daemons / Mikoshi (live state migration)** — stateful event processors that move between nodes carrying their causal chain. Read `net/README.md` § Daemons + Mikoshi if the user asks.
 - **CortEX / NetDB (queryable folded state)** — local materialized views over RedEX logs. Read `net/README.md` § CortEX + NetDB.
 - **Subprotocols** — custom protocols deployed incrementally over the same mesh. Out of scope unless the user is building one.
-- **Capability-addressed routing, subnets, identity/permission tokens** — covered briefly in `concepts.md` because they shape channel visibility, but the full surface is a separate concern.
-- **NAT traversal, port mapping, mesh transport internals** — operational concerns, not application API. Point at `net/crates/net/docs/`.
+- **Subnets, identity/permission tokens (full surface)** — covered briefly in `concepts.md` and `capabilities.md` because subnet scope filters and token-gated channels shape channel visibility, but the full identity / token issuance + delegation surface is a separate concern. Point at `net/README.md` § Security surface.
+- **Mesh transport internals** — packet codec, Noise handshake, routing-table internals. Point at `net/crates/net/docs/`. The application-level mesh setup is in `mesh.md`; capability routing on top of the mesh is in `capabilities.md`; per-peer streams over the mesh are in `streams.md`.
 
 If the user asks about these, point them at the relevant section of `net/README.md` rather than guessing.
