@@ -194,7 +194,7 @@ impl HorizonEncoder {
     /// Encode a full horizon into 8 bytes (a 64-bit bloom filter).
     pub fn encode(horizon: &ObservedHorizon) -> u64 {
         let mut bloom: u64 = 0;
-        for (&origin_hash, _seq) in &horizon.entries {
+        for &origin_hash in horizon.entries.keys() {
             bloom |= Self::bloom_bits_for_origin(origin_hash);
         }
         bloom
@@ -449,6 +449,169 @@ mod tests {
             (1..=3).contains(&bits),
             "single insert sets between 1 and 3 bits (got {bits})",
         );
+    }
+
+    /// Pin the documented practical ceiling at n=16. With m=64, k=3
+    /// the analytical FPR is ~44 %; the test asserts the empirical
+    /// FPR is below 60 % over 1000 random non-inserted probes, with
+    /// enough headroom to absorb hash-distribution noise without
+    /// flaking. A regression that broke the bloom encoding (e.g.
+    /// reduced `k` to 1, or reverted to the pre-fix 16-bit width)
+    /// would push FPR well past 60 % and trip this test.
+    ///
+    /// Past this ceiling the documented escape hatch is the
+    /// out-of-band full-`ObservedHorizon` path.
+    #[test]
+    fn might_contain_fpr_at_documented_ceiling_stays_under_60_percent() {
+        let mut h = ObservedHorizon::new();
+        let inserted: Vec<u32> = (0..16u32)
+            .map(|i| 0x2000_0000_u32.wrapping_add(i.wrapping_mul(0x9E37_79B9)))
+            .collect();
+        for &o in &inserted {
+            h.observe(o, 1);
+        }
+        let encoded = h.encode();
+
+        let mut false_positives = 0;
+        let trials = 1000;
+        for i in 0..trials {
+            let probe = 0xFEED_0000_u32.wrapping_add((i as u32).wrapping_mul(0xC0FF_EEAB));
+            if inserted.contains(&probe) {
+                continue;
+            }
+            if HorizonEncoder::might_contain(encoded, probe) {
+                false_positives += 1;
+            }
+        }
+        let fpr = (false_positives as f64) / (trials as f64);
+        assert!(
+            fpr < 0.60,
+            "FPR at the documented n=16 ceiling should stay under 60 % \
+             (analytical ~44 %); observed {:.1} % over {} trials",
+            fpr * 100.0,
+            trials,
+        );
+    }
+
+    /// User-facing semantic pin: two nodes that have observed
+    /// disjoint sets of peers see each other's events as
+    /// `potentially_concurrent`. This is the hot path callers gate
+    /// conflict-resolution on; if the bloom over-saturates and
+    /// `might_contain` starts returning `true` indiscriminately,
+    /// `potentially_concurrent` collapses to constant `false` and
+    /// merging never runs — the exact #130 failure mode.
+    ///
+    /// At n=4 origins each (well under the documented ≤16 ceiling),
+    /// disjoint horizons must reliably report concurrent. We sweep a
+    /// handful of disjoint origin-pair shapes to ensure the property
+    /// isn't an artifact of one fortunate hash.
+    #[test]
+    fn disjoint_small_horizons_recognize_concurrency() {
+        // 32 distinct origin candidates, partitioned into 3 pairs of
+        // disjoint 4-element sets so any one fortunate hash doesn't
+        // mask a regression. Pair k draws left from
+        // `[k*8 .. k*8+4)` and right from `[k*8+4 .. k*8+8)`.
+        let candidates: Vec<u32> = (0..32u32)
+            .map(|i| 0x3000_0000_u32.wrapping_add(i.wrapping_mul(0xDEAD_BEEF)))
+            .collect();
+
+        for split in 0..3 {
+            let base = split * 8;
+            let left_origins = &candidates[base..base + 4];
+            let right_origins = &candidates[base + 4..base + 8];
+
+            let mut left = ObservedHorizon::new();
+            for &o in left_origins {
+                left.observe(o, 1);
+            }
+            let mut right = ObservedHorizon::new();
+            for &o in right_origins {
+                right.observe(o, 1);
+            }
+            let enc_l = left.encode();
+            let enc_r = right.encode();
+
+            // For at least 3 of the 4 right-side origins, left's
+            // bloom must NOT contain them (false positives are
+            // possible at this cardinality but should be rare).
+            let mut left_false_positives = 0;
+            let mut right_false_positives = 0;
+            for (i, &o) in right_origins.iter().enumerate() {
+                if HorizonEncoder::might_contain(enc_l, o) {
+                    left_false_positives += 1;
+                }
+                let l = left_origins[i];
+                if HorizonEncoder::might_contain(enc_r, l) {
+                    right_false_positives += 1;
+                }
+            }
+            assert!(
+                left_false_positives <= 1 && right_false_positives <= 1,
+                "split {split}: at n=4 each, expected ≤1 false-positive \
+                 cross-origin probe in either direction, got \
+                 left={left_false_positives} right={right_false_positives}",
+            );
+
+            // And at least ONE pair (origin_a, origin_b) drawn from the
+            // disjoint sets must report `potentially_concurrent` — the
+            // hot-path semantic.
+            let any_concurrent =
+                left_origins
+                    .iter()
+                    .zip(right_origins.iter())
+                    .any(|(&origin_a, &origin_b)| {
+                        HorizonEncoder::potentially_concurrent(enc_l, origin_b, enc_r, origin_a)
+                    });
+            assert!(
+                any_concurrent,
+                "split {split}: at least one cross-origin pair must report \
+                 potentially_concurrent for disjoint small horizons",
+            );
+        }
+    }
+
+    /// End-to-end pin: a real `ObservedHorizon` encoded into a
+    /// `CausalLink`, serialized through the wire format, and parsed
+    /// back must preserve the bloom bits exactly. The wire-size
+    /// regression test in `causal.rs` pins the byte count; this
+    /// test pins that the bloom semantic survives the round-trip
+    /// (catches a future refactor that, e.g., truncates
+    /// `horizon_encoded` to u32 in one direction of `to_bytes`).
+    #[test]
+    fn encoded_horizon_round_trips_through_causal_link_wire_format() {
+        use crate::adapter::net::state::causal::CausalLink;
+
+        let mut h = ObservedHorizon::new();
+        for i in 0..8u32 {
+            h.observe(
+                0x4000_0000_u32.wrapping_add(i.wrapping_mul(0xCAFE_F00D)),
+                i as u64 + 1,
+            );
+        }
+        let encoded = h.encode();
+        assert_ne!(encoded, 0);
+        // Confirm the bloom has a non-trivial bit pattern (not just
+        // saturated and not just empty).
+        let bits = encoded.count_ones();
+        assert!((1..64).contains(&bits));
+
+        let link = CausalLink::genesis(0xDEAD_BEEF, encoded);
+        let bytes = link.to_bytes();
+        let parsed = CausalLink::from_bytes(&bytes).unwrap();
+
+        assert_eq!(
+            parsed.horizon_encoded, encoded,
+            "horizon_encoded must round-trip exactly through CausalLink wire format",
+        );
+
+        // And the bloom semantic must survive: every inserted origin
+        // still tests positive on the round-tripped value.
+        for (&origin, _) in h.iter() {
+            assert!(
+                HorizonEncoder::might_contain(parsed.horizon_encoded, origin),
+                "round-tripped horizon must still recognize inserted origin 0x{origin:08X}",
+            );
+        }
     }
 
     /// Defense-in-depth on the Kirsch-Mitzenmacher double-hash

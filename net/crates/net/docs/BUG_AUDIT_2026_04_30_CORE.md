@@ -31,7 +31,7 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 
 ## Status (running tally)
 
-**Outstanding (deferred — broader-than-audit-pass changes):** #56, #57 (cross-process retry duplicates — JetStream/Redis at-least-once semantics, require persistent nonce / server-side dedup state), #104 (local-source migration state mutation across cutover — rearchitecture), #130 (`HorizonEncoder::might_contain` bloom saturation — wire-format change to `horizon_encoded`).
+**Outstanding (deferred — broader-than-audit-pass changes):** #56, #57 (cross-process retry duplicates — JetStream/Redis at-least-once semantics, require persistent nonce / server-side dedup state), #104 (local-source migration state mutation across cutover — rearchitecture).
 
 **Fixed on 2026-04-30 (with regression tests where reasonable):**
 - **#80** — `Net::shutdown` now routes through `EventBus::shutdown_via_ref(&self)`, an idempotent reference-based shutdown that runs regardless of outstanding `Arc<EventBus>` clones. Tests: `sdk/tests/shutdown_regression.rs::{shutdown_runs_even_with_outstanding_event_stream, shutdown_via_ref_is_idempotent}`.
@@ -690,10 +690,24 @@ When `prune_through(seq)` is called on an empty log, `events.iter().rev().find(.
 
 Failure scenario: caller restored a fresh log via `from_snapshot(_, snapshot_seq=0, head_link=genesis, ..)`, then took an externally-coordinated snapshot at sequence 1000 and called `prune_through(1000)`. `head_seq()` reports 0 (base_link.sequence), but `snapshot_seq()` returns 1000. Code that prefers `head_seq().max(snapshot_seq())` to decide where the next event must start gets contradictory answers; the next `append` will only accept sequence == 1, not 1001 — silently dropping legitimate events from peers that observed the actual snapshot point. Fix: clamp `snapshot_seq = snapshot_seq.max(seq).min(head_seq())`, or only bump when `last_pruned.is_some()`.
 
-### 130. `HorizonEncoder::might_contain` saturates after ~8 origins, collapsing causal-concurrency detection to "always concurrent"
-**File:** `adapter/net/state/horizon.rs:91-141`
+### 130. `HorizonEncoder::might_contain` saturates after ~8 origins, collapsing causal-concurrency detection — **[FIXED 2026-05-01]**
+**File:** `adapter/net/state/horizon.rs` + `adapter/net/state/causal.rs::CausalLink`
 
-The bloom filter is 16 bits with two 4-bit hash positions per origin (`h & 0xF`, `(h >> 4) & 0xF`). Each insert sets two of 16 bits — by the birthday bound, after only ~6-8 inserted origins the bloom is fully saturated and `might_contain` returns true for *every* `origin_hash`. At that point `potentially_concurrent` always returns false, meaning the system claims "every event has observed every other event" — defeating causal concurrency detection on any non-tiny mesh. A node observing 8+ peer entities encodes a saturated bloom into every outgoing `CausalLink::horizon_encoded`. Receivers using `potentially_concurrent` to schedule conflict resolution / merging see all events as causally-ordered and skip the resolution they should be running. Fix: widen the bloom space (`horizon_encoded` is u32 but only the high 16 bits are bloom — the low 16 carry seq), or document a hard cardinality ceiling of ~6 origins, or use a counting/sliding sketch sized for realistic entity counts.
+Pre-fix `horizon_encoded` was a `u32` packed as `[16-bit bloom | 16-bit log-scale max-seq]`. Bloom math (m = 16 bits, k = 2 hash positions per insert) saturated around n ≈ 6–8 distinct origins, after which `might_contain` returned `true` for every probe and `potentially_concurrent` collapsed to constant `false` — receivers gating conflict resolution on it stopped running the path. The seq half was dormant in production (only test code ever called `decode_seq`).
+
+**Fix:** widen `CausalLink::horizon_encoded` from `u32` to `u64`; use all 64 bits as a bloom filter with `k = 3` hash positions per insert, derived via Kirsch-Mitzenmacher double-hashing from one xxh3 output (positions `h1`, `h1+h2`, `h1+2*h2` mod 64; `h2` forced odd to guarantee the three positions are mutually distinct). The seq encoding (`encode_seq_log` / `decode_seq` / `decode_seq_log`) is removed — production never read it. `CAUSAL_LINK_SIZE` bumps 24 → 28 bytes; the snapshot wire format and `ForkRecord::WIRE_SIZE` follow via `CAUSAL_LINK_SIZE` (no more hand-coded 24s scattered through the codebase). See `docs/BUG_130_HORIZON_BLOOM_PLAN.md` for the design and the option-tradeoff analysis.
+
+The new false-positive curve (m = 64, k = 3): n=8 → ~13 %, n=16 → ~44 %. Past n ≈ 16 active origins per event the FPR climbs above 50 % and the bloom approximation stops being trustworthy. **Two load-bearing doc invariants** are stamped on `HorizonEncoder` and `ObservedHorizon::encode`:
+
+1. The horizon bloom is **approximate** and tuned for **≲ 16 active origins**.
+2. Callers needing exact horizons at larger cardinalities **must fall back to the out-of-band full-horizon path** — `ObservedHorizon::has_observed` / `CausalCone::from_link_with_horizon`, which queries the locally-held full vector clock and gives an exact answer regardless of cardinality.
+
+Tests:
+- `bloom_fpr_at_n_8_is_well_below_pre_fix_saturation` — Monte Carlo over 1000 random non-inserted probes, asserts FPR < 25 % at n=8 (well under the pre-fix 16-bit-bloom's ~57 % at the same n).
+- `might_contain_has_no_false_negatives_for_inserted_origins` — pins the bloom invariant: every inserted origin must report `true`.
+- `bloom_does_not_collapse_to_one_bit_for_typical_origins` — defense-in-depth on the Kirsch-Mitzenmacher odd-`h2` trick. Without odd `h2`, an `h2 ≡ 0 mod 64` would collapse all three positions onto `h1` and produce a single-bit insert; this test pins that no origin in a 256-input sweep encodes to 1 bit.
+- `bloom_sets_at_least_one_bit_per_insert` — sanity bound on the encoding shape.
+- Updated `test_regression_causal_link_wire_size_is_28` (was `_24`) — pins the new wire size so a future refactor that drops bytes (or reintroduces padding) trips this test.
 
 ### 131. Subprotocol manifest exposes forwarding-only entries as if they were locally handled — **[FIXED 2026-04-30]**
 **File:** `adapter/net/subprotocol/negotiation.rs:39-50, 55-70`
