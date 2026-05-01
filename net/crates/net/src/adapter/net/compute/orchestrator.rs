@@ -1489,6 +1489,58 @@ mod tests {
         assert!(orch.is_migrating(origin));
     }
 
+    /// Regression: pin that the dispatcher's cutover path now finds
+    /// a real `source_handler` record for local-source migrations
+    /// and correctly drains buffered events. Pre-fix `on_cutover`
+    /// returned `DaemonNotFound` for any local-source migration
+    /// (the orchestrator never called `start_snapshot`), and the
+    /// dispatcher's tolerance fallback (`migration_handler.rs:537`)
+    /// swallowed the error and treated the cutover as having no
+    /// buffered events to forward. Post-fix `on_cutover` finds the
+    /// record and returns the buffered events for forwarding.
+    /// A future refactor that drops the `start_snapshot` wire-up
+    /// in the orchestrator's local branch would silently regress
+    /// this end-to-end drain — this test pins it directly.
+    #[test]
+    fn local_source_cutover_drains_buffered_events_through_source_handler() {
+        use crate::adapter::net::state::causal::CausalEvent;
+        use bytes::Bytes;
+
+        let (reg, origin) = setup_registry();
+        let source_handler = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        let orch =
+            MigrationOrchestrator::new(reg, 0x1111).with_source_handler(source_handler.clone());
+
+        let _ = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+
+        // Buffer two events through the source handler — the
+        // dispatcher will drain these on cutover.
+        for seq in 1..=2u64 {
+            let event = CausalEvent {
+                link: CausalLink {
+                    origin_hash: origin,
+                    horizon_encoded: 0,
+                    sequence: seq,
+                    parent_hash: 0,
+                },
+                payload: Bytes::from_static(b"buffered"),
+                received_at: 0,
+            };
+            assert!(source_handler.buffer_event(origin, event).unwrap());
+        }
+
+        let drained = source_handler
+            .on_cutover(origin)
+            .expect("post-fix on_cutover must find the local-source migration record");
+        assert_eq!(
+            drained.len(),
+            2,
+            "cutover must drain the buffered events for forwarding to target — \
+             pre-fix this returned `DaemonNotFound` for local-source migrations \
+             and the buffered events were silently lost",
+        );
+    }
+
     /// Regression: with the source handler registered (BUG #104
     /// fix), `source_handler.buffer_event` is now invokable for a
     /// local-source migration. Pre-fix it returned `Ok(false)`
