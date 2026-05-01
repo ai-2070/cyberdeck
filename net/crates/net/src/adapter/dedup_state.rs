@@ -28,8 +28,23 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// 8-byte u64 nonce, persisted little-endian on disk.
-const NONCE_FILE_LEN: usize = 8;
+/// Legacy v0 wire format: 8 raw little-endian bytes (no version
+/// prefix). Files produced before CR-28 used this shape; new files
+/// produced post-CR-28 use [`NONCE_FILE_LEN_V1`] (9 bytes with a
+/// 1-byte version prefix). Loaders accept BOTH for back-compat
+/// across rolling upgrades.
+const NONCE_FILE_LEN_V0: usize = 8;
+
+/// Current v1 wire format: `[VERSION:u8 = 1][nonce:u64 LE]` = 9 bytes.
+/// CR-28 added the version prefix so a future format change (e.g.
+/// HMAC-keyed nonce, extended to 16 bytes for `(epoch, nonce)`)
+/// can be deployed without an out-of-band file migration —
+/// loaders just match on `data[0]` and dispatch to the matching
+/// parser.
+const NONCE_FILE_LEN_V1: usize = 1 + 8;
+
+/// Version byte for the current wire format.
+const NONCE_FORMAT_V1: u8 = 1;
 
 /// Persistent u64 nonce loaded from (or created at) a stable path.
 ///
@@ -68,20 +83,52 @@ impl PersistentProducerNonce {
         // Fast path: file exists.
         match fs::read(&path) {
             Ok(bytes) => {
-                if bytes.len() != NONCE_FILE_LEN {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "producer-nonce file at {} has length {} (expected {})",
-                            path.display(),
-                            bytes.len(),
-                            NONCE_FILE_LEN,
-                        ),
-                    ));
-                }
-                let mut buf = [0u8; NONCE_FILE_LEN];
-                buf.copy_from_slice(&bytes);
-                let nonce = u64::from_le_bytes(buf);
+                let nonce = match bytes.len() {
+                    // CR-28: v0 legacy format (no version prefix).
+                    // Pre-CR-28 files are still in production; we
+                    // accept them so a rolling upgrade doesn't
+                    // require flushing every nonce file.
+                    NONCE_FILE_LEN_V0 => {
+                        let mut buf = [0u8; 8];
+                        buf.copy_from_slice(&bytes);
+                        u64::from_le_bytes(buf)
+                    }
+                    // CR-28: v1 versioned format. First byte must
+                    // be the v1 sentinel; future v2+ files would
+                    // mismatch and surface as InvalidData below
+                    // until a v2 reader lands.
+                    NONCE_FILE_LEN_V1 => {
+                        if bytes[0] != NONCE_FORMAT_V1 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "producer-nonce file at {} has unknown \
+                                     version byte 0x{:02x} (expected 0x{:02x} \
+                                     for v1)",
+                                    path.display(),
+                                    bytes[0],
+                                    NONCE_FORMAT_V1,
+                                ),
+                            ));
+                        }
+                        let mut buf = [0u8; 8];
+                        buf.copy_from_slice(&bytes[1..]);
+                        u64::from_le_bytes(buf)
+                    }
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "producer-nonce file at {} has length {} \
+                                 (expected {} for v0 or {} for v1)",
+                                path.display(),
+                                other,
+                                NONCE_FILE_LEN_V0,
+                                NONCE_FILE_LEN_V1,
+                            ),
+                        ));
+                    }
+                };
                 Ok(Self { nonce, path })
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -143,7 +190,13 @@ impl PersistentProducerNonce {
         if nonce == 0 {
             nonce = 1;
         }
-        let buf = nonce.to_le_bytes();
+        // CR-28: v1 wire format — `[VERSION:u8 = 1][nonce:u64 LE]`.
+        // Versioning lets a future format change (HMAC-keyed nonce,
+        // 16-byte epoch+nonce, etc.) deploy without an out-of-band
+        // migration — the loader matches on length + version byte.
+        let mut buf = [0u8; NONCE_FILE_LEN_V1];
+        buf[0] = NONCE_FORMAT_V1;
+        buf[1..].copy_from_slice(&nonce.to_le_bytes());
 
         // Atomic write: create a per-call-unique sibling tempfile,
         // fsync it, rename over the target.
@@ -357,15 +410,18 @@ mod tests {
              got: {nonces:?}",
         );
 
-        // The on-disk file is exactly 8 bytes — no interleaved-write
-        // corruption. (Pre-fix two threads could write to the same
-        // tempfile and the OS could split their writes mid-byte; the
-        // resulting file might be 4 + 4 bytes from different nonces.)
+        // CR-28: the on-disk file is exactly NONCE_FILE_LEN_V1 = 9
+        // bytes (1 version byte + 8 LE nonce bytes) — no
+        // interleaved-write corruption. (Pre-fix two threads could
+        // write to the same tempfile and the OS could split their
+        // writes mid-byte; the resulting file might be 4 + 4 bytes
+        // from different nonces.)
         let on_disk = fs::read(&*path).expect("path must exist after concurrent first-load");
         assert_eq!(
             on_disk.len(),
-            NONCE_FILE_LEN,
-            "on-disk nonce must be exactly 8 bytes (no interleaved-write corruption)",
+            NONCE_FILE_LEN_V1,
+            "on-disk nonce must be exactly {} bytes (no interleaved-write corruption)",
+            NONCE_FILE_LEN_V1,
         );
 
         // A subsequent load returns the nonce of whichever thread
@@ -384,12 +440,17 @@ mod tests {
         let _ = fs::remove_file(&*path);
     }
 
+    /// CR-28 v0 back-compat path: a legacy 8-byte file (no version
+    /// prefix) produced by a pre-CR-28 binary MUST still load
+    /// cleanly. This is the load-bearing rolling-upgrade contract:
+    /// upgrading a daemon that already has a `producer.nonce` file
+    /// on disk doesn't lose the cross-restart dedup property.
     #[test]
-    fn nonce_field_is_eight_byte_le_round_trip() {
-        // Direct file-format pin: write 8 LE bytes by hand, verify
-        // the load returns the matching u64.
-        let path = temp_path("le-roundtrip");
+    fn cr28_v0_legacy_8_byte_file_still_loads() {
+        let path = temp_path("v0-legacy");
         let expected: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        // Write 8 LE bytes by hand — exactly the pre-CR-28
+        // wire format.
         fs::write(&path, expected.to_le_bytes()).unwrap();
 
         let loaded = PersistentProducerNonce::load_or_create(&path)
@@ -397,9 +458,81 @@ mod tests {
             .nonce();
         assert_eq!(
             loaded, expected,
-            "file format is 8 LE bytes — pin so a future refactor \
-             that flips byte order doesn't silently produce a \
-             different nonce on the same on-disk file",
+            "CR-28: a legacy 8-byte v0 file must still load — pre-CR-28 \
+             producers wrote this shape and a rolling upgrade must not \
+             lose the cross-restart dedup property"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// CR-28 v1 round-trip: the new versioned file format is
+    /// `[VERSION = 1][8 LE bytes]`. Pin the wire shape so a future
+    /// refactor can't silently break it.
+    #[test]
+    fn cr28_v1_versioned_9_byte_file_round_trip() {
+        let path = temp_path("v1-roundtrip");
+        let expected: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        // Write [VERSION=1][8 LE bytes] by hand — the CR-28 wire
+        // format.
+        let mut bytes = Vec::with_capacity(9);
+        bytes.push(NONCE_FORMAT_V1);
+        bytes.extend_from_slice(&expected.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        let loaded = PersistentProducerNonce::load_or_create(&path)
+            .unwrap()
+            .nonce();
+        assert_eq!(
+            loaded, expected,
+            "CR-28: v1 file format is [VERSION=1][8 LE bytes]. Pin so a \
+             future refactor that flips byte order or drops the version \
+             byte doesn't silently produce a different nonce."
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// CR-28: a 9-byte file with an UNKNOWN version byte must
+    /// surface InvalidData. This is the forward-compat tripwire —
+    /// when v2 is introduced, a v2-aware reader will accept it,
+    /// but until then we refuse to silently misinterpret a v2
+    /// file as v1.
+    #[test]
+    fn cr28_unknown_version_byte_surfaces_invalid_data() {
+        let path = temp_path("v-unknown");
+        // 9 bytes with version byte = 0xFF (reserved future).
+        let mut bytes = Vec::with_capacity(9);
+        bytes.push(0xFF);
+        bytes.extend_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        let err = PersistentProducerNonce::load_or_create(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("0xff") || err.to_string().contains("0xFF"),
+            "error message must name the unknown version byte; got: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// CR-28: a freshly-created nonce file MUST be the v1 shape
+    /// (9 bytes, version byte = 1). Pin so a regression that
+    /// reverts to the v0 wire format is caught.
+    #[test]
+    fn cr28_create_new_writes_v1_format() {
+        let path = temp_path("v1-fresh");
+        let _ = PersistentProducerNonce::load_or_create(&path).unwrap();
+
+        let on_disk = fs::read(&path).unwrap();
+        assert_eq!(
+            on_disk.len(),
+            NONCE_FILE_LEN_V1,
+            "CR-28: freshly-created nonce file must be v1 (9 bytes); got {} bytes",
+            on_disk.len()
+        );
+        assert_eq!(
+            on_disk[0], NONCE_FORMAT_V1,
+            "CR-28: freshly-created nonce file must carry version byte 0x{:02x}; got 0x{:02x}",
+            NONCE_FORMAT_V1, on_disk[0]
         );
         let _ = fs::remove_file(&path);
     }

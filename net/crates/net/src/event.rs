@@ -387,14 +387,25 @@ impl Batch {
     /// nonce across process restart when the bus is configured
     /// with a `producer_nonce_path` (BUG #56).
     ///
-    /// Cubic-ai P2: a `producer_nonce == 0` is coerced to `1` to
-    /// preserve the non-zero invariant `batch_process_nonce` and
+    /// Cubic-ai P2 / CR-29: a `producer_nonce == 0` is coerced to
+    /// `1` to preserve the non-zero invariant that
+    /// `batch_process_nonce` and
     /// `dedup_state::PersistentProducerNonce::create_new` already
-    /// uphold. Some downstream consumers (notably JetStream's
-    /// `Nats-Msg-Id` codec) treat `0` as a sentinel meaning
-    /// "no nonce / use the legacy path"; letting an
-    /// uninitialized-or-zeroed `producer_nonce` leak through here
-    /// would silently disable cross-restart dedup for that batch.
+    /// uphold (each generates non-zero u64s and re-rolls on the
+    /// astronomical 1-in-2^64 zero draw).
+    ///
+    /// CR-29 correction: an earlier doc-comment claimed JetStream's
+    /// `Nats-Msg-Id` codec specifically "treats `0` as a sentinel."
+    /// That was fiction — `adapter/jetstream.rs::on_batch` just
+    /// formats `process_nonce` as `{:x}` with no special-casing.
+    /// The real reason for the zero coercion is **defense-in-depth
+    /// against future codecs**: a downstream caller that constructs
+    /// a `Batch::with_nonce(..., 0)` directly (e.g. tests, hand-
+    /// built fixtures) would otherwise emit `dedup_id` keys
+    /// starting `0:` — collision-prone with any future codec that
+    /// reserves `0` as "no nonce, use the legacy path." Coercing to
+    /// 1 keeps the invariant that every shipped batch has a
+    /// non-zero producer nonce regardless of caller hygiene.
     #[inline]
     pub fn with_nonce(
         shard_id: u16,

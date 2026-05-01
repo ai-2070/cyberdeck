@@ -370,6 +370,57 @@ mod tests {
         );
     }
 
+    /// CR-33: pin the genesis-edge documented limitation. A head
+    /// with `sequence == 0` (the genesis event) produces a proof
+    /// where `from_seq == 0` and `from_hash == parent_hash`
+    /// (typically zero / a genesis sentinel). `verify_against`
+    /// will fail unless the verifier holds the genesis event
+    /// — by design, since you can't prove continuity of a
+    /// genesis-only chain.
+    ///
+    /// More subtly: a head with `sequence == 1` ALSO produces
+    /// `from_seq == 0` (via `saturating_sub(1)`). After ANY
+    /// snapshot-prune that removes the genesis event, the
+    /// resulting proof is unverifiable for the seq-1 head until
+    /// the head advances past the prune anchor.
+    ///
+    /// This test pins both the genesis edge AND the seq-1 edge
+    /// so a future maintainer touching the `saturating_sub(1)`
+    /// either preserves the documented behavior or updates this
+    /// test to reflect a new contract.
+    #[test]
+    fn cr33_continuity_proof_at_genesis_and_seq_one_edge_cases() {
+        // Edge 1: head at exactly seq=0 (genesis-only chain).
+        let genesis_head = make_link(0xCAFE, 0);
+        let state = SuperpositionState::new(0xCAFE, genesis_head);
+        let proof = state.continuity_proof();
+        assert_eq!(
+            proof.from_seq, 0,
+            "genesis head: saturating_sub(1) yields 0 (CR-33 documented)"
+        );
+        assert_eq!(proof.to_seq, 0, "genesis head: from_seq == to_seq == 0");
+        // The proof's hash is whatever genesis's parent_hash carries
+        // — typically 0 (genesis sentinel). `verify_against` against
+        // a genesis-only log MIGHT succeed if event[0]'s forward
+        // hash happens to equal `genesis_head.parent_hash`, but
+        // typically does not — by design.
+
+        // Edge 2: head at seq=1 (one event past genesis). Same
+        // saturating_sub(1) collapse as genesis.
+        let seq1_head = make_link(0xBEEF, 1);
+        let state = SuperpositionState::new(0xBEEF, seq1_head);
+        let proof = state.continuity_proof();
+        assert_eq!(
+            proof.from_seq, 0,
+            "CR-33: head at seq=1 produces from_seq=0 — same as genesis. \
+             After ANY snapshot-prune that removes seq=0, the resulting \
+             proof becomes unverifiable. Documented limitation: heads \
+             must advance past the prune anchor before producing \
+             verifiable proofs."
+        );
+        assert_eq!(proof.to_seq, 0);
+    }
+
     #[test]
     fn test_auto_ready_to_collapse() {
         let source_head = make_link(0xAAAA, 50);

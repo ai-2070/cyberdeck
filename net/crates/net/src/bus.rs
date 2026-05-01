@@ -808,7 +808,24 @@ impl EventBus {
     /// Waits for all shard ring buffers to drain, then for the
     /// per-shard mpsc channels to drain, then for any pending batch
     /// inside each batch worker to time out and dispatch — and only
-    /// then calls `adapter.flush()`. Bounded by 5 s overall.
+    /// then calls `adapter.flush()`.
+    ///
+    /// # Latency bound (CR-26)
+    ///
+    /// The total wall-clock budget is the sum of three phases:
+    ///   * Phase 1 (ring-buffer drain): up to **5 s**.
+    ///   * Phase 2 (channel + pending-batch drain): up to
+    ///     `max(2 s, batch.max_delay × n_workers)`.
+    ///   * Phase 3 (`adapter.flush()` call): up to `adapter_timeout`
+    ///     (default **30 s**).
+    ///
+    /// Worst-case `flush()` runtime is therefore **~37 s under
+    /// default config**, NOT 5 s as an earlier doc-comment stated.
+    /// Callers wiring `flush()` into request-path latencies (HTTP
+    /// handler, RPC) MUST set `adapter_timeout` accordingly or run
+    /// the flush under their own outer timeout. The 5-second figure
+    /// describes Phase 1 only; the doc was misleading and is fixed
+    /// here.
     ///
     /// The previous implementation slept a single `batch.max_delay`
     /// (default 10 ms) after the ring buffers drained and immediately
@@ -973,12 +990,41 @@ impl EventBus {
         {
             // Bound the wait so a `Drop`-only path (which sets
             // `shutdown=true` but never sets `shutdown_completed`)
-            // doesn't spin forever. After the deadline, return Ok
-            // — the bus is at least signalled to stop.
+            // doesn't spin forever.
+            //
+            // CR-25: distinguish the two outcomes for callers.
+            // Pre-CR-25 both branches returned `Ok(())`, so a
+            // caller that loses the CAS race had no way to tell
+            // whether the FIRST caller's shutdown had actually
+            // completed (drain workers done, adapter flush+
+            // shutdown ran) or whether the deadline timed out
+            // mid-shutdown. Returning `Ok` in both cases meant
+            // shutdown-done assumptions silently drifted under
+            // a slow adapter (`adapter_timeout` default 30s
+            // > the 10s spin deadline), letting subsequent code
+            // observe a partially-shut-down bus.
+            //
+            // Now: if `shutdown_completed` flips inside the
+            // window, we return `Ok(())` and the caller can be
+            // sure the first caller finished. If the deadline
+            // fires first, we surface
+            // `AdapterError::Transient(_)` — the bus IS being
+            // shut down (the flag is set), but completion is
+            // not yet observable; the caller can treat this as
+            // "another thread is working on it, retry the
+            // is_shutdown_completed() poll if you need a hard
+            // barrier."
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !self.shutdown_completed.load(AtomicOrdering::Acquire) {
                 if std::time::Instant::now() >= deadline {
-                    return Ok(());
+                    return Err(AdapterError::Transient(
+                        "shutdown_via_ref: another caller is mid-shutdown; \
+                         deadline (10s) elapsed before shutdown_completed \
+                         flipped. The bus IS shutting down; poll \
+                         is_shutdown_completed() if you need a hard \
+                         barrier."
+                            .into(),
+                    ));
                 }
                 tokio::task::yield_now().await;
             }
@@ -1185,6 +1231,27 @@ impl EventBus {
                     finalized.insert(shard_id);
                 }
             }
+        }
+
+        // CR-27: surface partial success at WARN level. Pre-CR-27
+        // a deadline-elapsed partial-finalize returned `Ok(_)` with
+        // a smaller-than-target list silently — operators only
+        // saw the discrepancy if they happened to compare against
+        // the count they requested. The return shape is preserved
+        // for compat (changing to `(Vec, Vec)` would break the
+        // existing callers + test); the WARN log gives operations
+        // tooling something to alert on.
+        if finalized.len() < target.len() {
+            let still_draining: Vec<u16> = target.difference(&finalized).copied().collect();
+            tracing::warn!(
+                requested = target.len(),
+                finalized = finalized.len(),
+                still_draining = ?still_draining,
+                "manual_scale_down deadline elapsed before all targeted \
+                 shards finalized — events still in-flight on the listed \
+                 shards. They will finalize on the next scaling-monitor \
+                 tick or on shutdown. (CR-27)"
+            );
         }
 
         Ok(finalized.into_iter().collect())
@@ -2025,6 +2092,108 @@ mod tests {
         async fn is_healthy(&self) -> bool {
             true
         }
+    }
+
+    /// CR-23: pin that `EventBus::shutdown` actually invokes the
+    /// adapter's `flush()` and `shutdown()` methods. The existing
+    /// `sdk/tests/shutdown_regression.rs` covers BUG #80/#81's
+    /// "shutdown runs even with outstanding Arc clones" property
+    /// using a memory adapter whose `flush`/`shutdown` are no-ops
+    /// — so a regression that elided the adapter calls would still
+    /// pass. This test uses a recording adapter that increments
+    /// per-method counters; we assert flush AND shutdown both fired
+    /// exactly once after a clean `bus.shutdown().await`.
+    ///
+    /// The fix in BUG #80 routes `Net::shutdown` through
+    /// `shutdown_via_ref`, which in turn calls
+    /// `self.adapter.flush()` and `self.adapter.shutdown()` once
+    /// each. CR-23 pins this contract at the bus layer so an
+    /// inadvertent regression at the SDK or adapter wrapper layer
+    /// can be caught without an integration setup.
+    #[tokio::test]
+    async fn cr23_shutdown_invokes_adapter_flush_and_shutdown_exactly_once() {
+        struct RecordingAdapter {
+            on_batch_calls: Arc<AtomicU64>,
+            flush_calls: Arc<AtomicU64>,
+            shutdown_calls: Arc<AtomicU64>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::adapter::Adapter for RecordingAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+                self.on_batch_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                self.flush_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                self.shutdown_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _shard_id: u16,
+                _from_id: Option<&str>,
+                _limit: usize,
+            ) -> Result<crate::adapter::ShardPollResult, AdapterError> {
+                Ok(crate::adapter::ShardPollResult::empty())
+            }
+            fn name(&self) -> &'static str {
+                "cr23-recording"
+            }
+            async fn is_healthy(&self) -> bool {
+                true
+            }
+        }
+
+        let on_batch = Arc::new(AtomicU64::new(0));
+        let flush = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicU64::new(0));
+        let adapter: Box<dyn crate::adapter::Adapter> = Box::new(RecordingAdapter {
+            on_batch_calls: on_batch.clone(),
+            flush_calls: flush.clone(),
+            shutdown_calls: shutdown.clone(),
+        });
+
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .build()
+            .unwrap();
+        let bus = EventBus::new_with_adapter(config, adapter).await.unwrap();
+
+        // Drive a small burst so on_batch fires at least once —
+        // pins that the adapter is wired up correctly. The
+        // load-bearing assertions below are on flush and shutdown.
+        for i in 0..16 {
+            let _ = bus.ingest(Event::new(json!({"i": i})));
+        }
+
+        // Pre-CR-23 a regression that elided one of these would
+        // pass `shutdown_regression.rs::shutdown_runs_even_with_outstanding_event_stream`
+        // because the memory adapter's flush/shutdown are no-ops.
+        // Here the recording adapter makes the contract observable.
+        bus.shutdown().await.unwrap();
+
+        assert!(
+            on_batch.load(AtomicOrdering::SeqCst) > 0,
+            "sanity: on_batch must have fired at least once"
+        );
+        assert_eq!(
+            flush.load(AtomicOrdering::SeqCst),
+            1,
+            "CR-23 regression: shutdown MUST call adapter.flush() exactly once"
+        );
+        assert_eq!(
+            shutdown.load(AtomicOrdering::SeqCst),
+            1,
+            "CR-23 regression: shutdown MUST call adapter.shutdown() exactly once"
+        );
     }
 
     /// Regression: BUG_REPORT.md #6 — `shutdown()` must deliver every

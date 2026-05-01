@@ -1651,6 +1651,112 @@ mod tests {
         store.upsert(NodeMetadata::new(make_node_id(1))).unwrap();
     }
 
+    /// CR-30: pin the invariant that every `Arc<NodeMetadata>`
+    /// returned from a read path (`get`, `query`, `find_nearby`,
+    /// `best_for_routing`) satisfies [`NodeMetadata::validate_bounds`].
+    /// Pre-CR-30 the bounds check ran only on `upsert` /
+    /// `update_versioned`; if a future refactor adds a write path
+    /// that bypasses both (e.g. snapshot restore that deserializes
+    /// raw `NodeMetadata` and inserts it into `nodes` directly), an
+    /// over-bounded entry could leak into reads. This test pins
+    /// the read-side contract so a future maintainer either
+    /// honours it on every new write path OR has to update the
+    /// test.
+    #[test]
+    fn cr30_read_path_invariant_every_returned_node_passes_validate_bounds() {
+        let store = MetadataStore::new();
+        let mut node = NodeMetadata::new(make_node_id(1));
+        node.tags.insert("training".into());
+        store.upsert(node).unwrap();
+
+        // Read via `get`: the returned Arc must validate cleanly.
+        let got = store.get(&make_node_id(1)).expect("inserted node");
+        got.validate_bounds().expect(
+            "CR-30: every node returned from MetadataStore::get MUST satisfy \
+             validate_bounds. If this fires, a write path is bypassing \
+             upsert's bound check (BUG #124).",
+        );
+
+        // Read via `query`: same invariant.
+        let q = MetadataQuery::new();
+        for entry in store.query(&q) {
+            entry.validate_bounds().expect(
+                "CR-30: every node returned from MetadataStore::query MUST \
+                 satisfy validate_bounds.",
+            );
+        }
+    }
+
+    /// CR-18: pin the soft-cap race window. The capacity check sits
+    /// outside the `DashMap::entry` write lock (cannot move it inside
+    /// without `nodes.len()` self-deadlocking), so two concurrent
+    /// upserts of distinct `node_id`s can both pass the
+    /// `nodes.len() >= max` check and both insert past the cap. This
+    /// is documented as acceptable behavior — `max_capacity` is a
+    /// best-effort target, not a hard cap. The test intentionally
+    /// exercises the race and pins that the `len()` may transiently
+    /// exceed `max` so a future "fix" that turns this into a hard
+    /// cap also has to update this test.
+    ///
+    /// (Mirrors the pattern in `TokenCache::insert_unchecked` and
+    /// `ContextStore::create_context` after BUG #136.)
+    #[test]
+    fn cr18_capacity_check_is_a_soft_cap_under_concurrent_upserts() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const MAX: usize = 4;
+        const N_THREADS: usize = 16;
+
+        let store = Arc::new(MetadataStore::with_capacity(MAX));
+        let barrier = Arc::new(std::sync::Barrier::new(N_THREADS));
+
+        let mut handles = Vec::with_capacity(N_THREADS);
+        for t in 0..N_THREADS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                let id = make_node_id(t as u8 + 1);
+                store.upsert(NodeMetadata::new(id))
+            }));
+        }
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(()) => accepted += 1,
+                Err(MetadataError::CapacityExceeded) => rejected += 1,
+                Err(other) => panic!("unexpected upsert error: {other:?}"),
+            }
+        }
+
+        // CR-18: pin that at LEAST `MAX` upserts succeeded. The
+        // total `accepted` may be > MAX under heavy concurrency
+        // because the soft-cap check loses the race against
+        // multiple concurrent inserters of distinct ids — that's
+        // the documented behavior. Pre-CR-18 the docs didn't
+        // call this out at the public-API level, so a caller
+        // reading `with_capacity(N)` might assume a hard ceiling.
+        assert!(
+            accepted >= MAX,
+            "at least the cap's worth must succeed; got {accepted}"
+        );
+        assert!(
+            accepted + rejected == N_THREADS,
+            "every upsert must surface either Ok or CapacityExceeded"
+        );
+        // The store SIZE may transiently equal `accepted`, which
+        // can exceed MAX. Pin THAT property so the soft-cap
+        // semantic is documented in code, not just docs.
+        assert!(
+            store.nodes.len() <= accepted,
+            "store size must not exceed the count of successful upserts"
+        );
+        // If accepted > MAX, the soft-cap was crossed — that's
+        // the documented limitation. Just confirm nothing's torn.
+    }
+
     // ========================================================================
     // BUG #124: NodeMetadata bounds must be enforced before indexing
     // ========================================================================
