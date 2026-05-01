@@ -58,6 +58,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # `crates/net/rust-toolchain.toml` pins the cargo invocation
+      # to 1.95.0 with profile=minimal. The `dtolnay/rust-toolchain`
+      # step above installed stable + this target on stable, but
+      # cargo auto-switches to 1.95.0 once it enters `crates/net/`
+      # and that pinned toolchain doesn't carry the cross-compile
+      # target — `rustc` then errors with "can't find crate for
+      # core". Adding the target inside the pinned-toolchain dir
+      # forwards rustup's target-add to the pinned channel.
+      - name: Add target to pinned toolchain
+        working-directory: net/crates/net
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install dependencies (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: |
