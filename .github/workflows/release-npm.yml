@@ -116,9 +116,23 @@ jobs:
           esac
 
           WRAPPER="$HOME/zig-cc-${ZIG_TARGET}.sh"
+          # cc-rs appends `--target=<rustc-triple>` (with the
+          # `unknown` vendor tag) to every C/asm compile invocation.
+          # Zig's `cc` parses `--target=` as a clang-style target
+          # query and rejects `x86_64-unknown-linux-musl` because
+          # `unknown-linux-musl` isn't a valid OS+abi pair in
+          # zig's parser. Strip it — our own `-target` flag below
+          # already pins the cross target in zig's native format.
           cat > "$WRAPPER" <<EOF
           #!/bin/bash
-          exec zig cc -target ${ZIG_TARGET} "\$@"
+          args=()
+          for arg in "\$@"; do
+            case "\$arg" in
+              --target=*) ;;
+              *) args+=("\$arg") ;;
+            esac
+          done
+          exec zig cc -target ${ZIG_TARGET} "\${args[@]}"
           EOF
           chmod +x "$WRAPPER"
 
