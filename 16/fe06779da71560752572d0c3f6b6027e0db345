@@ -1,0 +1,40 @@
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  36b642b129ab4a5e 370-398,412,415
+net/crates/net/tests/integration_netdb.rs
+  36b642b129ab4a5e 304-388
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  36b642b129ab4a5e 332-337,352-353,356
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "16fe06779da71560752572d0c3f6b6027e0db345",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2470,
+      "total_deletions": 79,
+      "accepted_lines": 127,
+      "overriden_lines": 0
+    },
+    "64958cb6fb55fe73": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81cf66b-69b3-455c-bab9-06a87305bb12",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3708,
+      "total_deletions": 2341,
+      "accepted_lines": 3708,
+      "overriden_lines": 0
+    }
+  }
+}
