@@ -327,6 +327,64 @@ int  net_memories_watch_next(net_memories_watch_t* cursor, uint32_t timeout_ms,
 void net_memories_watch_free(net_memories_watch_t* cursor);
 
 /* =========================================================================
+ * Redis Streams consumer-side dedup helper (`redis` feature).
+ *
+ * Mirrors `net::adapter::RedisStreamDedup` and the cross-language
+ * wrappers in the Node / Python SDKs. The Redis adapter writes a
+ * stable `dedup_id` field on every XADD entry
+ * (`"{producer_nonce:hex}:{shard_id}:{sequence_start}:{i}"`); this
+ * helper filters duplicates whose `dedup_id`s repeat — handling the
+ * BUG #57 producer-side `MULTI/EXEC`-timeout race that lands two
+ * stream entries for one logical event.
+ *
+ * Each handle wraps an LRU-bounded set of seen ids; the LRU is
+ * mutex-protected so concurrent calls from multiple goroutines /
+ * threads are safe but serialize. Production callers typically
+ * instantiate one helper per consumer goroutine and key on the
+ * `dedup_id` field they extract from each `XRANGE` / `XREAD`
+ * entry. See `bindings/go/README.md` and the Python / Node SDK
+ * READMEs for runnable examples.
+ * ========================================================================= */
+
+typedef struct net_redis_dedup_s net_redis_dedup_t;
+
+/* Create a new dedup helper. `capacity == 0` selects the default
+ * (4096); production callers should size to their dedup window
+ * (consumer at ~10k events/sec with a 1 min window: ~600,000).
+ * Never returns NULL. Free with `net_redis_dedup_free`.
+ */
+net_redis_dedup_t* net_redis_dedup_new(size_t capacity);
+
+/* Free a helper handle. NULL is a no-op. */
+void net_redis_dedup_free(net_redis_dedup_t* handle);
+
+/* Test-and-insert. Returns:
+ *    1 — duplicate (caller should skip the entry)
+ *    0 — new       (caller should process AND we've now marked it seen)
+ *   -1 — NULL handle or NULL dedup_id
+ *   -2 — invalid UTF-8 in dedup_id
+ */
+int net_redis_dedup_is_duplicate(net_redis_dedup_t* handle, const char* dedup_id);
+
+/* Number of distinct ids currently tracked. Returns 0 on NULL
+ * handle (mirrors the "no ids" semantic).
+ */
+size_t net_redis_dedup_len(net_redis_dedup_t* handle);
+
+/* Configured maximum capacity. Returns 0 on NULL handle. */
+size_t net_redis_dedup_capacity(net_redis_dedup_t* handle);
+
+/* Returns 1 if no ids are tracked, 0 if the helper has at least
+ * one id, -1 on NULL handle.
+ */
+int net_redis_dedup_is_empty(net_redis_dedup_t* handle);
+
+/* Clear all tracked ids. Use after a consumer-group rebalance.
+ * NULL is a no-op.
+ */
+void net_redis_dedup_clear(net_redis_dedup_t* handle);
+
+/* =========================================================================
  * Mesh transport (`net` feature).
  *
  * Encrypted UDP mesh: handshake, per-peer streams, channels (named

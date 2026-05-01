@@ -118,6 +118,50 @@ DYLD_LIBRARY_PATH=target/release ./app     # macOS
 | `net_generate_keypair()` | Generate mesh keypair. Free with `net_free_string`. |
 | `net_free_string(s)` | Free a string from `net_generate_keypair`. |
 
+### Redis Streams dedup helper (`redis` feature)
+
+The Redis adapter writes a stable `dedup_id` field on every XADD
+entry (`{producer_nonce:hex}:{shard_id}:{sequence_start}:{i}`) so
+duplicate stream entries from the producer-side `MULTI/EXEC`
+timeout race can be filtered at consume time. Helper API:
+
+| Function | Description |
+|----------|-------------|
+| `net_redis_dedup_new(capacity)` | Create a helper. `0` selects the default 4096. Never returns NULL. |
+| `net_redis_dedup_free(handle)` | Free a helper handle. NULL is a no-op. |
+| `net_redis_dedup_is_duplicate(handle, dedup_id)` | Test-and-insert. Returns 1 = duplicate, 0 = new, -1 = NULL, -2 = invalid UTF-8. |
+| `net_redis_dedup_len(handle)` | Number of distinct ids tracked. |
+| `net_redis_dedup_capacity(handle)` | Configured LRU capacity. |
+| `net_redis_dedup_is_empty(handle)` | 1 = empty, 0 = non-empty, -1 = NULL. |
+| `net_redis_dedup_clear(handle)` | Drop all tracked ids (e.g. on consumer-group rebalance). |
+
+Canonical consumer loop:
+
+```c
+net_redis_dedup_t* dedup = net_redis_dedup_new(0);
+
+/* For each XRANGE / XREAD entry, extract the `dedup_id` field
+ * from the field map and probe the helper. */
+const char* dedup_id = ...; /* from your Redis client */
+int rc = net_redis_dedup_is_duplicate(dedup, dedup_id);
+if (rc == 0) {
+    process(entry);     /* new — process AND we're now marked seen */
+} else if (rc == 1) {
+    /* duplicate — skip */
+}
+
+net_redis_dedup_free(dedup);
+```
+
+The helper is transport-agnostic — bring your own `hiredis` /
+`redis-rs` / equivalent client. Sizing: ~10k events/sec at a 1
+min dedup window → capacity ~600,000. Default 4096 fits
+low-throughput / short-window deployments.
+
+See [`docs/BUG_AUDIT_2026_04_30_CORE.md`] (entries #56–#57) for
+the producer-side dedup contract and the cross-restart nonce
+persistence model.
+
 ## Types
 
 ```c

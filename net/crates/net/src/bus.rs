@@ -2237,8 +2237,12 @@ mod tests {
             bus.shutdown().await.unwrap();
         }
 
-        let n_a = nonce_first_run.lock().expect("first bus must have dispatched a batch");
-        let n_b = nonce_second_run.lock().expect("second bus must have dispatched a batch");
+        let n_a = nonce_first_run
+            .lock()
+            .expect("first bus must have dispatched a batch");
+        let n_b = nonce_second_run
+            .lock()
+            .expect("second bus must have dispatched a batch");
         assert_eq!(
             n_a, n_b,
             "two bus instances against the same producer_nonce_path \

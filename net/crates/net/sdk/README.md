@@ -106,6 +106,64 @@ Net::builder().jetstream(JetStreamAdapterConfig::new("nats://localhost:4222"))
 Net::builder().mesh(NetAdapterConfig::initiator(bind, peer, psk, peer_pubkey))
 ```
 
+### Persistent producer nonce (cross-restart dedup)
+
+The JetStream and Redis adapters key dedup on a `(producer_nonce,
+shard, sequence_start, i)` tuple. Without persistence, the nonce
+is fresh per process — a producer that crashes mid-batch and
+restarts gets a new nonce, retransmits look fresh to the
+backend, and the partial-batch's accepted half is persisted
+twice (BUG #56).
+
+Configure `EventBusConfig::producer_nonce_path` to make the
+nonce survive restart:
+
+```rust
+let cfg = EventBusConfig::builder()
+    .num_shards(4)
+    .redis(RedisAdapterConfig::new("redis://localhost:6379"))
+    .producer_nonce_path("/var/lib/myapp/producer.nonce")
+    .build()?;
+```
+
+The bus loads (or creates on first run) a u64 nonce at this
+path. JetStream gets server-side dedup automatically (the
+existing `Nats-Msg-Id` format absorbs the persistent nonce);
+Redis Streams ships the same id as a `dedup_id` field on every
+XADD, filterable consumer-side via the helper below.
+
+## Redis Streams consumer-side dedup helper
+
+```rust
+use net_sdk::RedisStreamDedup;
+
+// Sizing: ~10k events/sec * 1 min dedup window → ~600,000.
+let mut dedup = RedisStreamDedup::with_capacity(64_000);
+
+// Read entries from your Redis client of choice; pull the
+// `dedup_id` field from each XADD entry's field map.
+for entry in stream {
+    let id = entry.fields["dedup_id"].as_str();
+    if !dedup.is_duplicate(id) {
+        process(entry);
+    }
+}
+```
+
+The helper is transport-agnostic — it answers a test-and-insert
+question against an in-memory LRU. Pre-fix the producer-side
+`MULTI/EXEC`-timeout race (BUG #57) silently produced duplicate
+stream entries with distinct server-generated `*` ids that
+consumers couldn't dedupe; the `dedup_id` field is now stable
+across retries (and across process restart when
+`producer_nonce_path` is configured) so this filter cleanly
+removes them.
+
+The helper is also re-exported as `net_sdk::RedisStreamDedup`;
+the canonical impl lives in `net::adapter::RedisStreamDedup`.
+Cross-language wrappers (NAPI, PyO3, cgo, C) ship in the
+respective bindings.
+
 ## NAT Traversal (optimization, not correctness)
 
 Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it, cutting the per-packet relay tax. Everything in this section is disabled unless the core is built with `--features nat-traversal`; without it the routed path keeps working unchanged and the five reader methods below return `Unsupported`.

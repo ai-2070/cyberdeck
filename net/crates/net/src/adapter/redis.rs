@@ -16,6 +16,48 @@
 //! - Redis: 100K-500K events/sec (network-bound)
 //!
 //! The batch aggregation layer smooths bursts before they reach Redis.
+//!
+//! # Consumer-side dedup contract (BUG #57)
+//!
+//! Redis Streams does NOT have server-side dedup. The `MULTI/EXEC`
+//! `tokio::time::timeout` cancellation hazard at `on_batch` (the
+//! local future is dropped on timeout but the bytes are already on
+//! the wire — Redis can still execute the EXEC server-side after
+//! the future is dropped, then the caller's retry runs another
+//! EXEC and produces duplicate stream entries with distinct
+//! server-generated `*` ids) means duplicates are an inherent
+//! producer-side risk.
+//!
+//! To make duplicates filterable downstream, every XADD entry
+//! carries a `dedup_id` field of the form
+//! `"{producer_nonce}:{shard_id}:{sequence_start}:{i}"` — the same
+//! string JetStream uses for `Nats-Msg-Id`. The id is:
+//!
+//! - **Stable across retries**: deterministic from `(shard,
+//!   sequence_start, i)` plus the bus's persistent
+//!   `producer_nonce`. A duplicate XADD from a retry carries the
+//!   same `dedup_id`.
+//! - **Stable across process restart**: when the bus is
+//!   configured with `EventBusConfig::producer_nonce_path`, the
+//!   nonce survives restart so post-crash retries still produce
+//!   the same `dedup_id` (BUG #56).
+//! - **Unique per logical event**: distinct events from the same
+//!   producer never share an id.
+//!
+//! Consumers MUST treat `dedup_id` as the application-level
+//! idempotency key:
+//!
+//! - Read a stream entry, extract `dedup_id` from its field map.
+//! - If the id is in the seen-set, skip the entry.
+//! - Otherwise, process the event and add the id to the set.
+//!
+//! The seen-set is a small LRU sized to the worst-case
+//! out-of-window dedup horizon the caller cares about (default
+//! configurations: a few thousand ids, ~minutes of in-flight at
+//! moderate throughput). The reference helper
+//! [`net_sdk::RedisStreamDedup`] (Rust SDK) provides exactly this;
+//! cross-language wrappers (NAPI / PyO3) ship in the bindings as
+//! Phase 3 of BUG #57's resolution.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -293,7 +335,21 @@ impl Adapter for RedisAdapter {
         let mut pipe = redis::pipe();
         pipe.atomic();
 
-        for data in &serialized {
+        // Pre-render the dedup_id prefix for the batch — same shape
+        // as JetStream's `Nats-Msg-Id`:
+        // `{producer_nonce:hex}:{shard_id}:{sequence_start}`.
+        // We render the prefix once and append `:{i}` per event,
+        // matching the JetStream adapter's allocation strategy.
+        let mut dedup_id_buf = String::new();
+        use std::fmt::Write as _;
+        let _ = write!(
+            dedup_id_buf,
+            "{:x}:{}:{}",
+            batch.process_nonce, batch.shard_id, batch.sequence_start
+        );
+        let prefix_len = dedup_id_buf.len();
+
+        for (i, data) in serialized.iter().enumerate() {
             // Build XADD command
             let mut cmd = redis::cmd("XADD");
             cmd.arg(&*stream_key);
@@ -306,6 +362,15 @@ impl Adapter for RedisAdapter {
             cmd.arg("*"); // Auto-generate ID
             cmd.arg("d").arg(data.as_slice()); // "d" = data field
 
+            // Render the per-event dedup_id and add it as the
+            // second field. See the module docs for the
+            // consumer-side dedup contract: downstream consumers
+            // dedup on this field to filter duplicates introduced
+            // by the timeout-cancellation race below (BUG #57).
+            dedup_id_buf.truncate(prefix_len);
+            let _ = write!(dedup_id_buf, ":{i}");
+            cmd.arg("dedup_id").arg(dedup_id_buf.as_str());
+
             pipe.add_command(cmd);
         }
 
@@ -317,10 +382,17 @@ impl Adapter for RedisAdapter {
         // timeout-then-retry can produce duplicate XADDs (each with a
         // fresh `*` auto-id). The delivery semantics are therefore
         // at-least-once *with duplicates on retry* — not
-        // exactly-once. Consumers must be idempotent (e.g. dedup on
-        // the event's `r.id` field). Removing this footgun would
-        // require a per-event dedup token gated by a server-side Lua
-        // script; that has not been wired up yet.
+        // exactly-once at the producer.
+        //
+        // **Mitigation (BUG #57):** every XADD above carries a
+        // `dedup_id` field that's stable across retries (and across
+        // process restart when `producer_nonce_path` is configured;
+        // see BUG #56). Consumers filter duplicates by keying on
+        // that field — see the module docs for the contract and
+        // the [`net_sdk::RedisStreamDedup`] helper for a reference
+        // implementation. The Redis stream itself may still carry
+        // duplicate entries on the wire; the dedup happens at
+        // consume time.
         let fut = pipe.query_async::<()>(&mut conn);
         tokio::time::timeout(self.config.command_timeout, fut)
             .await

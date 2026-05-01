@@ -17,6 +17,8 @@ mod cortex;
 mod groups;
 #[cfg(feature = "net")]
 mod identity;
+#[cfg(feature = "redis")]
+mod redis_dedup;
 #[cfg(feature = "net")]
 mod subnets;
 

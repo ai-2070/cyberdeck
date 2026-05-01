@@ -294,6 +294,66 @@ the snapshot and an iterator seeded so that any divergent initial
 emission is forwarded through instead of dropped — see
 [`docs/STORAGE_AND_CORTEX.md`](../../docs/STORAGE_AND_CORTEX.md).
 
+## Redis Streams consumer-side dedup helper
+
+The Net Redis adapter writes a stable `dedup_id` field on every
+XADD entry: `{producer_nonce:hex}:{shard_id}:{sequence_start}:{i}`.
+Combined with the bus's persistent producer-nonce path
+(`producer_nonce_path` on `EventBusConfig`, BUG #56), the id is
+stable across both within-process retries AND cross-process
+restart — the `MULTI/EXEC`-timeout race (BUG #57) becomes
+filterable at consume time.
+
+`RedisStreamDedup` is the consumer-side helper, exposed on the
+`net` PyO3 module:
+
+```python
+from net import RedisStreamDedup
+import redis
+
+# ~10k events/sec * 1 min dedup window → ~600,000.
+dedup = RedisStreamDedup(capacity=64_000)
+
+r = redis.Redis(host="localhost", port=6379)
+cursor = "0"
+while True:
+    entries = r.xrange("net:shard:0", min=cursor, max="+", count=100)
+    for entry_id, fields in entries:
+        dedup_id = fields.get(b"dedup_id", b"").decode()
+        if not dedup_id:
+            # No dedup_id → older entry or non-Net producer; skip
+            # dedup and process as-is.
+            process(entry_id, fields)
+            continue
+        if not dedup.is_duplicate(dedup_id):
+            process(entry_id, fields)
+        cursor = entry_id.decode()
+    if not entries:
+        break
+```
+
+Surface:
+
+```python
+dedup = RedisStreamDedup()                # default capacity 4096
+dedup = RedisStreamDedup(capacity=N)      # explicit; 0 → 1
+dedup.is_duplicate(id: str) -> bool       # test-and-insert
+dedup.len                                 # property — tracked-id count
+dedup.capacity                            # property — configured cap
+dedup.is_empty                            # property
+dedup.clear()                             # reset (e.g. on consumer-group rebalance)
+```
+
+The helper is transport-agnostic — bring your own `redis-py` /
+`aioredis` / equivalent client; it just answers the dedup
+question against an in-memory LRU. Concurrency: each handle
+wraps a Rust `Mutex<RedisStreamDedup>`, so concurrent calls from
+multiple Python threads are safe but serialize. Production-shape
+is one helper per consumer thread.
+
+Background: [`docs/BUG_AUDIT_2026_04_30_CORE.md`](../../docs/BUG_AUDIT_2026_04_30_CORE.md)
+entries #56 and #57.
+
 ## Security Surface (Stage A–E)
 
 The mesh layer surfaces the same identity / capabilities / subnets /

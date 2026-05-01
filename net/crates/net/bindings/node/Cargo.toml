@@ -14,7 +14,12 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["redis"]
-redis = ["net/redis"]
+# Pulls in `net-sdk` at its `redis` sub-feature for the
+# `RedisStreamDedup` consumer helper (BUG #57). The redis feature
+# was originally just `net/redis`; the SDK dep is added here so the
+# dedup helper is a thin NAPI wrapper around the canonical Rust
+# implementation rather than a re-implementation.
+redis = ["net/redis", "dep:net-sdk", "net-sdk/redis"]
 jetstream = ["net/jetstream"]
 # Core mesh transport. Bundles the identity, capabilities, and
 # subnet surfaces — they share `adapter::net`'s subprotocol dispatch

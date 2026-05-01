@@ -15,6 +15,8 @@ mod compute;
 mod groups;
 #[cfg(feature = "net")]
 mod identity;
+#[cfg(feature = "redis")]
+mod redis_dedup;
 #[cfg(feature = "net")]
 mod subnets;
 
@@ -2089,6 +2091,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PollResponse>()?;
     m.add_class::<Stats>()?;
     m.add_class::<NetKeypair>()?;
+    #[cfg(feature = "redis")]
+    m.add_class::<redis_dedup::PyRedisStreamDedup>()?;
     #[cfg(feature = "net")]
     m.add_function(wrap_pyfunction!(generate_net_keypair, m)?)?;
     #[cfg(feature = "net")]

@@ -83,6 +83,13 @@ pub mod cortex;
 #[allow(missing_docs)]
 pub mod mesh;
 
+/// C FFI for the Redis Streams consumer-side dedup helper. Mirrors
+/// the Rust `net::adapter::RedisStreamDedup` surface for Go / C / Zig
+/// consumers. See `ffi::redis_dedup` module docs for the wire
+/// shape and the BUG #57 dedup contract.
+#[cfg(feature = "redis")]
+pub mod redis_dedup;
+
 #[cfg(feature = "net")]
 use crate::adapter::net::{NetAdapterConfig, ReliabilityConfig, StaticKeypair};
 #[cfg(any(feature = "redis", feature = "jetstream", feature = "net"))]

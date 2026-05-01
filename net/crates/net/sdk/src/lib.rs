@@ -45,7 +45,12 @@ pub mod groups;
 #[cfg(feature = "net")]
 pub mod mesh;
 mod net;
+#[cfg(feature = "redis")]
+pub mod redis_dedup;
 pub mod stream;
+
+#[cfg(feature = "redis")]
+pub use redis_dedup::RedisStreamDedup;
 
 // Security surface — identity (keypairs + tokens), capabilities
 // (declare + query), and subnets (visibility partitioning). All

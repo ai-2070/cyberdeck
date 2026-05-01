@@ -15,7 +15,12 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["redis", "net"]
-redis = ["net/redis"]
+# Pulls in `net-sdk` at its `redis` sub-feature for the
+# `RedisStreamDedup` consumer helper (BUG #57). The redis feature
+# was originally just `net/redis`; the SDK dep is added here so
+# the dedup helper is a thin PyO3 wrapper around the canonical
+# Rust implementation.
+redis = ["net/redis", "dep:net-sdk", "net-sdk/redis"]
 jetstream = ["net/jetstream"]
 net = ["net/net", "dep:hex"]
 # NAT traversal — reflex probes, classification, rendezvous-

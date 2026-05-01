@@ -31,7 +31,7 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 
 ## Status (running tally)
 
-**Outstanding (deferred — broader-than-audit-pass changes):** #56, #57 (cross-process retry duplicates — JetStream/Redis at-least-once semantics, require persistent nonce / server-side dedup state).
+**Outstanding (deferred — broader-than-audit-pass changes):** none.
 
 **Fixed on 2026-04-30 (with regression tests where reasonable):**
 - **#80** — `Net::shutdown` now routes through `EventBus::shutdown_via_ref(&self)`, an idempotent reference-based shutdown that runs regardless of outstanding `Arc<EventBus>` clones. Tests: `sdk/tests/shutdown_regression.rs::{shutdown_runs_even_with_outstanding_event_stream, shutdown_via_ref_is_idempotent}`.
@@ -142,15 +142,49 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 
 After a long retention rollover (e.g. MAXLEN trimmed the first 10M sequences), `poll_shard(from_id=None)` resumes at `start_seq=1`. `direct_get(seq)` returns `NotFound` for every deleted seq; the loop simply increments by one and tries again. Result: 10M sequential network RTTs before a single event is returned. The consumer hangs for minutes — until the request timeout fires, at which point the next poll resumes from where it left off, never making progress. Should query `info().state.first_sequence` and bump `current_seq` to that on the first `NotFound`, or use `direct_get_next_for_subject` / a bounded fetch.
 
-### 56. JetStream cross-process retry duplicates due to per-process nonce (inverse of #9)
+### 56. JetStream cross-process retry duplicates due to per-process nonce (inverse of #9) — **[FIXED 2026-05-01]**
 **File:** `adapter/jetstream.rs:285-320` (with `process_nonce` at `event.rs:304`)
 
-Issue #9's fix prepends a per-process nonce to `Nats-Msg-Id` so legitimate same-batch retransmits dedup correctly within one process lifetime. The trade-off: a producer that crashes mid-batch (after the server already accepted some events) and restarts gets a fresh `process_nonce` on retry, so JetStream sees the post-crash msg-ids as new and persists the partial batch *plus* the full retry — duplicates in the stream under the same `(shard_id, sequence_start)` tuple. The mid-batch failure comment claiming "the dedup window discards the prior copies" only holds within one process. Same hazard for `try_join_all(acks)` short-circuiting on first error: the dropped ack futures may still complete server-side, leaving partial state that survives the retry. Mitigation requires either persisting `process_nonce` across restarts or moving to a server-side checkpoint scheme.
+Pre-fix the `Nats-Msg-Id` nonce prefix was sampled fresh at every process start. A producer that crashed mid-batch (server-accepted half of a batch) and restarted got a new nonce; retransmits looked fresh to JetStream's dedup window and the partial-batch's accepted half got persisted twice.
 
-### 57. Redis `MULTI`/`EXEC` timeout cancellation produces duplicate XADDs
-**File:** `adapter/redis.rs:298-319`
+**Fix (Direction A — durable producer identity):** new `adapter::PersistentProducerNonce` module loads (or creates on first run) a u64 nonce at a configured path via atomic `tempfile + rename`. `EventBusConfig::producer_nonce_path: Option<PathBuf>` selects the durable path; when set, the bus loads the nonce on startup and threads it through every `Batch` (via the existing `process_nonce` field, plumbed through a new `Batch::with_nonce` constructor and a new `BatchWorker::producer_nonce` field). When unset, falls back to the per-process default — documented as "at-most-once across restarts". The JetStream adapter is unchanged; it sees a now-stable nonce in `batch.process_nonce` and writes the same `Nats-Msg-Id` format.
 
-`tokio::time::timeout` cancels the future locally but does not roll back bytes already on the wire. `EXEC` may run server-side after the future is dropped; the caller-driven retry then runs *another* `EXEC`, producing duplicate XADDs (each with a distinct server-generated `*` stream id, so downstream consumers cannot dedupe on `r.id` since that is application-defined and not necessarily unique). Self-acknowledged in the inline comment, unmitigated. Either drop the timeout (let the connection-manager handle it) or implement an idempotency token consulted by the retry path.
+The `remove_shard_internal` stranded-flush path also stamps the bus's loaded nonce (via `Batch::with_nonce`), so cross-process dedup applies to stranded events too — closing a hole that would have leaked through the BUG #153 fix's seq-stamping otherwise.
+
+Tests:
+- `adapter::dedup_state::tests::*` (6 unit tests on the file-format / load-or-create / corrupt-file / cross-path-distinctness paths).
+- `bus::tests::persistent_producer_nonce_survives_bus_restart` — two bus instances against the same path stamp the same nonce.
+- `bus::tests::process_nonce_fallback_differs_across_bus_instances` — pin the documented within-process OnceLock-cached fallback.
+- `bus::tests::multi_shard_bus_stamps_consistent_nonce_across_static_and_dynamic_shards` — both spawn sites (initial-shard loop + `add_shard_internal`) clone the bus's nonce.
+- `event::tests::batch_with_nonce_round_trips_the_passed_value` — direct unit on the `Batch::with_nonce` constructor.
+- `tests/bus_stranded_flush.rs::stranded_flush_uses_bus_producer_nonce` — end-to-end: every batch the recording adapter observes (worker + stranded if it fires) shares the bus's loaded nonce.
+
+### 57. Redis `MULTI`/`EXEC` timeout cancellation produces duplicate XADDs — **[FIXED 2026-05-01]**
+**File:** `adapter/redis.rs:298-319` (producer side) + `sdk/src/redis_dedup.rs` + binding wrappers (consumer side)
+
+Pre-fix `tokio::time::timeout` cancelled the future locally but didn't roll back bytes already on the wire. Redis could run the EXEC server-side after the future was dropped; the retry then issued another EXEC, producing duplicate XADDs in the stream with distinct server-generated `*` ids that consumers couldn't dedupe on.
+
+Redis Streams has no server-side dedup, so the producer can't fix this in isolation. The fix shifts dedup responsibility to the consumer via a stable `dedup_id` field on every XADD entry:
+
+**Producer side (`adapter/redis.rs::on_batch`):** every XADD now carries a `dedup_id` field whose value is `{producer_nonce:hex}:{shard_id}:{sequence_start}:{i}` — same string JetStream uses for `Nats-Msg-Id`. Stable across retries (deterministic from `(shard, seq, i)`) and across process restart (when `producer_nonce_path` is configured; see #56). The wire format (`MULTI/EXEC` of XADDs) is otherwise unchanged — duplicate stream entries can still appear, but each duplicate carries the same `dedup_id`.
+
+**Consumer side (`net_sdk::RedisStreamDedup`):** new LRU-bounded helper that maintains a set of recently-seen `dedup_id`s and answers a `is_duplicate(id) -> bool` test-and-insert query. Transport-agnostic — bring your own `redis-rs` / `ioredis` / `redis-py` client; the helper just answers the dedup question. Default capacity 4096; production callers tune to their dedup window.
+
+**Cross-language helpers:** thin wrappers around the canonical Rust impl in:
+- `bindings/node/src/redis_dedup.rs` — NAPI class, exported as `RedisStreamDedup`.
+- `bindings/python/src/redis_dedup.rs` — PyO3 class, registered as `RedisStreamDedup` in `_net`.
+
+The Redis adapter module docs (`adapter/redis.rs` top-of-file) document the consumer contract: read entries, extract `dedup_id`, skip if seen.
+
+Tests:
+- 9 unit tests on `RedisStreamDedup` (`sdk/src/redis_dedup.rs::tests`) — first-observation, repeat, distinct-ids, LRU eviction (split into two assertions to avoid the re-insert side-effect), no-refresh-on-duplicate, capacity-zero-clamp, clear, plus the canonical BUG #57 scenario.
+- 3 contract tests (`sdk/tests/redis_dedup_contract.rs`) — pin the producer-side `dedup_id` format string so a future refactor that diverges either side is caught: producer-retry duplicates filtered, cross-restart-via-stable-nonce duplicates filtered, distinct events not falsely collided.
+- 4 NAPI smoke tests on the Node wrapper.
+- 4 PyO3 smoke tests on the Python wrapper.
+
+Trade-off: the duplicate XADD entries still land on disk in the stream — the dedup happens at consume time. Scoping the producer change to "add a field" instead of restructuring `MULTI/EXEC` keeps the Redis storage cost unchanged and the producer simple; the documented escape hatch is the `RedisStreamDedup` helper at consumer time.
+
+Direction B (durable batch ledger for true exactly-once across arbitrary crash windows) remains follow-up work; the audit's two paired hazards are now covered by Direction A + consumer-side filtering.
 
 ### 58. `net_free_bytes` panics across the FFI boundary on adversarial `len` — **[FIXED 2026-04-30]**
 **File:** `ffi/mesh.rs:1721`
