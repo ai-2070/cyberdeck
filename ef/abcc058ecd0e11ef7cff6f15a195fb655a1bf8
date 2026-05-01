@@ -1,0 +1,75 @@
+net/crates/net/bindings/go/README.md
+  36b642b129ab4a5e 498-580
+net/crates/net/src/bus.rs
+  36b642b129ab4a5e 2240-2245
+net/crates/net/sdk-py/README.md
+  36b642b129ab4a5e 126-157,160-161
+net/crates/net/sdk/tests/redis_dedup_contract.rs
+  36b642b129ab4a5e 1-117
+net/crates/net/bindings/go/net/net.h
+  36b642b129ab4a5e 330-386
+net/crates/net/src/ffi/mod.rs
+  36b642b129ab4a5e 86-92
+net/crates/net/docs/BUG_AUDIT_2026_04_30_CORE.md
+  36b642b129ab4a5e 34,145,148,150,152-187
+net/crates/net/sdk/src/error.rs
+  36b642b129ab4a5e 42-46
+net/crates/net/bindings/python/Cargo.toml
+  36b642b129ab4a5e 18-23
+net/crates/net/bindings/go/net/redis_dedup.go
+  36b642b129ab4a5e 1-186
+net/crates/net/include/README.md
+  36b642b129ab4a5e 121-164
+net/crates/net/bindings/python/README.md
+  36b642b129ab4a5e 297-356
+net/crates/net/src/ffi/redis_dedup.rs
+  36b642b129ab4a5e 1-352
+net/crates/net/sdk/src/lib.rs
+  36b642b129ab4a5e 48-49,52-53
+net/crates/net/sdk-ts/README.md
+  36b642b129ab4a5e 113-195
+net/crates/net/bindings/node/src/redis_dedup.rs
+  36b642b129ab4a5e 1-186
+net/crates/net/src/adapter/redis.rs
+  36b642b129ab4a5e 19-60,338-352,365-373,385-395
+net/crates/net/sdk/README.md
+  36b642b129ab4a5e 109-166
+net/crates/net/src/adapter/redis_dedup.rs
+  36b642b129ab4a5e 24-322
+net/crates/net/src/adapter/dedup_state.rs
+  36b642b129ab4a5e 163
+net/crates/net/bindings/python/src/redis_dedup.rs
+  36b642b129ab4a5e 1-181
+net/crates/net/bindings/go/net/redis_dedup_test.go
+  36b642b129ab4a5e 1-140
+net/crates/net/sdk/src/redis_dedup.rs
+  36b642b129ab4a5e 1-10
+net/crates/net/bindings/node/Cargo.toml
+  36b642b129ab4a5e 17-22
+net/crates/net/bindings/node/src/lib.rs
+  36b642b129ab4a5e 20-21
+net/crates/net/bindings/python/src/lib.rs
+  36b642b129ab4a5e 18-19,2094-2095
+net/crates/net/src/adapter/mod.rs
+  36b642b129ab4a5e 25-26,29-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "efabcc058ecd0e11ef7cff6f15a195fb655a1bf8",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 6058,
+      "total_deletions": 403,
+      "accepted_lines": 1760,
+      "overriden_lines": 0
+    }
+  }
+}
