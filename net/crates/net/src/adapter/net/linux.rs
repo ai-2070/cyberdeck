@@ -148,8 +148,7 @@ impl BatchedTransport {
             // struct literal.
             self.msgs[i].msg_hdr = unsafe { std::mem::zeroed() };
             self.msgs[i].msg_hdr.msg_name = &mut self.addrs[i] as *mut _ as *mut _;
-            self.msgs[i].msg_hdr.msg_namelen =
-                std::mem::size_of::<libc::sockaddr_in>() as u32;
+            self.msgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
             self.msgs[i].msg_hdr.msg_iov = &mut self.iovecs[i];
             self.msgs[i].msg_hdr.msg_iovlen = 1;
             self.msgs[i].msg_len = 0;
@@ -232,8 +231,7 @@ impl BatchedTransport {
             // See `new_inner` for the zero-then-assign rationale.
             self.msgs[i].msg_hdr = unsafe { std::mem::zeroed() };
             self.msgs[i].msg_hdr.msg_name = &mut self.addrs[i] as *mut _ as *mut _;
-            self.msgs[i].msg_hdr.msg_namelen =
-                std::mem::size_of::<libc::sockaddr_in>() as u32;
+            self.msgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
             self.msgs[i].msg_hdr.msg_iov = &mut self.iovecs[i];
             self.msgs[i].msg_hdr.msg_iovlen = 1;
             self.msgs[i].msg_len = 0;
@@ -312,8 +310,7 @@ impl BatchedTransport {
             // See `new_inner` for the zero-then-assign rationale.
             self.msgs[i].msg_hdr = unsafe { std::mem::zeroed() };
             self.msgs[i].msg_hdr.msg_name = &mut self.addrs[i] as *mut _ as *mut _;
-            self.msgs[i].msg_hdr.msg_namelen =
-                std::mem::size_of::<libc::sockaddr_in>() as u32;
+            self.msgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
             self.msgs[i].msg_hdr.msg_iov = &mut self.iovecs[i];
             self.msgs[i].msg_hdr.msg_iovlen = 1;
             self.msgs[i].msg_len = 0;
