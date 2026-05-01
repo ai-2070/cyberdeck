@@ -741,35 +741,6 @@ fn routing_id(node_id: u64) -> u64 {
     (node_id as u32) as u64
 }
 
-/// Verify the AEAD tag on an inbound heartbeat packet.
-///
-/// Heartbeats carry no payload — the "payload" field of the
-/// `ParsedPacket` is the 16-byte Poly1305 tag from
-/// `PacketBuilder::build_heartbeat`. Decrypting empty plaintext
-/// over that tag against the session's RX cipher is the
-/// verification step. Returns `true` only when the tag verifies
-/// against the session's key AND the replay window admits the
-/// counter.
-///
-/// Closes BUG #85: the mesh dispatch loop previously fast-pathed
-/// `is_heartbeat()` packets without invoking AEAD verification,
-/// letting an off-path attacker who observed the cleartext
-/// `session_id` and source UDP address spoof heartbeats
-/// indefinitely (defeating session-idle timeout and injecting
-/// false failure-detector signals).
-fn verify_heartbeat_aead(parsed: &ParsedPacket, session: &NetSession) -> bool {
-    let aad = parsed.header.aad();
-    let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
-    let rx_cipher = session.rx_cipher();
-    if !rx_cipher.is_valid_rx_counter(counter) {
-        return false;
-    }
-    if rx_cipher.decrypt(counter, &aad, &parsed.payload).is_err() {
-        return false;
-    }
-    rx_cipher.update_rx_counter(counter)
-}
-
 /// 64-bit origin-hash projection used as the `AuthGuard` key.
 ///
 /// A prior version truncated to `u32` so the key matched the
@@ -2500,25 +2471,24 @@ impl MeshNode {
         if parsed.header.flags.is_heartbeat() {
             // BUG #85: previously this branch fast-pathed the
             // heartbeat — touched `failure_detector` and `session`
-            // without verifying the AEAD tag. The legacy single-
-            // peer adapter (`mod.rs:642-663`) explicitly verifies
-            // the tag for the same packet shape; the comment on
-            // `pool.rs:237-249` documents that heartbeats are now
-            // AEAD-authenticated specifically to prevent off-path
-            // spoofing. An attacker with the cleartext `session_id`
-            // (visible on every prior data packet) and the source
-            // UDP address could spoof heartbeats from `peer_addr`,
-            // indefinitely defeating session-idle timeout and
-            // injecting false `failure_detector.heartbeat(...)`
-            // notifications.
+            // without verifying the AEAD tag. An attacker with the
+            // cleartext `session_id` (visible on every prior data
+            // packet) and the source UDP address could spoof
+            // heartbeats from `peer_addr`, indefinitely defeating
+            // session-idle timeout and injecting false
+            // `failure_detector.heartbeat(...)` notifications.
             //
-            // Now: do the same AEAD verify the legacy path does
-            // BEFORE touching any session state.
-            if !verify_heartbeat_aead(&parsed, &session) {
+            // `verify_and_touch_heartbeat` fuses AEAD verify with
+            // `session.touch()` so a future caller can't reorder
+            // them or forget to touch on success — the type
+            // system enforces verify-then-touch atomically. The
+            // failure-detector callback is mesh-specific (legacy
+            // adapter has no such observer) and stays here, after
+            // a successful verify.
+            if !session.verify_and_touch_heartbeat(&parsed) {
                 return;
             }
             failure_detector.heartbeat(peer_node_id, source);
-            session.touch();
             return;
         }
 
@@ -3368,17 +3338,11 @@ impl MeshNode {
                             //     reject every subsequent one as
                             //     a replay.
                             //
-                            // Use `thread_local_pool` (the same
+                            // `Session::build_heartbeat` routes
+                            // through `thread_local_pool` (same
                             // pool the data path uses) so heartbeats
                             // and data share a single `tx_counter`.
-                            // Routing heartbeats through
-                            // `packet_pool` (a separate counter)
-                            // would make the receiver's `rx_cipher`
-                            // see the same counter value twice —
-                            // once from each pool — and replay-
-                            // reject one of them.
-                            let mut pooled = session.thread_local_pool().get();
-                            let packet = pooled.build_heartbeat();
+                            let packet = session.build_heartbeat();
                             let _ = socket.send_to(&packet, peer_addr).await;
                             // Pingwave (raw UDP — not encrypted, topology is public)
                             let _ = socket.send_to(&pw_bytes, peer_addr).await;
@@ -7375,10 +7339,13 @@ mod heartbeat_aead_tests {
     //! verification, letting an off-path attacker who observed the
     //! cleartext `session_id` and source UDP address spoof
     //! heartbeats indefinitely. The fix routes through
-    //! [`verify_heartbeat_aead`] before calling
-    //! `failure_detector.heartbeat` or `session.touch`. These
-    //! tests pin the verifier itself at the same coverage bar the
-    //! legacy single-peer adapter has at
+    //! [`NetSession::verify_and_touch_heartbeat`] before calling
+    //! `failure_detector.heartbeat`. The verify+touch are now fused
+    //! into the session method so a future caller can't reorder
+    //! them or forget to touch on success. These tests pin both
+    //! the AEAD-verify outcome AND the touch-on-success/no-touch-
+    //! on-failure invariant at the same coverage bar the legacy
+    //! single-peer adapter has at
     //! `mod.rs::heartbeat_is_aead_authenticated`.
     use super::*;
     use crate::adapter::net::crypto::{NoiseHandshake, StaticKeypair};
@@ -7404,7 +7371,7 @@ mod heartbeat_aead_tests {
     }
 
     #[test]
-    fn aead_authenticated_heartbeat_passes_verification() {
+    fn aead_authenticated_heartbeat_passes_verification_and_touches_session() {
         let (init_keys, resp_keys) = make_session_keys();
         let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
@@ -7414,14 +7381,23 @@ mod heartbeat_aead_tests {
             .expect("legitimate heartbeat must parse");
         assert!(parsed.header.flags.is_heartbeat());
 
+        let last_before = resp_session.last_activity_ns();
+        // Sleep so `current_timestamp()` ticks observably forward
+        // before `verify_and_touch_heartbeat` reads it.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
         assert!(
-            verify_heartbeat_aead(&parsed, &resp_session),
+            resp_session.verify_and_touch_heartbeat(&parsed),
             "AEAD-authenticated heartbeat must verify against the matched session"
+        );
+        assert!(
+            resp_session.last_activity_ns() > last_before,
+            "successful verify must touch the session — verify+touch are fused"
         );
     }
 
     #[test]
-    fn unauthenticated_heartbeat_fails_verification() {
+    fn unauthenticated_heartbeat_fails_verification_and_does_not_touch() {
         let (_init_keys, resp_keys) = make_session_keys();
         let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
 
@@ -7440,11 +7416,19 @@ mod heartbeat_aead_tests {
             .expect("forged heartbeat must still parse — verification is downstream");
         assert!(parsed.header.flags.is_heartbeat());
 
+        let last_before = resp_session.last_activity_ns();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
         assert!(
-            !verify_heartbeat_aead(&parsed, &resp_session),
+            !resp_session.verify_and_touch_heartbeat(&parsed),
             "heartbeat with garbage AEAD tag must NOT verify — pre-fix the \
              mesh dispatcher would have called session.touch() / \
              failure_detector.heartbeat() unconditionally"
+        );
+        assert_eq!(
+            resp_session.last_activity_ns(),
+            last_before,
+            "failed verify must NOT touch the session — verify+touch are fused"
         );
     }
 
@@ -7656,16 +7640,11 @@ mod heartbeat_aead_tests {
         );
         let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
 
-        // Mirror the production sender at `mesh.rs:3220` —
-        // acquire from the session's pool, not a fresh builder.
-        let h1_bytes = {
-            let mut pooled = init_session.thread_local_pool().get();
-            pooled.build_heartbeat()
-        };
-        let h2_bytes = {
-            let mut pooled = init_session.thread_local_pool().get();
-            pooled.build_heartbeat()
-        };
+        // Mirror the production sender — go through
+        // `Session::build_heartbeat`, not a fresh
+        // `PacketBuilder::new`.
+        let h1_bytes = init_session.build_heartbeat();
+        let h2_bytes = init_session.build_heartbeat();
 
         let p1 = ParsedPacket::parse(h1_bytes, "127.0.0.1:5001".parse().unwrap())
             .expect("first heartbeat must parse");
@@ -7673,13 +7652,13 @@ mod heartbeat_aead_tests {
             .expect("second heartbeat must parse");
 
         assert!(
-            verify_heartbeat_aead(&p1, &resp_session),
+            resp_session.verify_and_touch_heartbeat(&p1),
             "first pooled heartbeat must verify — pre-fix the \
              all-zero key would have produced an AEAD tag the \
              receiver couldn't decrypt"
         );
         assert!(
-            verify_heartbeat_aead(&p2, &resp_session),
+            resp_session.verify_and_touch_heartbeat(&p2),
             "second pooled heartbeat must also verify — pre-fix, \
              a per-builder fresh counter would reuse counter=0 \
              and the receiver's replay window would reject this \
@@ -7695,11 +7674,11 @@ mod heartbeat_aead_tests {
         let bytes = builder.build_heartbeat();
         let parsed = ParsedPacket::parse(bytes, "127.0.0.1:5000".parse().unwrap()).unwrap();
 
-        assert!(verify_heartbeat_aead(&parsed, &resp_session));
+        assert!(resp_session.verify_and_touch_heartbeat(&parsed));
         // Replay: counter is now committed, so the second attempt
         // must fail at the replay-window check.
         assert!(
-            !verify_heartbeat_aead(&parsed, &resp_session),
+            !resp_session.verify_and_touch_heartbeat(&parsed),
             "replay of an already-accepted heartbeat must fail"
         );
     }

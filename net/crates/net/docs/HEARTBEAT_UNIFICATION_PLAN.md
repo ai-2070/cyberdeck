@@ -153,12 +153,40 @@ Add a CI grep (or a `compile_fail` test) asserting that no `*.rs` file outside `
 | Step | State |
 |---|---|
 | Send-side fix (#97) — route through `thread_local_pool` | ✅ done |
-| Mesh receive-side fix (#85) — `verify_heartbeat_aead` helper | ✅ done |
+| Mesh receive-side fix (#85) — AEAD verify before touching session | ✅ done |
 | Drop `Session::tx_cipher` / `Session::packet_pool` getters | ✅ done |
 | Regression tests for #85 and #97 | ✅ done |
-| 1 — Replace `verify_heartbeat_aead` predicate with `NetSession::verify_and_touch_heartbeat` (verify + touch fused), port both receive sites | outstanding |
-| 2 — `NetSession::build_heartbeat()` wrapper, port both build sites | outstanding |
-| 3 — `PacketBuilder::new` → `pub(crate)` | outstanding |
-| 4 — Static check / CI grep | outstanding |
+| 1 — `NetSession::verify_and_touch_heartbeat` (verify + touch fused), both receive sites ported, free `verify_heartbeat_aead` deleted | ✅ done |
+| 2 — `NetSession::build_heartbeat()` wrapper, both build sites ported | ✅ done |
+| 3 — `PacketBuilder::new` → `pub(crate)` | ✅ done |
+| 4 — Static drift-check tests (`heartbeat_api_drift_check`) | ✅ done |
 
-Closed by the implementation: **#11**, **#85**, **#97**, surface area for **#106**. Outstanding steps reduce duplication only; they do not fix new bugs.
+Closed by the implementation: **#11**, **#85**, **#97**, surface area for **#106**.
+
+## Final shape (post-implementation)
+
+**`NetSession` (`adapter/net/session.rs`)** owns the heartbeat primitive:
+- `build_heartbeat() -> Bytes` — routes through `thread_local_pool` so heartbeats share a TX counter with data-path packets.
+- `verify_and_touch_heartbeat(&ParsedPacket) -> bool` — fuses AEAD verify + counter commit + `touch()` so a caller cannot observe a heartbeat without verifying it, or touch a session whose verify failed.
+
+**Production callers** (one line each):
+- Legacy adapter send: `mod.rs:863` — `let packet = session.build_heartbeat();`
+- Legacy adapter receive: `mod.rs:660-662` — source check, then `session.verify_and_touch_heartbeat(&parsed)`.
+- Mesh send: `mesh.rs:3345` — `let packet = session.build_heartbeat();`
+- Mesh receive: `mesh.rs:2487-2491` — `session.verify_and_touch_heartbeat(&parsed)`, then `failure_detector.heartbeat(...)` on success.
+
+**Locked-down surface:**
+- `PacketBuilder::new` is `pub(crate)` — external callers cannot construct a builder with a raw key. Verified: no callers exist outside `adapter/net/` (grep across `sdk/`, `bindings/`, `tests/`, `examples/`).
+- `verify_heartbeat_aead` (free function) is deleted. The single AEAD-verify implementation lives on `NetSession`.
+
+**Drift tripwires** (`adapter::net::session::heartbeat_api_drift_check`):
+- `mod_rs_production_callers_match_allowlist`: scans the production prefix of `mod.rs` and asserts the only `.build_heartbeat(` call is `let packet = session.build_heartbeat();`.
+- `mesh_rs_production_callers_match_allowlist`: same for `mesh.rs`. A future contributor adding a new production caller has to update the allowlist deliberately, forcing review of the design.
+
+**Test coverage:** 10 heartbeat-related tests, all green:
+- `mod.rs::tests::heartbeat_is_aead_authenticated` — legitimate / no-tag / garbage-tag verify outcomes (legacy path).
+- `mesh::heartbeat_aead_tests::aead_authenticated_heartbeat_passes_verification_and_touches_session` — verify+touch fusion on success.
+- `mesh::heartbeat_aead_tests::unauthenticated_heartbeat_fails_verification_and_does_not_touch` — verify+touch fusion on failure (the structural guarantee).
+- `mesh::heartbeat_aead_tests::pooled_heartbeat_builds_succeed_in_sequence_and_verify` — back-to-back builds via `Session::build_heartbeat` produce verifiable packets with monotonic counters.
+- `mesh::heartbeat_aead_tests::replay_of_authenticated_heartbeat_fails_verification_on_second_try` — replay rejected by counter window.
+- `session::heartbeat_api_drift_check::*` — the two drift tripwires.

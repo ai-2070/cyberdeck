@@ -656,27 +656,15 @@ impl NetAdapter {
         // We still require `source == peer_addr` as a cheap
         // first-line filter so an unauthenticated flood doesn't
         // get to do the AEAD verify.
+        //
+        // The verify+touch sequence lives inside
+        // `NetSession::verify_and_touch_heartbeat` so callers can't
+        // touch a session whose heartbeat failed verify, and can't
+        // forget to touch on success. See BUG #85 / #97.
         if parsed.header.flags.is_heartbeat() {
-            if source != session.peer_addr() {
-                return;
+            if source == session.peer_addr() {
+                session.verify_and_touch_heartbeat(&parsed);
             }
-            let aad = parsed.header.aad();
-            let counter =
-                u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
-            let rx_cipher = session.rx_cipher();
-            if !rx_cipher.is_valid_rx_counter(counter) {
-                return;
-            }
-            // The "payload" of a heartbeat is just the 16-byte
-            // AEAD tag. Decrypting an empty plaintext over the
-            // tag is the verification step.
-            if rx_cipher.decrypt(counter, &aad, &parsed.payload).is_err() {
-                return;
-            }
-            if !rx_cipher.update_rx_counter(counter) {
-                return;
-            }
-            session.touch();
             return;
         }
 
@@ -867,26 +855,12 @@ impl NetAdapter {
                         // window rejected every heartbeat after
                         // the first.
                         //
-                        // The first round of #97 fix routed
-                        // heartbeats through `session.packet_pool`
-                        // — that fixed (a)+(b) but introduced a
-                        // counter conflict with the data path:
-                        // `packet_pool` and `thread_local_pool`
-                        // each own their own `tx_counter`, and
-                        // the data path uses `thread_local_pool`
-                        // (see `on_batch` at `:982`). The receiver
-                        // verifies all packets against a single
-                        // `rx_cipher`, so heartbeats and data
-                        // must share the SAME counter on the
-                        // sender side or one will be replay-
-                        // rejected.
-                        //
-                        // Use `thread_local_pool` here too — same
-                        // pool, same shared counter, so heartbeats
-                        // and data interleave correctly on the
-                        // wire.
-                        let mut pooled = session.thread_local_pool().get();
-                        let packet = pooled.build_heartbeat();
+                        // `Session::build_heartbeat` routes through
+                        // `thread_local_pool` (same pool the data
+                        // path uses) so heartbeats share a single
+                        // TX counter with data and interleave
+                        // correctly on the wire.
+                        let packet = session.build_heartbeat();
 
                         if let Err(e) = socket.send_to(&packet, peer_addr).await {
                             tracing::warn!(error = %e, "heartbeat send failed");

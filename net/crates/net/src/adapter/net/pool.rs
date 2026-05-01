@@ -31,8 +31,19 @@ pub struct PacketBuilder {
 }
 
 impl PacketBuilder {
-    /// Create a new packet builder
-    pub fn new(key: &[u8; 32], session_id: u64) -> Self {
+    /// Create a new packet builder.
+    ///
+    /// `pub(crate)` not `pub`: every legitimate caller is inside
+    /// `adapter/net/`. Demoted as part of the heartbeat-unification
+    /// pass — see [`HEARTBEAT_UNIFICATION_PLAN.md`] — to lock the
+    /// surface that admitted BUG #97 (a caller substituting
+    /// `&[0u8; 32]` for the session's real TX key produced
+    /// AEAD-tagged heartbeats whose tag the receiver could never
+    /// verify against the session's actual key). Heartbeats now go
+    /// through [`NetSession::build_heartbeat`]; data-path packets
+    /// go through the pool. No external caller should be
+    /// constructing raw-key builders.
+    pub(crate) fn new(key: &[u8; 32], session_id: u64) -> Self {
         Self {
             payload: BytesMut::with_capacity(MAX_PAYLOAD_SIZE),
             cipher: PacketCipher::new(key, session_id),

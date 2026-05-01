@@ -3,6 +3,7 @@
 //! This module manages session state after Noise handshake completion,
 //! including per-stream state for multiplexing.
 
+use bytes::Bytes;
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
 use std::net::SocketAddr;
@@ -21,6 +22,7 @@ use super::crypto::{PacketCipher, SessionKeys};
 use super::pool::SharedLocalPool;
 use super::reliability::{create_reliability_mode, ReliabilityMode};
 use super::stream::DEFAULT_STREAM_WINDOW_BYTES;
+use super::transport::ParsedPacket;
 
 /// TIME_WAIT-style quarantine window after `close_stream`. A
 /// `StreamWindow` grant that arrives for a stream closed within
@@ -621,6 +623,66 @@ impl NetSession {
     #[inline]
     pub fn thread_local_pool(&self) -> &SharedLocalPool {
         &self.thread_local_pool
+    }
+
+    /// Build an AEAD-authenticated heartbeat packet for this session.
+    ///
+    /// Routes through `thread_local_pool` so the heartbeat shares
+    /// its TX counter with data-path packets — heartbeats and data
+    /// interleave cleanly on the wire, and the receiver's replay
+    /// window admits them in either order.
+    ///
+    /// Closes BUG #97: pre-fix, callers built heartbeats with a
+    /// fresh `PacketBuilder::new(&[0u8; 32], session_id)`, which
+    /// (a) used the wrong key so the receiver's AEAD verify
+    /// rejected every heartbeat, and (b) reused counter=0 across
+    /// successive heartbeats so the replay window rejected every
+    /// heartbeat after the first. Wrapping the construction in this
+    /// method removes the surface that admitted both errors.
+    #[inline]
+    pub fn build_heartbeat(&self) -> Bytes {
+        self.thread_local_pool.get().build_heartbeat()
+    }
+
+    /// Verify an inbound heartbeat's AEAD tag against this session's
+    /// RX cipher, commit the counter into the replay window, and
+    /// refresh `last_activity`. Returns `true` if the packet was
+    /// accepted; the session is mutated only on success.
+    ///
+    /// Verify and touch are fused into a single call so callers
+    /// cannot get the order wrong (verify-then-touch, never the
+    /// reverse) or forget to touch (which would defeat session
+    /// idle-timeout for legitimate heartbeats).
+    ///
+    /// Source-address validation (legacy adapter: 1:1 source per
+    /// session) and any post-accept observation (mesh:
+    /// `failure_detector.heartbeat`) remain the caller's
+    /// responsibility — those policies vary by adapter and don't
+    /// belong inside the helper.
+    ///
+    /// Closes BUG #85: pre-fix, the mesh dispatch loop fast-pathed
+    /// `is_heartbeat()` packets through to `failure_detector.heartbeat`
+    /// and `session.touch()` without ever decrypting the tag, letting
+    /// an off-path attacker who observed the cleartext `session_id`
+    /// and source UDP address spoof heartbeats indefinitely.
+    pub fn verify_and_touch_heartbeat(&self, parsed: &ParsedPacket) -> bool {
+        let aad = parsed.header.aad();
+        let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
+        if !self.rx_cipher.is_valid_rx_counter(counter) {
+            return false;
+        }
+        if self
+            .rx_cipher
+            .decrypt(counter, &aad, &parsed.payload)
+            .is_err()
+        {
+            return false;
+        }
+        if !self.rx_cipher.update_rx_counter(counter) {
+            return false;
+        }
+        self.touch();
+        true
     }
 
     /// Update last activity timestamp
@@ -1347,6 +1409,100 @@ impl std::fmt::Debug for SessionManager {
 }
 
 use super::current_timestamp;
+
+#[cfg(test)]
+mod heartbeat_api_drift_check {
+    //! Tripwire for the heartbeat-unification invariant: every
+    //! production-side caller in `mod.rs` and `mesh.rs` that
+    //! constructs a heartbeat must go through
+    //! [`NetSession::build_heartbeat`]. See
+    //! `docs/HEARTBEAT_UNIFICATION_PLAN.md` Step 4.
+    //!
+    //! `PacketBuilder::new` is `pub(crate)` so the type system
+    //! already forbids external callers. Within the crate,
+    //! though, a future contributor could legitimately add a new
+    //! production caller that reaches into the pool directly
+    //! (`session.thread_local_pool().get().build_heartbeat()`)
+    //! and bypass the session helper — that pattern was the bug
+    //! shape behind #97/#106. This test counts the approved
+    //! production call sites and fails if a new one appears
+    //! without an explicit allowlist update, forcing the
+    //! contributor to confirm the design choice.
+    //!
+    //! The test scans only the *production* prefixes of each
+    //! file (everything before the first column-0
+    //! `#[cfg(test)]`), which excludes the test modules where
+    //! `PacketBuilder::new(&keys.tx_key, ...)` is the canonical
+    //! way to build a heartbeat for a manually-constructed
+    //! peer session.
+
+    fn production_prefix(src: &str) -> &str {
+        // Top-level test modules are tagged with a column-0
+        // `#[cfg(test)]` immediately followed by `mod`. Find the
+        // first such marker and treat everything before it as
+        // production code. Nested `#[cfg(test)]` mods (indented
+        // inside an `impl` or inline `mod` block) are NOT cut
+        // here, so production code in those files that follows
+        // a nested test mod is still checked. False positives
+        // from nested-test-mod content are unlikely because none
+        // of the nested test mods in this codebase reference
+        // `build_heartbeat`.
+        let needle = "\n#[cfg(test)]\nmod ";
+        match src.find(needle) {
+            Some(idx) => &src[..idx],
+            None => src,
+        }
+    }
+
+    fn count_build_heartbeat_callers(src: &str) -> Vec<String> {
+        src.lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                // Skip comments / doc-comments.
+                if trimmed.starts_with("//") {
+                    return false;
+                }
+                line.contains(".build_heartbeat(")
+            })
+            .map(|line| line.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn mod_rs_production_callers_match_allowlist() {
+        let prod = production_prefix(include_str!("mod.rs"));
+        let callers = count_build_heartbeat_callers(prod);
+        // The only approved production caller in mod.rs:
+        //   `let packet = session.build_heartbeat();`
+        // inside `spawn_heartbeat`. Pre-fix this read
+        //   `let packet = pooled.build_heartbeat();`
+        // — that pattern is the regression we want to catch.
+        let approved = ["let packet = session.build_heartbeat();"];
+        assert_eq!(
+            callers,
+            approved.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "mod.rs production callers of `.build_heartbeat()` drifted from the \
+             approved allowlist. If you intentionally added a new caller, route it \
+             through `Session::build_heartbeat` and update this allowlist. \
+             See docs/HEARTBEAT_UNIFICATION_PLAN.md."
+        );
+    }
+
+    #[test]
+    fn mesh_rs_production_callers_match_allowlist() {
+        let prod = production_prefix(include_str!("mesh.rs"));
+        let callers = count_build_heartbeat_callers(prod);
+        let approved = ["let packet = session.build_heartbeat();"];
+        assert_eq!(
+            callers,
+            approved.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "mesh.rs production callers of `.build_heartbeat()` drifted from the \
+             approved allowlist. If you intentionally added a new caller, route it \
+             through `Session::build_heartbeat` and update this allowlist. \
+             See docs/HEARTBEAT_UNIFICATION_PLAN.md."
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
