@@ -1,0 +1,249 @@
+diff --git a/net/crates/net/src/adapter/net/linux.rs b/net/crates/net/src/adapter/net/linux.rs
+index 0290a0c..258092b 100644
+--- a/net/crates/net/src/adapter/net/linux.rs
++++ b/net/crates/net/src/adapter/net/linux.rs
+@@ -210,6 +210,20 @@ impl BatchedTransport {
+             return Ok(Vec::new());
+         }
+ 
++        // BUG #90: a `BatchedTransport` constructed via
++        // `new_send_only` skipped the `recv_buffers` allocation,
++        // so indexing into them below would panic with
++        // index-out-of-bounds. Surface the misuse as an explicit
++        // error instead — the doc on `new_send_only` only stated
++        // the contract verbally before this guard.
++        if self.recv_buffers.is_empty() {
++            return Err(io::Error::new(
++                io::ErrorKind::Unsupported,
++                "BatchedTransport constructed via `new_send_only` cannot \
++                 receive packets — use `new` if recv is needed",
++            ));
++        }
++
+         // Setup receive buffers
+         for i in 0..count {
+             self.recv_buffers[i].resize(MAX_PACKET_SIZE, 0);
+@@ -280,6 +294,15 @@ impl BatchedTransport {
+             return Ok(Vec::new());
+         }
+ 
++        // BUG #90: see `recv_batch` for context.
++        if self.recv_buffers.is_empty() {
++            return Err(io::Error::new(
++                io::ErrorKind::Unsupported,
++                "BatchedTransport constructed via `new_send_only` cannot \
++                 receive packets — use `new` if recv is needed",
++            ));
++        }
++
+         // Setup receive buffers
+         for i in 0..count {
+             self.recv_buffers[i].resize(MAX_PACKET_SIZE, 0);
+@@ -488,4 +511,36 @@ mod tests {
+         // Should not fail
+         configure_socket_for_throughput(fd).unwrap();
+     }
++
++    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #90:
++    /// `BatchedTransport::new_send_only` skips the `recv_buffers`
++    /// allocation, leaving the vector empty. Pre-fix, calling
++    /// `recv_batch` on a send-only transport panicked with
++    /// index-out-of-bounds at the first `self.recv_buffers[i]
++    /// .resize(...)` line. The fix surfaces the misuse as an
++    /// `io::ErrorKind::Unsupported` instead.
++    #[test]
++    fn recv_batch_returns_unsupported_for_send_only_transport() {
++        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
++        let fd = socket.as_raw_fd();
++        let mut transport = BatchedTransport::new_send_only(fd);
++
++        let err = transport
++            .recv_batch(8)
++            .expect_err("send-only recv must surface Unsupported, not panic");
++        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
++
++        let err_blocking = transport
++            .recv_batch_blocking(8)
++            .expect_err("send-only recv_batch_blocking must also surface Unsupported");
++        assert_eq!(err_blocking.kind(), io::ErrorKind::Unsupported);
++
++        // Sanity: a `new()` (recv-capable) transport doesn't trip
++        // the guard. We don't actually assert success of recv (no
++        // packets are arriving), just that the guard isn't fired.
++        let mut recv_transport = BatchedTransport::new(fd);
++        // 0-count is the explicit no-op path before the guard.
++        let zero = recv_transport.recv_batch(0).unwrap();
++        assert!(zero.is_empty());
++    }
+ }
+diff --git a/net/crates/net/src/adapter/net/traversal/classify.rs b/net/crates/net/src/adapter/net/traversal/classify.rs
+index a6b783d..2c38adf 100644
+--- a/net/crates/net/src/adapter/net/traversal/classify.rs
++++ b/net/crates/net/src/adapter/net/traversal/classify.rs
+@@ -285,11 +285,25 @@ impl ClassifyFsm {
+         // Open: any reflex equals bind. A port-mapping installed
+         // via stage 4 produces the same shape (bind == external),
+         // so this check naturally subsumes that case.
+-        if self
+-            .probes
+-            .iter()
+-            .any(|(_, reflex)| reflex.port() == bind_addr.port() && reflex.ip() == bind_addr.ip())
+-        {
++        //
++        // BUG #107: when `bind_addr.ip()` is wildcard (0.0.0.0 or
++        // ::), a reflex observation like `192.0.2.1:9001` would
++        // never compare equal under the strict `reflex.ip() ==
++        // bind_addr.ip()` check — even though the ports match and
++        // the node is in fact directly reachable. The FSM then
++        // classified as `Cone` (or `Symmetric`) and
++        // `pair_action` triggered an unnecessary `SinglePunch`.
++        // Capability tags advertised `nat:cone` instead of
++        // `nat:open`, biasing peer-side decisions. The docstring
++        // says callers should pre-resolve `bind_addr` to an
++        // interface address, but no runtime guard enforced it.
++        // Now an unspecified bind IP is treated as a wildcard
++        // match — port-only equality suffices.
++        let bind_ip_is_wildcard = bind_addr.ip().is_unspecified();
++        if self.probes.iter().any(|(_, reflex)| {
++            reflex.port() == bind_addr.port()
++                && (bind_ip_is_wildcard || reflex.ip() == bind_addr.ip())
++        }) {
+             return NatClass::Open;
+         }
+ 
+@@ -402,6 +416,60 @@ mod tests {
+         assert_eq!(fsm.classify(bind), NatClass::Open);
+     }
+ 
++    // ========================================================================
++    // BUG #107: wildcard bind IP must not block Open detection
++    // ========================================================================
++
++    /// When the daemon binds to `0.0.0.0:9001` (the common
++    /// default), a reflex observation like `192.0.2.1:9001`
++    /// should classify as `Open` — the ports match and the node
++    /// is in fact directly reachable. Pre-fix the strict
++    /// `reflex.ip() == bind_addr.ip()` check rejected the match
++    /// (since `192.0.2.1 != 0.0.0.0`) and the FSM mis-classified
++    /// as `Cone`/`Symmetric`, advertising `nat:cone` instead of
++    /// `nat:open` in capability tags.
++    #[test]
++    fn wildcard_bind_v4_recognizes_open() {
++        let mut fsm = ClassifyFsm::new();
++        // Same port across two peers, different IPs — the bind
++        // is wildcard so port-only equality should suffice.
++        fsm.observe(1, sa("192.0.2.1:9001"));
++        fsm.observe(2, sa("203.0.113.7:9001"));
++        let bind = sa("0.0.0.0:9001");
++        assert_eq!(
++            fsm.classify(bind),
++            NatClass::Open,
++            "wildcard bind must classify port-matching reflex as Open (BUG #107)"
++        );
++    }
++
++    /// IPv6 wildcard (`[::]:9001`) — same hazard pattern.
++    #[test]
++    fn wildcard_bind_v6_recognizes_open() {
++        let mut fsm = ClassifyFsm::new();
++        fsm.observe(1, sa("[2001:db8::1]:9001"));
++        fsm.observe(2, sa("[2001:db8::2]:9001"));
++        let bind = sa("[::]:9001");
++        assert_eq!(
++            fsm.classify(bind),
++            NatClass::Open,
++            "wildcard v6 bind must classify port-matching reflex as Open (BUG #107)"
++        );
++    }
++
++    /// Wildcard bind + DIFFERENT reflex ports must still
++    /// classify as Symmetric (port mismatch trumps wildcard IP).
++    /// Pins that the wildcard relaxation only matches port-
++    /// equal reflexes — varying ports still mean a NAT.
++    #[test]
++    fn wildcard_bind_with_varying_ports_is_symmetric() {
++        let mut fsm = ClassifyFsm::new();
++        fsm.observe(1, sa("192.0.2.1:54321"));
++        fsm.observe(2, sa("203.0.113.7:54322"));
++        let bind = sa("0.0.0.0:9001");
++        assert_eq!(fsm.classify(bind), NatClass::Symmetric);
++    }
++
+     // ========================================================================
+     // TEST_COVERAGE_PLAN §P2-11 — FSM determinism under permutation +
+     // scaling beyond the 2-observation minimum.
+diff --git a/net/crates/net/src/adapter/net/traversal/portmap/natpmp.rs b/net/crates/net/src/adapter/net/traversal/portmap/natpmp.rs
+index 629971f..697f567 100644
+--- a/net/crates/net/src/adapter/net/traversal/portmap/natpmp.rs
++++ b/net/crates/net/src/adapter/net/traversal/portmap/natpmp.rs
+@@ -459,6 +459,23 @@ impl PortMapperClient for NatPmpMapper {
+         internal_port: u16,
+         ttl: Duration,
+     ) -> Result<PortMapping, PortMappingError> {
++        // BUG #113: pre-fix this turned `ttl == Duration::ZERO`
++        // into `lifetime = 0` and sent the request. Per RFC 6886
++        // §3.3, lifetime=0 is the "remove this mapping" signal —
++        // the same wire format `remove()` sends. So an "install"
++        // with zero TTL silently REMOVED the mapping instead of
++        // creating one. Compounded with the renewal loop:
++        // `mapping.ttl = ZERO` propagated, and the next renewal
++        // sent another remove ("succeeding" while the router
++        // had nothing mapped). Reject zero TTL up-front so the
++        // caller sees an error instead of a silent removal.
++        if ttl.is_zero() {
++            return Err(PortMappingError::Transport(
++                "NAT-PMP install with ttl=0 would unmap; \
++                 caller must supply a non-zero lifetime"
++                    .into(),
++            ));
++        }
+         let lifetime = ttl.as_secs().min(u32::MAX as u64) as u32;
+         let req = NatPmpRequest::MapUdp {
+             internal_port,
+@@ -670,6 +687,46 @@ mod tests {
+         }
+     }
+ 
++    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #113: pre-fix
++    /// `install` accepted `ttl == Duration::ZERO` and turned it
++    /// into a NAT-PMP `lifetime=0`, which per RFC 6886 §3.3 is
++    /// the "remove this mapping" wire signal. The gateway acks
++    /// (mapping removed); `install` returned `Ok(...)` which
++    /// the caller treated as freshly installed — silent
++    /// data-plane failure where peers couldn't reach the node.
++    /// Compounded by the renewal loop self-removing on the
++    /// next tick.
++    ///
++    /// Post-fix: `install` rejects zero TTL synchronously
++    /// before sending the wire request, so callers see an
++    /// explicit error and the gateway is never asked to remove
++    /// what we meant to install.
++    #[tokio::test]
++    async fn install_rejects_zero_ttl_before_sending_wire_request() {
++        let gateway = Ipv4Addr::new(10, 0, 0, 1);
++        let mapper = NatPmpMapper::new(gateway);
++
++        // Pre-fix: this would send an install request with
++        // lifetime=0; the gateway would interpret it as remove
++        // and return Ok, leaving the caller with `mapping.ttl =
++        // ZERO`. Post-fix: rejected synchronously without any
++        // wire I/O.
++        let result = mapper.install(9001, Duration::ZERO).await;
++        match result {
++            Err(PortMappingError::Transport(msg)) => {
++                assert!(
++                    msg.contains("ttl=0"),
++                    "error message should mention ttl=0 (got: {msg})"
++                );
++            }
++            other => panic!(
++                "ttl=0 install must reject synchronously with Transport \
++                 error, got {:?}",
++                other
++            ),
++        }
++    }
++
+     #[test]
+     fn decode_result_code_variants() {
+         assert_eq!(ResultCode::from_u16(0), ResultCode::Success);

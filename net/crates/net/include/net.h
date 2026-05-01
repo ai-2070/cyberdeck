@@ -30,7 +30,15 @@ extern "C" {
 /* Opaque handle to the event bus. */
 typedef void* net_handle_t;
 
-/* Error codes. */
+/*
+ * Error codes.
+ *
+ * MUST stay in sync with `src/ffi/mod.rs::NetError`. CR-22 added the
+ * `-9` and `-10` values that were defined in Rust but missing here;
+ * the `cr22_c_header_parity_with_rust_neterror` test (Rust-side)
+ * scans this header and the Go-side copy at `bindings/go/net/net.h`
+ * to catch future drift.
+ */
 typedef enum {
     NET_SUCCESS              =  0,
     NET_ERR_NULL_POINTER     = -1,
@@ -41,6 +49,21 @@ typedef enum {
     NET_ERR_POLL_FAILED      = -6,
     NET_ERR_BUFFER_TOO_SMALL = -7,
     NET_ERR_SHUTTING_DOWN    = -8,
+    /*
+     * CR-22: response byte count exceeds c_int::MAX. The data was
+     * already copied into the caller's buffer (so resizing won't
+     * help — that's BUFFER_TOO_SMALL); the caller's int counter
+     * just can't represent the count. Surfaced by net_poll /
+     * net_stats when their JSON output is multi-gigabyte.
+     */
+    NET_ERR_INT_OVERFLOW     = -9,
+    /*
+     * CR-22: a stream handle was passed to a send-family FFI for a
+     * NetHandle that did not create it. Pre-fix the FFI layer
+     * accepted any (stream, node) pair, allowing silent cross-
+     * session traffic when a caller bug crossed handles.
+     */
+    NET_ERR_MISMATCHED_HANDLES = -10,
     NET_ERR_UNKNOWN          = -99
 } net_error_t;
 

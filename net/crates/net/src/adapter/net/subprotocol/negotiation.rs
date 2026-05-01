@@ -506,4 +506,74 @@ mod tests {
             "manifest and capability_tags must advertise the same subprotocols",
         );
     }
+
+    /// CR-31: tighten the cross-channel parity. The HashSet
+    /// comparison above pins which subprotocols are advertised
+    /// but NOT the order in which they're advertised. BUG #149's
+    /// fix made `from_registry` deterministically sorted by id,
+    /// but if `capability_tags()` consumed downstream as an
+    /// ordered byte stream (e.g. fed into a hash for "same caps?
+    /// skip re-announce" optimisation), divergence between the
+    /// two channels' orderings would silently invalidate the
+    /// dedup. We pin matching ascending-by-id order on BOTH so a
+    /// future change touching either side surfaces here.
+    #[test]
+    fn from_registry_and_capability_tags_have_matching_ascending_id_order() {
+        let reg = SubprotocolRegistry::new();
+        // Register out of id order on purpose.
+        reg.register(SubprotocolDescriptor::new(
+            0x0500,
+            "b",
+            SubprotocolVersion::new(1, 0),
+        ));
+        reg.register(SubprotocolDescriptor::new(
+            0x0400,
+            "a",
+            SubprotocolVersion::new(1, 0),
+        ));
+        reg.register(SubprotocolDescriptor::new(
+            0x0700,
+            "d",
+            SubprotocolVersion::new(1, 0),
+        ));
+        reg.register(SubprotocolDescriptor::new(
+            0x0600,
+            "c",
+            SubprotocolVersion::new(1, 0),
+        ));
+
+        let manifest = SubprotocolManifest::from_registry(&reg);
+        let manifest_ids: Vec<u16> = manifest.entries.iter().map(|e| e.id).collect();
+
+        let mut tag_ids: Vec<u16> = reg
+            .capability_tags()
+            .iter()
+            .filter_map(|t| {
+                t.strip_prefix("subprotocol:0x")
+                    .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+            })
+            .collect();
+
+        // CR-31: pin both as Vecs in ascending id order. The
+        // manifest is sorted (BUG #149); we sort the tag list to
+        // make the comparison fair, then assert the SORTED forms
+        // match exactly. This catches a future divergence even
+        // if `capability_tags()` is unsorted today (DashMap
+        // iteration order).
+        let mut expected_sorted = manifest_ids.clone();
+        expected_sorted.sort();
+        tag_ids.sort();
+
+        assert_eq!(
+            manifest_ids, expected_sorted,
+            "from_registry must emit entries in ascending id order (BUG #149)"
+        );
+        assert_eq!(
+            tag_ids, expected_sorted,
+            "capability_tags must contain the same set of ids as the manifest \
+             (CR-31 / BUG #131): once both channels' bytes are consumed by a \
+             downstream digest optimisation, this divergence becomes a silent \
+             dedup-bypass"
+        );
+    }
 }

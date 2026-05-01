@@ -45,32 +45,16 @@ pub struct NetSession {
     peer_addr: SocketAddr,
     /// RX cipher (ChaCha20-Poly1305 with counter-based nonces)
     rx_cipher: PacketCipher,
-    /// Raw TX key. Used by callers (notably `mesh.rs`'s heartbeat
-    /// timer) that need to construct `PacketBuilder` instances
-    /// bound to the session's actual key. BUG #97 was caused by
-    /// callers substituting `&[0u8; 32]` here, producing
-    /// heartbeats that the receiver's AEAD verify (BUG #85 fix)
-    /// correctly rejected.
-    ///
-    /// BUG #106: pre-fix this struct also held a separate
-    /// `tx_cipher: PacketCipher` and `packet_pool:
-    /// SharedPacketPool`, both constructed with the same TX key
-    /// as `thread_local_pool` but with INDEPENDENT
-    /// `Arc<AtomicU64>` counters. Each pool's internal regression
-    /// tests (`pool.rs:952, 992`) prevented within-pool counter
-    /// reuse, but cross-pool reuse was guaranteed by construction:
-    /// the moment a caller obtained `session.packet_pool()` or
-    /// `session.tx_cipher()` and encrypted a packet, ChaCha20-
-    /// Poly1305 nonce reuse against the corresponding counter
-    /// slot in `thread_local_pool` was assured (same key + same
-    /// nonce), giving an attacker XOR access to the plaintext.
-    /// In practice the issue was dormant — the only caller of
-    /// `packet_pool()` was a regression test, and `tx_cipher()`
-    /// had no callers — but the API surface invited future
-    /// misuse. Both fields and getters have been removed; the
-    /// data path uses `thread_local_pool` exclusively for tx
-    /// AEAD operations.
-    tx_key: [u8; 32],
+    // CR-12: `tx_key: [u8; 32]` field REMOVED along with the
+    // public `tx_key()` accessor. The field had zero readers
+    // outside of construction (it was passed straight into
+    // `thread_local_pool`'s constructor, then never read) — it
+    // was inert storage that only existed as a back-channel for
+    // the dead public accessor. Removing the field hardens the
+    // BUG #106 invariant: `thread_local_pool` is now the only
+    // surface that holds the TX key on a live `NetSession`,
+    // making the cross-pool nonce-reuse hazard structurally
+    // impossible to reintroduce by accident.
     /// Per-stream state
     streams: DashMap<u64, StreamState>,
     /// Last activity timestamp (for session timeout)
@@ -134,12 +118,13 @@ impl NetSession {
         let thread_local_pool =
             super::pool::shared_local_pool(pool_size, &keys.tx_key, keys.session_id);
 
-        let tx_key = keys.tx_key;
+        // CR-12: `tx_key` is consumed only by `shared_local_pool` above.
+        // The previous extra copy into a struct field was dead storage
+        // and a cross-pool footgun (see BUG #106).
         Self {
             session_id: keys.session_id,
             peer_addr,
             rx_cipher,
-            tx_key,
             streams: DashMap::new(),
             last_activity: AtomicU64::new(current_timestamp()),
             thread_local_pool,
@@ -182,38 +167,16 @@ impl NetSession {
         self.peer_addr
     }
 
-    /// Get the raw TX key.
-    ///
-    /// **HAZARDOUS — internal-use only.** This accessor exists for
-    /// the mesh heartbeat timer (`mesh.rs`), which needs to build
-    /// ad-hoc `PacketBuilder` instances bound to the session's
-    /// real key (substituting a placeholder here is what caused
-    /// BUG #97 — heartbeats AEAD-tagged with the wrong key that
-    /// the receiver correctly rejected). It is NOT part of the
-    /// supported SDK surface; outside callers MUST go through the
-    /// normal `send_*` paths or `NetSession::build_heartbeat` so
-    /// every TX-side AEAD operation flows through
-    /// `thread_local_pool` (the single nonce-counter source —
-    /// see the `tx_key` field doc and BUG #106 for the cross-
-    /// pool nonce-reuse hazard a parallel `PacketBuilder` would
-    /// reintroduce).
-    ///
-    /// If you find yourself reaching for this from a new call site,
-    /// either:
-    ///  - Add a typed wrapper that hands you a pre-wired
-    ///    `PacketBuilder` whose nonce counter shares the session's
-    ///    `thread_local_pool`, or
-    ///  - Add a method on `NetSession` for the operation you're
-    ///    trying to perform.
-    ///
-    /// Cubic-ai P1 surfaced this as a footgun; the fix is the
-    /// doc-warn here plus internal-only positioning. If observed
-    /// misuse appears in the future, replace the accessor with a
-    /// guard type.
-    #[inline]
-    pub fn tx_key(&self) -> &[u8; 32] {
-        &self.tx_key
-    }
+    // CR-12: `tx_key()` accessor was REMOVED. It was a public
+    // footgun with zero in-tree callers — any caller using
+    // `session.tx_key()` to construct a fresh `PacketBuilder`
+    // would re-introduce the BUG #97/#106 cross-pool nonce-reuse
+    // hazard (independent counters under the same ChaCha20-
+    // Poly1305 key). All TX-side AEAD operations now flow through
+    // `thread_local_pool` via `build_heartbeat` and the normal
+    // `send_*` paths. The `tx_key` FIELD is preserved (private)
+    // because `thread_local_pool` is constructed from it; nothing
+    // outside the session module reads it directly.
 
     /// Get the RX cipher
     #[inline]
@@ -2544,6 +2507,35 @@ mod tests {
         /// Test-only accessor for the captured epoch.
         fn epoch_for_test(&self) -> u64 {
             self.epoch
+        }
+    }
+
+    /// CR-12: pin that no `tx_key` method exists on `NetSession`.
+    /// This is a source-string tripwire — if a future maintainer
+    /// reintroduces the accessor, the test fires loudly. The hazard
+    /// it gates (BUG #97/#106 cross-pool nonce reuse) is dormant
+    /// unless someone calls a `tx_key()` method, so a behavioural
+    /// test would not catch the regression in time. We assemble
+    /// the forbidden token at runtime so the test's OWN source
+    /// doesn't contain the literal it scans for.
+    #[test]
+    fn cr12_tx_key_accessor_must_not_exist_on_net_session() {
+        // Build the forbidden token at runtime: `fn` + space + `tx_key` + `(`.
+        // The literal `fn tx_key(` shape is what we must NOT see in
+        // a non-comment line in the source.
+        let needle = format!("{} {}{}", "fn", "tx_key", "(");
+
+        let src = include_str!("session.rs");
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue; // doc-comment / line comment
+            }
+            assert!(
+                !trimmed.contains(&needle),
+                "CR-12 regression: tx_key accessor reintroduced into session.rs:\n  {}",
+                line
+            );
         }
     }
 }

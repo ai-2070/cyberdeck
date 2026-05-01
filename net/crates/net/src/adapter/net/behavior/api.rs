@@ -73,6 +73,75 @@ impl ApiMethod {
 /// well clear of the typical default 8 MB Linux stack.
 pub const MAX_SCHEMA_DEPTH: usize = 128;
 
+/// CR-9: scan the byte stream of a JSON document and reject if
+/// nesting depth (the deepest stack of `{` and `[` after balancing)
+/// exceeds `max_depth`.
+///
+/// This is the deserialize-side defence for [`SchemaType`]: an
+/// adversarial schema with thousands of nested `{"type":"array",
+/// "items":...}` levels would otherwise either trip `serde_json`'s
+/// internal limit (currently 128 by default but tied to a
+/// transitive dependency) or stack-overflow the typed
+/// deserialize. Pre-scanning the bytes has a single linear-time
+/// cost regardless of which deserialize path follows.
+///
+/// String literals are handled correctly: bracket characters
+/// inside a `"..."` string don't change depth, and escapes
+/// (`\"`, `\\`) are skipped so a `}` inside a string can't fool
+/// the counter.
+///
+/// Returns `Err(serde_json::Error)` with a `Custom` kind so
+/// callers can match on `*::is_data` / `*::is_eof` etc. uniformly
+/// with the standard `serde_json::from_slice` error surface.
+fn check_json_nesting_depth(data: &[u8], max_depth: usize) -> Result<(), serde_json::Error> {
+    use serde::de::Error;
+    let mut depth: usize = 0;
+    let mut max_seen: usize = 0;
+    let mut i = 0;
+    let n = data.len();
+    while i < n {
+        let b = data[i];
+        match b {
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                if depth > max_seen {
+                    max_seen = depth;
+                }
+                if depth > max_depth {
+                    return Err(serde_json::Error::custom(format!(
+                        "max nesting depth exceeded ({} > {})",
+                        depth, max_depth
+                    )));
+                }
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'"' => {
+                // Skip the rest of the string. Honor `\"` (don't
+                // exit) and `\\` (don't treat the following char
+                // as an escape). Anything else inside the string
+                // is opaque to the depth counter.
+                i += 1;
+                while i < n {
+                    match data[i] {
+                        b'\\' if i + 1 < n => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
 /// JSON Schema type definitions
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -194,6 +263,37 @@ pub enum StringFormat {
 }
 
 impl SchemaType {
+    /// Deserialize a `SchemaType` from JSON bytes with an explicit
+    /// nesting-depth cap.
+    ///
+    /// CR-9: callers that deserialize peer-supplied / untrusted
+    /// JSON into `SchemaType` MUST use this entry point. The
+    /// derive-`Deserialize` path inherits `serde_json`'s built-in
+    /// 128-frame recursion limit, but that's tied to a transitive
+    /// dependency and may shift across versions; we pin a local
+    /// cap matching [`MAX_SCHEMA_DEPTH`] by **pre-scanning** the
+    /// input bytes for max nesting depth (cheap O(n) walk over
+    /// `{`/`[`/`}`/`]` outside of strings) and rejecting before
+    /// any deserialize work runs. This also guards against
+    /// `serde_json::from_slice::<SchemaType>(...)` callsites that
+    /// might bypass [`Self::validate`]'s post-parse cap entirely.
+    ///
+    /// Returns:
+    /// - `Err(serde_json::Error)` with kind `Custom("max nesting
+    ///   depth exceeded")` if depth > [`MAX_SCHEMA_DEPTH`].
+    /// - The standard `serde_json::Error` variants from the
+    ///   downstream `from_slice` call otherwise.
+    pub fn try_from_slice(data: &[u8]) -> Result<Self, serde_json::Error> {
+        check_json_nesting_depth(data, MAX_SCHEMA_DEPTH)?;
+        serde_json::from_slice(data)
+    }
+
+    /// Deserialize a `SchemaType` from a JSON string with an
+    /// explicit nesting-depth cap. See [`Self::try_from_slice`].
+    pub fn try_from_str(s: &str) -> Result<Self, serde_json::Error> {
+        Self::try_from_slice(s.as_bytes())
+    }
+
     /// Create a string schema
     pub fn string() -> Self {
         SchemaType::String {
@@ -1904,6 +2004,101 @@ mod tests {
             schema.validate(&value).is_ok(),
             "schema right at the depth limit must still validate"
         );
+    }
+
+    /// CR-9: deeply-nested input must be rejected at the deserialize
+    /// boundary, BEFORE `validate` is called. Pre-fix the cap was
+    /// only enforced post-parse — an adversarial schema could
+    /// trigger the recursive `Deserialize` to allocate a deep
+    /// `SchemaType` tree (or stack-overflow on a very deep input)
+    /// before any validation ran.
+    #[test]
+    fn try_from_slice_rejects_input_over_max_schema_depth() {
+        // Build a JSON string with MAX_SCHEMA_DEPTH + 50 nested
+        // arrays. Even though valid JSON, it must trip the
+        // depth-scan guard before serde_json runs.
+        let depth = MAX_SCHEMA_DEPTH + 50;
+        let mut s = String::new();
+        for _ in 0..depth {
+            s.push('[');
+        }
+        s.push_str("null");
+        for _ in 0..depth {
+            s.push(']');
+        }
+        let err = SchemaType::try_from_str(&s)
+            .expect_err("deeply-nested JSON must be rejected by the depth pre-scan");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("max nesting depth exceeded"),
+            "error message must name the depth cap; got: {}",
+            msg
+        );
+    }
+
+    /// CR-9: the depth pre-scan must not be fooled by JSON strings
+    /// containing brackets. A long string of `}`s inside `"..."`
+    /// must NOT be counted as depth-out (which would let an
+    /// attacker mask real depth).
+    #[test]
+    fn try_from_slice_handles_brackets_inside_strings_correctly() {
+        // A schema with a `pattern` field containing brackets in
+        // a string. The string brackets must be ignored by the
+        // depth counter.
+        let json = r#"{"type":"string","pattern":"[}{]\""}"#;
+        let r = SchemaType::try_from_str(json);
+        assert!(
+            r.is_ok(),
+            "valid schema with bracket-bearing string must parse: {:?}",
+            r.err()
+        );
+    }
+
+    /// CR-9: a moderately-deep schema (well under both the depth
+    /// pre-scan cap AND serde_json's internal recursion limit)
+    /// must parse cleanly. The internal serde_json limit (128) and
+    /// our `MAX_SCHEMA_DEPTH` (128) are intentionally aligned, but
+    /// each `Box<SchemaType>` adds a serde call frame on top of
+    /// the byte-counter depth, so the effective serde-side ceiling
+    /// is a bit below `MAX_SCHEMA_DEPTH`. We pin a depth of 32
+    /// here — comfortably representative of any real-world nested
+    /// schema and well within both caps.
+    #[test]
+    fn try_from_slice_accepts_normal_depth_schema() {
+        let depth = 32usize;
+        let mut s = String::new();
+        for _ in 0..depth {
+            s.push_str(r#"{"type":"array","items":"#);
+        }
+        s.push_str(r#"{"type":"null"}"#);
+        for _ in 0..depth {
+            s.push('}');
+        }
+        let r = SchemaType::try_from_str(&s);
+        assert!(
+            r.is_ok(),
+            "moderately-nested schema (depth {}) must parse; got: {:?}",
+            depth,
+            r.err()
+        );
+    }
+
+    /// CR-9: direct unit test on the depth scanner — confirms
+    /// it counts both `{`/`}` and `[`/`]` correctly and respects
+    /// string-literal boundaries.
+    #[test]
+    fn check_json_nesting_depth_unit() {
+        assert!(check_json_nesting_depth(b"{}", 1).is_ok());
+        assert!(check_json_nesting_depth(b"{}", 0).is_err()); // depth 1 > 0
+        assert!(check_json_nesting_depth(b"[[[[]]]]", 4).is_ok());
+        assert!(check_json_nesting_depth(b"[[[[]]]]", 3).is_err());
+        // Brackets inside a string are NOT counted.
+        assert!(check_json_nesting_depth(b"\"[[[[\"", 0).is_ok());
+        // Escaped quote keeps us inside the string.
+        assert!(check_json_nesting_depth(b"\"[\\\"[[\"", 0).is_ok());
+        // Mixed nesting.
+        assert!(check_json_nesting_depth(b"{\"a\":[1,2]}", 2).is_ok());
+        assert!(check_json_nesting_depth(b"{\"a\":[1,2]}", 1).is_err());
     }
 
     #[test]

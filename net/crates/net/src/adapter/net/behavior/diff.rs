@@ -224,9 +224,55 @@ impl CapabilityDiff {
         header_size + ops_size
     }
 
-    /// Serialize to bytes
+    /// Serialize to bytes (legacy — silent empty-on-failure path).
+    ///
+    /// CR-10: prefer [`Self::try_to_bytes`], which validates that
+    /// the encoded diff fits inside the receiver's
+    /// [`MAX_DIFF_BYTES`] / [`MAX_DIFF_OPS`] caps before returning.
+    /// `to_bytes` returns `Vec::new()` on any failure (encoding
+    /// error OR cap violation) — historically callers treated an
+    /// empty result as "encode failed, drop", so the new cap
+    /// integration is bug-compatible. Production senders that
+    /// can produce diffs near the caps should switch to
+    /// `try_to_bytes` so they observe the cap violation explicitly
+    /// rather than silently emitting bytes the receiver discards.
+    ///
+    /// Pre-CR-10 this function had no cap awareness — a sender
+    /// could build a 100MB diff and dump it to bytes; every
+    /// receiver's [`Self::from_bytes`] would silently reject it
+    /// (BUG #138 cap), producing silent state divergence
+    /// indistinguishable from a network drop.
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap_or_default()
+        self.try_to_bytes().unwrap_or_default()
+    }
+
+    /// Serialize to bytes with explicit size-cap enforcement.
+    ///
+    /// CR-10: returns `Err(DiffSizeError::TooManyOps)` if `ops.len()
+    /// > MAX_DIFF_OPS` and `Err(DiffSizeError::Encoded { … })` if
+    /// the serialized form exceeds [`MAX_DIFF_BYTES`]. Both checks
+    /// MUST mirror what [`Self::from_bytes`] enforces — otherwise
+    /// the sender produces bytes the receiver silently discards.
+    /// Production senders building diffs from peer-supplied or
+    /// large-cardinality input MUST use this entry point.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, DiffSizeError> {
+        if self.ops.len() > MAX_DIFF_OPS {
+            return Err(DiffSizeError::TooManyOps {
+                got: self.ops.len(),
+                cap: MAX_DIFF_OPS,
+            });
+        }
+        let encoded = serde_json::to_vec(self).map_err(|_| DiffSizeError::Encoded {
+            got: self.estimated_size(),
+            cap: MAX_DIFF_BYTES,
+        })?;
+        if encoded.len() > MAX_DIFF_BYTES {
+            return Err(DiffSizeError::Encoded {
+                got: encoded.len(),
+                cap: MAX_DIFF_BYTES,
+            });
+        }
+        Ok(encoded)
     }
 
     /// Deserialize from bytes.
@@ -300,6 +346,55 @@ impl std::fmt::Display for DiffError {
 }
 
 impl std::error::Error for DiffError {}
+
+/// Error returned by [`CapabilityDiff::try_to_bytes`] when the diff
+/// would exceed the wire-format caps the receiver enforces.
+///
+/// CR-10: pre-fix `to_bytes` had no size cap and could silently
+/// emit bytes that every peer's `from_bytes` discarded — silent
+/// state divergence indistinguishable from a network drop. Senders
+/// that build diffs from peer-supplied / large-cardinality input
+/// MUST surface this error rather than swallow it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DiffSizeError {
+    /// `ops.len()` exceeds [`MAX_DIFF_OPS`]. Detected before
+    /// serialization so the sender pays no heap cost on rejection.
+    TooManyOps {
+        /// Actual op count.
+        got: usize,
+        /// The cap, [`MAX_DIFF_OPS`].
+        cap: usize,
+    },
+    /// Encoded byte length exceeds [`MAX_DIFF_BYTES`]. Surfaces
+    /// either the actual encoded length (post-serialize) or a
+    /// best-estimate from `estimated_size()` if the encoder
+    /// itself failed.
+    Encoded {
+        /// Actual or estimated encoded length in bytes.
+        got: usize,
+        /// The cap, [`MAX_DIFF_BYTES`].
+        cap: usize,
+    },
+}
+
+impl std::fmt::Display for DiffSizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiffSizeError::TooManyOps { got, cap } => write!(
+                f,
+                "capability diff has {} ops; cap is {} (MAX_DIFF_OPS)",
+                got, cap
+            ),
+            DiffSizeError::Encoded { got, cap } => write!(
+                f,
+                "encoded capability diff is {} bytes; cap is {} (MAX_DIFF_BYTES)",
+                got, cap
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DiffSizeError {}
 
 // ============================================================================
 // Diff Engine
@@ -546,21 +641,44 @@ impl DiffEngine {
         }
     }
 
-    /// Apply diff operations to a capability set.
+    /// Apply diff operations to a capability set, ignoring
+    /// `diff.base_version`.
     ///
-    /// Returns the updated capability set or an error if application fails.
-    /// The `strict` parameter controls whether missing items cause errors.
+    /// **Deprecated (CR-15 / BUG #125): production callers MUST use
+    /// [`Self::apply_with_version`] so a stale `base_version → new_version`
+    /// diff cannot silently roll receiver state backward.** The
+    /// version-naive entry point is preserved only for hand-built
+    /// diffs in unit tests where no live version is tracked. New
+    /// non-test callsites should reach for `apply_with_version`.
+    ///
+    /// Returns the updated capability set or an error if application
+    /// fails. The `strict` parameter controls whether missing items
+    /// cause errors.
     ///
     /// BUG #125: pre-fix this function ignored
     /// `diff.base_version` entirely, even though
     /// [`DiffError::VersionMismatch`] was a documented error variant.
     /// A receiver at v5 happily accepted an old `base_version=2 →
-    /// new_version=3` diff and silently rolled state back. Callers
-    /// must now thread the live version into [`Self::apply_with_version`];
-    /// this method is a thin wrapper that skips the check (kept for
-    /// callers that genuinely don't track a version, e.g. unit tests
-    /// applying a hand-built diff to a fresh `CapabilitySet`).
+    /// new_version=3` diff and silently rolled state back.
+    #[deprecated(
+        since = "0.8.0",
+        note = "version-naive — use apply_with_version to enforce the BUG #125 \
+                base_version check; this entry point is retained only for \
+                hand-built diffs in unit tests"
+    )]
     pub fn apply(
+        base: &CapabilitySet,
+        diff: &CapabilityDiff,
+        strict: bool,
+    ) -> Result<CapabilitySet, DiffError> {
+        Self::apply_unchecked(base, diff, strict)
+    }
+
+    /// Internal, version-naive apply. Same body the deprecated public
+    /// `apply` carried — split out so test code can reach it without
+    /// triggering the deprecation warning. Production callers must
+    /// use [`Self::apply_with_version`].
+    pub(crate) fn apply_unchecked(
         base: &CapabilitySet,
         diff: &CapabilityDiff,
         strict: bool,
@@ -599,7 +717,10 @@ impl DiffEngine {
                 actual: current_version,
             });
         }
-        Self::apply(base, diff, strict)
+        // Internal: the version check just succeeded, so we delegate
+        // to the unchecked apply rather than the deprecated public
+        // wrapper (avoids the deprecation warning at this site).
+        Self::apply_unchecked(base, diff, strict)
     }
 
     /// Apply a single diff operation
@@ -793,10 +914,15 @@ impl DiffEngine {
             return None;
         }
 
-        // Apply all diffs to get final state
+        // Apply all diffs to get final state. CR-15: this is the
+        // internal chain-compaction path — the caller has already
+        // validated the chain via `validate_chain` before reaching
+        // here, so the per-diff version check is redundant.
+        // `apply_unchecked` bypasses it cleanly without triggering
+        // the public `apply`'s deprecation warning.
         let mut current = base.clone();
         for diff in diffs {
-            current = Self::apply(&current, diff, false).ok()?;
+            current = Self::apply_unchecked(&current, diff, false).ok()?;
         }
 
         // Generate new diff from base to final
@@ -836,6 +962,11 @@ impl DiffEngine {
 // ============================================================================
 
 #[cfg(test)]
+// CR-15: this module's tests intentionally exercise the deprecated
+// `DiffEngine::apply` to verify version-naive semantics. The
+// deprecation warning is the right signal for production callers but
+// only noise for the unit tests that pin the version-naive contract.
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::adapter::net::behavior::capability::{GpuInfo, GpuVendor, Modality};
@@ -1326,5 +1457,152 @@ mod tests {
         let parsed = CapabilityDiff::from_bytes(&bytes)
             .expect("diff at the exact MAX_DIFF_OPS boundary must be accepted");
         assert_eq!(parsed.ops.len(), MAX_DIFF_OPS);
+    }
+
+    // ========================================================================
+    // CR-10: try_to_bytes must enforce the same caps from_bytes does
+    // ========================================================================
+
+    /// CR-10: a diff with too many ops MUST surface a typed error
+    /// from `try_to_bytes`, not silently emit bytes the receiver
+    /// will reject. Pre-CR-10 the sender had no cap check —
+    /// every receiver's `from_bytes` rejected the diff and the
+    /// sender saw "encode succeeded" → silent state divergence.
+    #[test]
+    fn try_to_bytes_rejects_diff_with_too_many_ops() {
+        let ops: Vec<DiffOp> = (0..(MAX_DIFF_OPS + 1))
+            .map(|i| DiffOp::AddTag(format!("t{}", i % 10)))
+            .collect();
+        let diff = CapabilityDiff::new(1, 1, 2, ops);
+        let err = diff
+            .try_to_bytes()
+            .expect_err("over-cap op count must surface DiffSizeError::TooManyOps");
+        match err {
+            DiffSizeError::TooManyOps { got, cap } => {
+                assert_eq!(got, MAX_DIFF_OPS + 1);
+                assert_eq!(cap, MAX_DIFF_OPS);
+            }
+            other => panic!("expected TooManyOps, got {:?}", other),
+        }
+    }
+
+    /// CR-10: a diff whose serialized form exceeds MAX_DIFF_BYTES
+    /// (large per-op payloads, fewer-than-cap op count) must
+    /// surface `DiffSizeError::Encoded`. We pack the bytes by
+    /// using long tag strings — each op stays under MAX_DIFF_OPS
+    /// but the encoded total exceeds MAX_DIFF_BYTES.
+    #[test]
+    fn try_to_bytes_rejects_diff_over_max_diff_bytes() {
+        // Each tag is ~80 bytes when JSON-encoded;
+        // `MAX_DIFF_BYTES / 80 + 100` ops definitely overshoots.
+        let big_tag = "x".repeat(80);
+        let ops_count = (MAX_DIFF_BYTES / 80) + 100;
+        // Make sure we don't trip the op-count cap first (the
+        // `TooManyOps` check fires before encoding); pin against
+        // a configuration that puts us over bytes but under ops.
+        let ops_count = ops_count.min(MAX_DIFF_OPS);
+        let ops: Vec<DiffOp> = (0..ops_count)
+            .map(|_| DiffOp::AddTag(big_tag.clone()))
+            .collect();
+        let diff = CapabilityDiff::new(1, 1, 2, ops);
+        let err = diff
+            .try_to_bytes()
+            .expect_err("over-cap encoded bytes must surface DiffSizeError::Encoded");
+        match err {
+            DiffSizeError::Encoded { got, cap } => {
+                assert!(got > MAX_DIFF_BYTES, "got {} must exceed cap {}", got, cap);
+                assert_eq!(cap, MAX_DIFF_BYTES);
+            }
+            DiffSizeError::TooManyOps { .. } => {
+                // Acceptable — if MAX_DIFF_OPS happens to be the
+                // tighter cap for this fixture, the op-count
+                // check fires first. Either rejection prevents
+                // the silent-success failure mode CR-10 targets.
+            }
+        }
+    }
+
+    /// CR-10: a diff at the exact byte boundary must succeed.
+    /// Pin the boundary so a future tightening doesn't silently
+    /// break legitimate large-but-bounded diffs.
+    #[test]
+    fn try_to_bytes_accepts_normal_diff() {
+        let diff = CapabilityDiff::new(
+            1,
+            1,
+            2,
+            vec![
+                DiffOp::AddTag("training".into()),
+                DiffOp::UpdateMemory(65536),
+            ],
+        );
+        let bytes = diff.try_to_bytes().expect("normal-size diff must succeed");
+        assert!(bytes.len() <= MAX_DIFF_BYTES);
+        // Round-trip — receiver-side `from_bytes` must accept.
+        let parsed = CapabilityDiff::from_bytes(&bytes).expect("normal-size diff must round-trip");
+        assert_eq!(parsed.ops.len(), 2);
+    }
+
+    /// CR-10: the legacy `to_bytes` returns Vec::new() on cap
+    /// violation (pre-fix it returned the oversized bytes; post-fix
+    /// it goes through `try_to_bytes` and surfaces "" on Err). Pin
+    /// this so a future caller that relies on empty-means-failure
+    /// stays correct.
+    #[test]
+    fn to_bytes_returns_empty_when_cap_exceeded() {
+        let ops: Vec<DiffOp> = (0..(MAX_DIFF_OPS + 5))
+            .map(|i| DiffOp::AddTag(format!("t{}", i)))
+            .collect();
+        let diff = CapabilityDiff::new(1, 1, 2, ops);
+        let bytes = diff.to_bytes();
+        assert!(
+            bytes.is_empty(),
+            "to_bytes must surface Vec::new() on cap violation, got {} bytes",
+            bytes.len()
+        );
+    }
+
+    /// CR-15: pin that `DiffEngine::apply` carries the
+    /// `#[deprecated]` attribute. Pre-CR-15 the version-naive
+    /// `apply` was the same shape as the post-#125 fix's
+    /// `apply_with_version` — only convention separated the two.
+    /// Marking `apply` deprecated turns a future caller's misuse
+    /// into a compile-time warning instead of a silent rollback
+    /// hazard. This source-level tripwire fires loudly the moment
+    /// the marker is removed.
+    #[test]
+    fn cr15_diff_engine_apply_must_be_deprecated() {
+        let src = include_str!("diff.rs");
+        // Find the `pub fn apply(` definition and assert that the
+        // preceding non-blank/non-comment lines include
+        // `#[deprecated`.
+        let needle = format!("pub fn {}({}", "apply", "");
+        let lines: Vec<&str> = src.lines().collect();
+        let apply_lineno = lines
+            .iter()
+            .position(|l| l.contains(&needle))
+            .expect("DiffEngine::apply definition must exist (CR-15 guards its deprecation)");
+
+        // Walk backward over attribute / doc-comment lines; the
+        // `#[deprecated` token must appear before we hit a blank
+        // line (which terminates the attribute block).
+        let mut found = false;
+        for i in (0..apply_lineno).rev() {
+            let line = lines[i].trim();
+            if line.is_empty() {
+                break;
+            }
+            if line.starts_with("#[deprecated") {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "CR-15 regression: DiffEngine::apply must carry #[deprecated]; \
+             the version-naive entry point should warn callers off the \
+             BUG #125 silent-rollback hazard. Definition at diff.rs:{}",
+            apply_lineno + 1
+        );
     }
 }

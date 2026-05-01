@@ -1543,4 +1543,96 @@ mod tests {
         let err = parse_poll_request_json(r#"{"limit": 8589934592}"#).unwrap_err();
         assert_eq!(err, c_int::from(NetError::InvalidJson));
     }
+
+    /// CR-22: pin parity between the Rust-side `NetError` enum and
+    /// the two C-header copies (`include/net.h` and
+    /// `bindings/go/net/net.h`). The Rust enum is the source of
+    /// truth; C / Go consumers `errors.Is` against the named codes.
+    /// Pre-CR-22 the headers were missing `-9` (IntOverflow) and
+    /// `-10` (MismatchedHandles); a consumer receiving those values
+    /// would fall into the unknown-code branch and lose actionable
+    /// distinction.
+    ///
+    /// We extract every integer literal that appears as the
+    /// right-hand side of an `= ` token in the file and check
+    /// that each Rust-side value is present in BOTH headers. The
+    /// test does NOT verify symbolic names; the sealing
+    /// constraint is the numeric value alone.
+    #[test]
+    fn cr22_c_header_parity_with_rust_neterror() {
+        let primary = include_str!("../../include/net.h");
+        let go_copy = include_str!("../../bindings/go/net/net.h");
+
+        // The Rust enum's full set of values (mirrors `pub enum
+        // NetError` above). When a new variant is added in the
+        // Rust source, this list — AND both headers — must be
+        // updated together. The asserts that follow then catch a
+        // missing header update at the next CI run.
+        let rust_values: &[i32] = &[0, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -99];
+
+        // Pull every numeric literal that looks like an enum-value
+        // assignment (`= <number>` followed by `,` or whitespace).
+        // Whitespace-tolerant: skips `= 0`, `=  0`, `= -10`, etc.
+        fn extract_assigned_values(src: &str) -> Vec<i32> {
+            let mut out = Vec::new();
+            let mut chars = src.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '=' {
+                    continue;
+                }
+                // Skip whitespace.
+                while let Some(&peek) = chars.peek() {
+                    if peek == ' ' || peek == '\t' {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Optional sign.
+                let mut buf = String::new();
+                if let Some(&peek) = chars.peek() {
+                    if peek == '-' || peek == '+' {
+                        buf.push(peek);
+                        chars.next();
+                    }
+                }
+                // Digits.
+                let mut had_digit = false;
+                while let Some(&peek) = chars.peek() {
+                    if peek.is_ascii_digit() {
+                        buf.push(peek);
+                        chars.next();
+                        had_digit = true;
+                    } else {
+                        break;
+                    }
+                }
+                if had_digit {
+                    if let Ok(v) = buf.parse::<i32>() {
+                        out.push(v);
+                    }
+                }
+            }
+            out
+        }
+
+        let primary_vals = extract_assigned_values(primary);
+        let go_vals = extract_assigned_values(go_copy);
+
+        for &v in rust_values {
+            assert!(
+                primary_vals.contains(&v),
+                "CR-22 regression: include/net.h is missing the value {} \
+                 (Rust NetError defines it). Add the matching `NET_ERR_*` \
+                 enumerator before merging.",
+                v
+            );
+            assert!(
+                go_vals.contains(&v),
+                "CR-22 regression: bindings/go/net/net.h is missing the value {} \
+                 (Rust NetError defines it).",
+                v
+            );
+        }
+    }
 }

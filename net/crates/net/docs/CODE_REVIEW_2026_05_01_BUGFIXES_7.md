@@ -6,6 +6,37 @@ The fixes themselves are mostly high-quality and surgical. This document capture
 
 Each item is tagged `[Critical | High | Medium | Low | Nit]`. Critical items are merge-blockers.
 
+## Status (2026-05-01)
+
+**Ship-blockers: ALL FIXED** (CR-1 through CR-5).
+**High-severity: ALL FIXED** (CR-6 through CR-12).
+**Medium (priority subset): FIXED** (CR-14, CR-15, CR-17, CR-19, CR-20, CR-21, CR-22, CR-31).
+
+| ID | Status | Notes |
+|----|--------|-------|
+| CR-1 | ✅ Fixed | Structured-id comparator in `consumer/merge.rs`; 6 regression tests |
+| CR-2 | ✅ Fixed | `Rc<str>` → `Arc<str>`; PyO3 binding now compiles; 2 regression tests |
+| CR-3 | ✅ Fixed | Python `__init__.py` re-export + `sdk-ts/src/redis-dedup.ts` shim; tests in both languages |
+| CR-4 | ✅ Fixed | `reopen_with_retries` helper; locals-first atomic-swap; 3 regression tests |
+| CR-5 | ✅ Fixed | `IdentityEnvelope::open` v1→v0 AAD fallback; 3 rolling-upgrade tests |
+| CR-6 | ✅ Fixed | `likely_restart` no longer overwrites `n.addr`; security-invariant pin test |
+| CR-7 | ✅ Fixed | `accept()` errors when called after `start()`; integration test |
+| CR-8 | ✅ Fixed | All 5 sister dispatch branches iterate events; source tripwire test |
+| CR-9 | ✅ Fixed | `SchemaType::try_from_slice` with byte-level depth pre-scan; 4 regression tests |
+| CR-10 | ✅ Fixed | `CapabilityDiff::try_to_bytes` returns `Result<_, DiffSizeError>`; 4 regression tests |
+| CR-11 | ✅ Fixed | Per-file `sync_all` after rename + loud_log on Windows no-op; updated test |
+| CR-12 | ✅ Fixed | `tx_key()` accessor and field both removed; source tripwire test |
+| CR-14 | ✅ Fixed | `ContextStore::SlotReservation` RAII guard; sampling-skip + panic-rollback tests |
+| CR-15 | ✅ Fixed | `#[deprecated]` on `DiffEngine::apply` + `apply_unchecked` for internals; source tripwire test |
+| CR-17 | ✅ Documented | `SnapshotStore::remove` ABA limitation pinned with test (deliberate) |
+| CR-19 | ✅ Fixed | `ProbeGuard` RAII type added for async callers; 3 panic-safety tests |
+| CR-20 | ✅ Documented | Inclusive-bounds duplicate-delivery on paginate-by-last-seen-ns pinned (deliberate) |
+| CR-21 | ✅ Fixed | `getrandom` failures abort instead of panic in `context.rs` and `loadbalance.rs`; 2 source tripwires |
+| CR-22 | ✅ Fixed | `include/net.h` and `bindings/go/net/net.h` synced with `-9`/`-10`; parity test |
+| CR-31 | ✅ Fixed | `from_registry` / `capability_tags` parity test now compares ordered Vec (was HashSet) |
+
+The remaining medium / low items (CR-13, CR-16, CR-18, CR-23, CR-24, CR-25, CR-26, CR-27, CR-28, CR-29, CR-30, CR-32, CR-33, CR-34, CR-35) are tracked as follow-ups; none are exploitable in isolation. Total regression tests added across all 20 closed items: 37 across Rust (lib + integration), Python (pytest), and TypeScript (vitest).
+
 ---
 
 ## Ship-blockers

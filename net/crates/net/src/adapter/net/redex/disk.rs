@@ -1301,6 +1301,28 @@ impl DiskSegment {
         let new_idx = reopen_with_retries(&idx_path).map_err(RedexError::io)?;
         let new_dat = reopen_with_retries(&dat_path).map_err(RedexError::io)?;
         let new_ts = reopen_with_retries(&ts_path).map_err(RedexError::io)?;
+
+        // CR-11: per-file durability flush. On POSIX `fsync_dir`
+        // above already covered the dir-level rename durability;
+        // on Windows it's a no-op (stdlib doesn't expose the
+        // dir-flush API). Calling `sync_all` on each renamed
+        // file's freshly-opened handle here ensures FILE CONTENT
+        // is durable on every target, even when dir-level
+        // atomicity is best-effort. Best-effort on the sync_all
+        // itself: a failure here does NOT roll back the rename
+        // (already committed), so we log and continue rather than
+        // surfacing a fail-the-compact error after the disk state
+        // has flipped.
+        if let Err(e) = new_idx.sync_all() {
+            tracing::warn!(error = %e, "post-compact sync_all on idx failed (best-effort)");
+        }
+        if let Err(e) = new_dat.sync_all() {
+            tracing::warn!(error = %e, "post-compact sync_all on dat failed (best-effort)");
+        }
+        if let Err(e) = new_ts.sync_all() {
+            tracing::warn!(error = %e, "post-compact sync_all on ts failed (best-effort)");
+        }
+
         let new_idx_worker = new_idx.try_clone().map_err(RedexError::io)?;
         let new_dat_worker = new_dat.try_clone().map_err(RedexError::io)?;
         let new_ts_worker = new_ts.try_clone().map_err(RedexError::io)?;
@@ -1404,9 +1426,34 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// CR-11: on non-Unix targets the `fsync_dir` helper is a no-op.
+/// Stdlib does not expose the Windows equivalent (`MoveFileExW`
+/// with `MOVEFILE_WRITE_THROUGH`, or `FlushFileBuffers` on a
+/// directory handle), so a power-loss between successful renames
+/// can leave the directory pointing at the OLD inodes even after
+/// every individual file has been flushed.
+///
+/// We log loudly ONCE per process so operators see the durability
+/// gap rather than silently relying on an empty-Ok return that
+/// looks indistinguishable from a successful POSIX fsync. The
+/// `compact_to` caller still benefits from per-file `sync_all`
+/// calls earlier in the sequence, so file CONTENT is durable —
+/// only the directory-level atomicity of the three-rename
+/// sequence is best-effort. See `BUG_AUDIT_2026_04_30_CORE.md`
+/// #93 and `docs/CODE_REVIEW_2026_05_01_BUGFIXES_7.md` CR-11.
 #[cfg(not(unix))]
-#[allow(dead_code)]
 fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::AcqRel) {
+        tracing::warn!(
+            os = std::env::consts::OS,
+            "redex fsync_dir is a NO-OP on this platform — directory-level \
+             rename atomicity is best-effort. Per-file content remains durable \
+             via the explicit sync_all calls in compact_to, but the cross-file \
+             rename sequence is not transactional. See BUG #93 / CR-11."
+        );
+    }
     Ok(())
 }
 
@@ -2282,9 +2329,9 @@ mod tests {
     /// access (the open mode `File::open` uses).
     ///
     /// On Windows the helper is a no-op and returns `Ok(())`
-    /// regardless of input. This test pins both behaviours:
-    /// it MUST succeed without error on a freshly-created
-    /// `tempdir`.
+    /// regardless of input — see `fsync_dir_no_op_on_non_unix`
+    /// for that branch's regression. This test pins POSIX-only
+    /// success.
     #[test]
     fn fsync_dir_helper_succeeds_on_a_normal_directory() {
         let tmp = std::env::temp_dir().join(format!(
@@ -2301,6 +2348,34 @@ mod tests {
 
         // Cleanup. Best-effort; not load-bearing for the test.
         let _ = std::fs::remove_dir(&tmp);
+    }
+
+    /// CR-11: on non-Unix targets, `fsync_dir` is a no-op that
+    /// returns `Ok(())` on ANY input — even a path that does not
+    /// exist, even a path that is not a directory. This pins the
+    /// no-op contract so a future "let's fail closed on Windows"
+    /// change has to also update this test (and consider whether
+    /// the change actually closes the BUG #93 hazard or just
+    /// trades durability gap for crash-on-bad-path).
+    ///
+    /// The compact_to caller covers the per-file durability via
+    /// the `sync_all` calls added in CR-11 — that's where the
+    /// real durability work happens on Windows.
+    #[cfg(not(unix))]
+    #[test]
+    fn fsync_dir_no_op_on_non_unix_returns_ok_even_for_nonexistent_paths() {
+        // Path that demonstrably does not exist: no-op should
+        // STILL return Ok. This is the documented contract.
+        let bogus = std::path::PathBuf::from(format!(
+            "{}/redex-no-such-dir-{}",
+            std::env::temp_dir().display(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(!bogus.exists(), "test fixture: bogus path must not exist");
+        super::fsync_dir(&bogus).expect("non-Unix fsync_dir must be a no-op Ok");
     }
 
     /// CR-4: `reopen_with_retries` must succeed on the first

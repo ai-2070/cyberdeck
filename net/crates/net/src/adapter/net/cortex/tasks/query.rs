@@ -337,6 +337,57 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3]);
     }
 
+    /// CR-20: pin the symmetric duplicate-delivery hazard the
+    /// BUG #142 inclusive-bound fix introduced. The fix made
+    /// `created_after(N)` inclusive (`>=`) so a `created_ns == N`
+    /// event isn't dropped by both halves of a `[after, before]`
+    /// pagination range. But the symmetric paginate-by-cutoff
+    /// case re-delivers the boundary:
+    ///
+    ///   poll_1: query.created_after(0) → returns events at ns=100, 200
+    ///           caller stores `last_seen_ns = 200`
+    ///   poll_2: query.created_after(200) → returns event at ns=200 AGAIN
+    ///                                       (because >= 200 is inclusive)
+    ///
+    /// Receiver-side dedup by `id` masks the duplicate today, but
+    /// a same-ns legitimate update (real secondary write at the
+    /// boundary timestamp) collides with the prior event under
+    /// the same id. This test pins the documented symmetric-
+    /// duplicate behavior so a future paginate-helper that uses
+    /// `last_seen_ns` as the next cutoff knows to advance by
+    /// `last_seen_ns + 1` (or to switch to id-based cursors).
+    #[test]
+    fn cr20_paginate_by_last_seen_ns_re_delivers_boundary_event() {
+        let s = sample();
+
+        // First "page": everything created at or after ns=100.
+        let page_1: Vec<_> = s.query().created_after(100).collect();
+        let last_seen = page_1
+            .iter()
+            .map(|t| t.created_ns)
+            .max()
+            .expect("non-empty result");
+
+        // Caller stores `last_seen` and uses it as the next
+        // page's cutoff — naive paginator pattern.
+        let page_2: Vec<_> = s.query().created_after(last_seen).collect();
+
+        // CR-20: the boundary event at `created_ns == last_seen`
+        // is RE-DELIVERED. This is the symmetric hazard the
+        // BUG #142 fix introduced.
+        let boundary_count = page_2.iter().filter(|t| t.created_ns == last_seen).count();
+        assert!(
+            boundary_count >= 1,
+            "CR-20: with inclusive `created_after`, paginating by \
+             last_seen_ns re-delivers the boundary event. The naive \
+             paginator pattern (`cutoff = last_seen_ns`) MUST advance \
+             past the boundary explicitly (e.g. `cutoff = last_seen_ns + \
+             1`) or use an id-based cursor instead. This test pins the \
+             documented behavior — fix it only if you also update the \
+             paginate-helper docs and the receiver-side dedup expectations."
+        );
+    }
+
     #[test]
     fn test_updated_after_and_before() {
         let s = sample();

@@ -72,12 +72,27 @@ pub const CONTINUITY_PROOF_SIZE: usize = 36; // 4 + 8 + 8 + 8 + 8
 /// walk between `from_seq` and `to_seq` (inclusive). Without this
 /// cap, a peer could ship a proof spanning `[0, u64::MAX]` and force
 /// the verifier into a multi-billion-event walk on every dispatch.
-/// 1M is far past any realistic single-proof span (snapshots prune
-/// the chain to a small replay tail; long-lived chains use
-/// snapshot-anchored proofs that span far less than 1M events) and
-/// bounds verification cost at a fixed multiple of the chain's
-/// memory footprint. (BUG #98)
-pub const MAX_PROOF_VERIFY_SPAN: u64 = 1_000_000;
+///
+/// CR-13: tightened from 1M to 100K. At ~100ns per event for the
+/// xxh3-over-(link + payload) hash recomputation, 100K events ≈
+/// 10ms of synchronous CPU per call — bounded enough that a peer
+/// who fires verify-requests at line rate cannot exhaust the
+/// verifier's CPU budget before backpressure kicks in. 1M was an
+/// unintentional 100ms-CPU-per-call attack surface; the new value
+/// is still well past any realistic single-proof span (snapshots
+/// prune the chain to a small replay tail, and long-lived chains
+/// use snapshot-anchored proofs that span far less than 100K events).
+///
+/// **Caller contract (CR-13):** `verify_against` is itself bounded
+/// at this cap, but a peer can still trigger up to ~10ms of CPU
+/// per call. Production callers MUST rate-limit verify-requests
+/// per remote peer (e.g. token-bucket on inbound continuity-proof
+/// frames) to prevent N peers × line-rate from saturating the
+/// verifier. The structural cap below bounds per-call cost; the
+/// per-peer rate limit bounds aggregate cost.
+///
+/// (BUG #98 + CR-13)
+pub const MAX_PROOF_VERIFY_SPAN: u64 = 100_000;
 
 impl ContinuityProof {
     /// Extract a proof from a local entity log.
@@ -940,6 +955,31 @@ mod tests {
             matches!(result, Err(ProofError::SpanTooLarge { .. })),
             "verify_against must reject spans over MAX_PROOF_VERIFY_SPAN (BUG #98), got {:?}",
             result,
+        );
+    }
+
+    /// CR-13: pin the tightened cap value. Pre-CR-13 the cap was
+    /// 1_000_000 — at ~100ns per event (xxh3 over link + payload),
+    /// a peer firing verify-requests at line rate could force
+    /// ~100ms of synchronous CPU per call, exhausting the
+    /// verifier's CPU budget before backpressure kicked in. The
+    /// new cap of 100_000 caps per-call cost at ~10ms; the per-
+    /// peer rate-limit contract documented on the constant
+    /// bounds aggregate cost.
+    ///
+    /// This test fires loudly the moment someone raises the cap
+    /// back without re-evaluating the per-peer rate-limit
+    /// contract.
+    #[test]
+    fn cr13_max_proof_verify_span_is_capped_at_100k() {
+        assert_eq!(
+            MAX_PROOF_VERIFY_SPAN, 100_000,
+            "CR-13: MAX_PROOF_VERIFY_SPAN must stay at 100_000. \
+             Raising it requires re-evaluating the per-peer rate-limit \
+             contract documented on the constant — at ~100ns per event, \
+             a 1M cap is a 100ms-CPU-per-call attack surface. If you're \
+             increasing this for legitimate reasons, also document the \
+             updated per-peer rate-limit requirement and bump the test."
         );
     }
 

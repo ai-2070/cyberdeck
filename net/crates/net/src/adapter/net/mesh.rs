@@ -1766,7 +1766,35 @@ impl MeshNode {
     ///
     /// Waits for an incoming handshake packet and completes the handshake.
     /// Returns the peer's address and assigns the given node_id.
+    ///
+    /// # Ordering contract (CR-7)
+    ///
+    /// `accept()` MUST be called before [`Self::start()`]. Once
+    /// `start()` has spawned the dispatch loop, the dispatcher
+    /// consumes every inbound UDP datagram from the shared socket;
+    /// `try_handshake_responder` polls the same socket directly and
+    /// races the dispatcher for incoming msg1 packets. Because no
+    /// per-pending-responder registry exists today (initiator-side
+    /// handshakes use one — see `pending_direct_initiators` at
+    /// `mesh.rs:~1216`; the responder side is a deferred design item),
+    /// a `start() → accept()` ordering produces a swallowed msg1 and
+    /// a hang. To prevent that hang silently turning into a debugging
+    /// nightmare, calling `accept()` after `start()` now returns an
+    /// explicit error rather than spinning forever.
     pub async fn accept(&self, peer_node_id: u64) -> Result<(SocketAddr, u64), AdapterError> {
+        // CR-7: refuse if `start()` has already spawned the
+        // dispatch loop. The Acquire load pairs with the AcqRel
+        // swap in `start()` so we observe `started == true`
+        // strictly after the dispatcher has been published.
+        if self.started.load(Ordering::Acquire) {
+            return Err(AdapterError::Fatal(
+                "Mesh::accept called after start() — the dispatch loop is already \
+                 consuming inbound packets and would race the responder handshake. \
+                 Call accept() for every peer BEFORE invoking start(). See CR-7 / \
+                 BUG #86 for the responder-side handshake-race contract."
+                    .into(),
+            ));
+        }
         let (keys, peer_addr) = self.handshake_responder(peer_node_id).await?;
 
         let remote_static_pub = keys.remote_static_pub;
@@ -2760,91 +2788,112 @@ impl MeshNode {
             // `ArcSwapOption::load` — lock-free on the hot path.
             let handler_guard = ctx.migration_handler.load();
             if let Some(handler) = handler_guard.as_ref() {
-                // Extract the payload from the event frame wrapper
+                // Extract the payload(s) from the event frame wrapper.
+                //
+                // CR-8: pre-fix used `events.into_iter().next()` —
+                // dropping every payload past the first. The
+                // protocol design is single-event-per-frame, but
+                // the wire format permits multi-event, so a hostile
+                // (or buggy) peer batching multiple migration
+                // messages into one frame would silently lose
+                // every message past the first. We now iterate
+                // and log a warning for the (anomalous) multi-event
+                // case so operators see the protocol violation
+                // rather than a silent stall.
                 let events =
                     EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-                let payload = match events.into_iter().next() {
-                    Some(data) => data,
-                    None => return,
-                };
+                if events.is_empty() {
+                    return;
+                }
+                if events.len() > 1 {
+                    tracing::warn!(
+                        n = events.len(),
+                        from_node = from_node,
+                        "migration subprotocol received multi-event frame \
+                         (protocol design is single-event per frame); \
+                         processing each message in order"
+                    );
+                }
 
-                match handler.handle_message(&payload, from_node) {
-                    Ok(outbound) => {
-                        // BFS queue: self-destined messages loop back
-                        // through the dispatcher in-place; any output
-                        // the loopback produces joins the same queue
-                        // so remote-bound follow-ups reach the socket.
-                        //
-                        // The 2-node case where orchestrator and
-                        // source/target share a node uses this path —
-                        // `peers.get(&local_node_id)` is None, so the
-                        // loopback short-circuit is the only way a
-                        // self-destined wire message gets dispatched.
-                        //
-                        // Regression (Cubic-AI P1): the earlier
-                        // implementation `tokio::spawn`ed each
-                        // loopback with a fire-and-forget closure,
-                        // discarding `handle_message`'s return value.
-                        // Any outbound produced by the loopback —
-                        // including remote-bound messages that should
-                        // have ridden the wire — disappeared, wedging
-                        // state transitions whenever a self-bounce
-                        // chained into a further reply. The in-place
-                        // queue preserves all downstream messages.
-                        //
-                        // Handler work is synchronous and cheap; doing
-                        // it on the receive-loop task is fine.
-                        let mut pending: std::collections::VecDeque<_> = outbound.into();
-                        while let Some(msg) = pending.pop_front() {
-                            if msg.dest_node == ctx.local_node_id {
-                                match handler.handle_message(&msg.payload, ctx.local_node_id) {
-                                    Ok(more) => pending.extend(more),
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "migration handler loopback error",
-                                        );
+                for payload in events {
+                    match handler.handle_message(&payload, from_node) {
+                        Ok(outbound) => {
+                            // BFS queue: self-destined messages loop back
+                            // through the dispatcher in-place; any output
+                            // the loopback produces joins the same queue
+                            // so remote-bound follow-ups reach the socket.
+                            //
+                            // The 2-node case where orchestrator and
+                            // source/target share a node uses this path —
+                            // `peers.get(&local_node_id)` is None, so the
+                            // loopback short-circuit is the only way a
+                            // self-destined wire message gets dispatched.
+                            //
+                            // Regression (Cubic-AI P1): the earlier
+                            // implementation `tokio::spawn`ed each
+                            // loopback with a fire-and-forget closure,
+                            // discarding `handle_message`'s return value.
+                            // Any outbound produced by the loopback —
+                            // including remote-bound messages that should
+                            // have ridden the wire — disappeared, wedging
+                            // state transitions whenever a self-bounce
+                            // chained into a further reply. The in-place
+                            // queue preserves all downstream messages.
+                            //
+                            // Handler work is synchronous and cheap; doing
+                            // it on the receive-loop task is fine.
+                            let mut pending: std::collections::VecDeque<_> = outbound.into();
+                            while let Some(msg) = pending.pop_front() {
+                                if msg.dest_node == ctx.local_node_id {
+                                    match handler.handle_message(&msg.payload, ctx.local_node_id) {
+                                        Ok(more) => pending.extend(more),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "migration handler loopback error",
+                                            );
+                                        }
                                     }
-                                }
-                                continue;
-                            }
-                            let dest_session = ctx
-                                .peers
-                                .get(&msg.dest_node)
-                                .map(|e| (e.value().addr, e.value().session.clone()));
-
-                            if let Some((dest_addr, dest_sess)) = dest_session {
-                                // Respect partition filter on outbound path
-                                if ctx.partition_filter.contains(&dest_addr) {
                                     continue;
                                 }
-                                let socket = ctx.socket.clone();
-                                let payload = Bytes::from(msg.payload);
-                                tokio::spawn(async move {
-                                    let pool = dest_sess.thread_local_pool();
-                                    let mut builder = pool.get();
-                                    let seq = {
-                                        let stream = dest_sess
-                                            .get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
-                                        stream.next_tx_seq()
-                                    };
-                                    let events = vec![payload];
-                                    let packet = builder.build_subprotocol(
-                                        SUBPROTOCOL_MIGRATION as u64,
-                                        seq,
-                                        &events,
-                                        PacketFlags::NONE,
-                                        SUBPROTOCOL_MIGRATION,
-                                    );
-                                    let _ = socket.send_to(&packet, dest_addr).await;
-                                });
+                                let dest_session = ctx
+                                    .peers
+                                    .get(&msg.dest_node)
+                                    .map(|e| (e.value().addr, e.value().session.clone()));
+
+                                if let Some((dest_addr, dest_sess)) = dest_session {
+                                    // Respect partition filter on outbound path
+                                    if ctx.partition_filter.contains(&dest_addr) {
+                                        continue;
+                                    }
+                                    let socket = ctx.socket.clone();
+                                    let payload = Bytes::from(msg.payload);
+                                    tokio::spawn(async move {
+                                        let pool = dest_sess.thread_local_pool();
+                                        let mut builder = pool.get();
+                                        let seq = {
+                                            let stream = dest_sess
+                                                .get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
+                                            stream.next_tx_seq()
+                                        };
+                                        let events = vec![payload];
+                                        let packet = builder.build_subprotocol(
+                                            SUBPROTOCOL_MIGRATION as u64,
+                                            seq,
+                                            &events,
+                                            PacketFlags::NONE,
+                                            SUBPROTOCOL_MIGRATION,
+                                        );
+                                        let _ = socket.send_to(&packet, dest_addr).await;
+                                    });
+                                }
                             }
                         }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "migration handler error");
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "migration handler error");
-                    }
-                }
+                } // end CR-8 for payload in events
                 return; // handler processed it
             }
             // No handler set — synthesize a `ComputeNotSupported`
@@ -2855,8 +2904,14 @@ impl MeshNode {
             // `SnapshotReady`) — other inbound types arrive only
             // mid-migration, and a migration can't be mid-state
             // against a node that has no compute runtime.
+            //
+            // CR-8: iterate every event in the frame so a
+            // multi-event migration packet (protocol violation, but
+            // possible on the wire) gets one reply per request
+            // rather than one for the first and silent drops for
+            // the rest.
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            if let Some(payload) = events.into_iter().next() {
+            for payload in events {
                 if let Some(reply) = synthesize_compute_not_supported_reply(&payload) {
                     let dest_session = ctx
                         .peers
@@ -2938,14 +2993,17 @@ impl MeshNode {
         }
 
         // Channel membership: Subscribe / Unsubscribe / Ack.
+        //
+        // CR-8: pre-fix used `events.into_iter().next()`, dropping
+        // every membership op past the first when a peer batched
+        // multiple Subscribe/Unsubscribe events into one frame.
+        // Each membership op is independent and idempotent on the
+        // receiver, so iterating is structurally safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_CHANNEL_MEMBERSHIP {
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            let payload = match events.into_iter().next() {
-                Some(data) => data,
-                None => return,
-            };
-
-            // Resolve the sender's node_id from the session they arrived on.
+            if events.is_empty() {
+                return;
+            }
             let from_node = ctx
                 .peers
                 .iter()
@@ -2953,18 +3011,26 @@ impl MeshNode {
                 .map(|e| e.value().node_id)
                 .unwrap_or(0);
 
-            Self::handle_membership_message(&payload, from_node, ctx);
+            for payload in events {
+                Self::handle_membership_message(&payload, from_node, ctx);
+            }
             return;
         }
 
         // Capability announcement: signed, versioned capability metadata.
         // Feeds the local `CapabilityIndex`; never responded to.
+        //
+        // CR-8: pre-fix used `events.into_iter().next()`, dropping
+        // every announcement past the first when a peer batched
+        // multiple capability updates into one frame. Each
+        // announcement is independently signed and version-skip
+        // safe on the index side, so iterating is structurally
+        // safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_CAPABILITY_ANN {
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            let Some(payload) = events.into_iter().next() else {
+            if events.is_empty() {
                 return;
-            };
-
+            }
             let from_node = ctx
                 .peers
                 .iter()
@@ -2972,7 +3038,9 @@ impl MeshNode {
                 .map(|e| e.value().node_id)
                 .unwrap_or(0);
 
-            Self::handle_capability_announcement(&payload, from_node, ctx);
+            for payload in events {
+                Self::handle_capability_announcement(&payload, from_node, ctx);
+            }
             return;
         }
 
@@ -2985,11 +3053,9 @@ impl MeshNode {
         if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_REFLEX {
             use super::traversal::reflex;
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            let payload = events.into_iter().next().unwrap_or_default();
-            let Some(msg) = reflex::decode(&payload) else {
+            if events.is_empty() {
                 return;
-            };
-
+            }
             let from_node = ctx
                 .peers
                 .iter()
@@ -3000,51 +3066,64 @@ impl MeshNode {
                 return;
             }
 
-            match msg {
-                reflex::ReflexMsg::Request => {
-                    // Echo the observed source address back. Source
-                    // is read from `PeerInfo.addr` — the last
-                    // address our kernel saw packets from this peer
-                    // arrive on, equivalent to a STUN server's
-                    // "observed source" because NAT-rewriting is
-                    // applied by the time packets reach our socket.
-                    let Some((dest_addr, dest_sess)) = ctx
-                        .peers
-                        .get(&from_node)
-                        .map(|e| (e.value().addr, e.value().session.clone()))
-                    else {
-                        return;
-                    };
-                    if ctx.partition_filter.contains(&dest_addr) {
-                        return;
-                    }
-                    let response = reflex::encode_response(dest_addr);
-                    let socket = ctx.socket.clone();
-                    tokio::spawn(async move {
-                        let pool = dest_sess.thread_local_pool();
-                        let mut builder = pool.get();
-                        let seq = {
-                            let stream = dest_sess
-                                .get_or_create_stream(super::traversal::SUBPROTOCOL_REFLEX as u64);
-                            stream.next_tx_seq()
+            // CR-8: iterate every event in the frame. Pre-fix the
+            // dispatcher used `events.into_iter().next()` and
+            // dropped every reflex message past the first when a
+            // peer batched multiple probes into one packet.
+            // Reflex Request/Response are each independent so
+            // multi-event handling is structurally safe.
+            for payload in events {
+                let Some(msg) = reflex::decode(&payload) else {
+                    continue;
+                };
+                match msg {
+                    reflex::ReflexMsg::Request => {
+                        // Echo the observed source address back. Source
+                        // is read from `PeerInfo.addr` — the last
+                        // address our kernel saw packets from this peer
+                        // arrive on, equivalent to a STUN server's
+                        // "observed source" because NAT-rewriting is
+                        // applied by the time packets reach our socket.
+                        let Some((dest_addr, dest_sess)) = ctx
+                            .peers
+                            .get(&from_node)
+                            .map(|e| (e.value().addr, e.value().session.clone()))
+                        else {
+                            continue;
                         };
-                        let events = vec![response];
-                        let packet = builder.build_subprotocol(
-                            super::traversal::SUBPROTOCOL_REFLEX as u64,
-                            seq,
-                            &events,
-                            PacketFlags::NONE,
-                            super::traversal::SUBPROTOCOL_REFLEX,
-                        );
-                        let _ = socket.send_to(&packet, dest_addr).await;
-                    });
-                }
-                reflex::ReflexMsg::Response(observed) => {
-                    // Complete the pending probe (if any). A probe
-                    // that already timed out has no oneshot entry;
-                    // the late response is dropped silently.
-                    if let Some((_, (_gen, tx))) = ctx.pending_reflex_probes.remove(&from_node) {
-                        let _ = tx.send(observed);
+                        if ctx.partition_filter.contains(&dest_addr) {
+                            continue;
+                        }
+                        let response = reflex::encode_response(dest_addr);
+                        let socket = ctx.socket.clone();
+                        tokio::spawn(async move {
+                            let pool = dest_sess.thread_local_pool();
+                            let mut builder = pool.get();
+                            let seq = {
+                                let stream = dest_sess.get_or_create_stream(
+                                    super::traversal::SUBPROTOCOL_REFLEX as u64,
+                                );
+                                stream.next_tx_seq()
+                            };
+                            let events = vec![response];
+                            let packet = builder.build_subprotocol(
+                                super::traversal::SUBPROTOCOL_REFLEX as u64,
+                                seq,
+                                &events,
+                                PacketFlags::NONE,
+                                super::traversal::SUBPROTOCOL_REFLEX,
+                            );
+                            let _ = socket.send_to(&packet, dest_addr).await;
+                        });
+                    }
+                    reflex::ReflexMsg::Response(observed) => {
+                        // Complete the pending probe (if any). A probe
+                        // that already timed out has no oneshot entry;
+                        // the late response is dropped silently.
+                        if let Some((_, (_gen, tx))) = ctx.pending_reflex_probes.remove(&from_node)
+                        {
+                            let _ = tx.send(observed);
+                        }
                     }
                 }
             }
@@ -3065,11 +3144,9 @@ impl MeshNode {
         if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_RENDEZVOUS {
             use super::traversal::rendezvous;
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            let payload = events.into_iter().next().unwrap_or_default();
-            let Some(msg) = rendezvous::decode(&payload) else {
+            if events.is_empty() {
                 return;
-            };
-
+            }
             let from_node = ctx
                 .peers
                 .iter()
@@ -3080,43 +3157,57 @@ impl MeshNode {
                 return;
             }
 
-            match msg {
-                rendezvous::RendezvousMsg::PunchRequest(req) => {
-                    Self::handle_punch_request(from_node, req, ctx);
-                }
-                rendezvous::RendezvousMsg::PunchIntroduce(intro) => {
-                    // Endpoint side of the rendezvous. Complete
-                    // any installed observer waiter (for tests /
-                    // explicit awaits), then schedule the
-                    // keep-alive train + observer. The
-                    // `PunchAck` fires only once the observer
-                    // sees inbound traffic from `peer_reflex`
-                    // (or — on localhost — at the punch_deadline
-                    // fallback). Plan §3 endpoint semantics.
-                    if let Some((_, (_gen, tx))) = ctx.pending_punch_introduces.remove(&intro.peer)
-                    {
-                        let _ = tx.send(intro);
+            // CR-8: iterate every event in the frame. Pre-fix the
+            // dispatcher used `events.into_iter().next()` and
+            // dropped every rendezvous message past the first when
+            // a peer batched PunchRequest/PunchIntroduce/PunchAck
+            // into one packet. Each is independent — no cross-event
+            // ordering dependency — so multi-event handling is
+            // structurally safe.
+            for payload in events {
+                let Some(msg) = rendezvous::decode(&payload) else {
+                    continue;
+                };
+                match msg {
+                    rendezvous::RendezvousMsg::PunchRequest(req) => {
+                        Self::handle_punch_request(from_node, req, ctx);
                     }
-                    Self::schedule_punch(from_node, intro, ctx);
-                }
-                rendezvous::RendezvousMsg::PunchAck(ack) => {
-                    if ack.to_peer == ctx.local_node_id {
-                        // Final recipient: complete the correlation
-                        // oneshot keyed by `from_peer`. A late ack
-                        // for an abandoned `connect_direct` is
-                        // dropped silently.
-                        if let Some((_, (_gen, tx))) = ctx.pending_punch_acks.remove(&ack.from_peer)
+                    rendezvous::RendezvousMsg::PunchIntroduce(intro) => {
+                        // Endpoint side of the rendezvous. Complete
+                        // any installed observer waiter (for tests /
+                        // explicit awaits), then schedule the
+                        // keep-alive train + observer. The
+                        // `PunchAck` fires only once the observer
+                        // sees inbound traffic from `peer_reflex`
+                        // (or — on localhost — at the punch_deadline
+                        // fallback). Plan §3 endpoint semantics.
+                        if let Some((_, (_gen, tx))) =
+                            ctx.pending_punch_introduces.remove(&intro.peer)
                         {
-                            let _ = tx.send(ack);
+                            let _ = tx.send(intro);
                         }
-                    } else {
-                        // Coordinator role: forward verbatim to
-                        // `to_peer` via our session with that
-                        // peer. The forwarded ack keeps the same
-                        // bytes — `from_peer` still points at the
-                        // original sender, which is what the
-                        // recipient correlates on.
-                        Self::forward_punch_ack(ack, ctx);
+                        Self::schedule_punch(from_node, intro, ctx);
+                    }
+                    rendezvous::RendezvousMsg::PunchAck(ack) => {
+                        if ack.to_peer == ctx.local_node_id {
+                            // Final recipient: complete the correlation
+                            // oneshot keyed by `from_peer`. A late ack
+                            // for an abandoned `connect_direct` is
+                            // dropped silently.
+                            if let Some((_, (_gen, tx))) =
+                                ctx.pending_punch_acks.remove(&ack.from_peer)
+                            {
+                                let _ = tx.send(ack);
+                            }
+                        } else {
+                            // Coordinator role: forward verbatim to
+                            // `to_peer` via our session with that
+                            // peer. The forwarded ack keeps the same
+                            // bytes — `from_peer` still points at the
+                            // original sender, which is what the
+                            // recipient correlates on.
+                            Self::forward_punch_ack(ack, ctx);
+                        }
                     }
                 }
             }
@@ -7768,6 +7859,48 @@ mod heartbeat_aead_tests {
                  interleave; got {:?} (BUG #106 regression: heartbeats and data \
                  are drawing from independent counters)",
                 counters
+            );
+        }
+    }
+
+    /// CR-8: source-level tripwire pinning that no dispatch
+    /// branch uses `events.into_iter().next()` to drop multi-event
+    /// frames. The original BUG #147 fix only patched
+    /// `SUBPROTOCOL_STREAM_WINDOW`; CR-8 extended the same fix to
+    /// the migration / channel-membership / capability-ann / reflex
+    /// / rendezvous branches. This test scans the file source for
+    /// any new occurrence outside fix-doc comments and fails loudly
+    /// if a future maintainer reintroduces the pattern.
+    ///
+    /// We assemble the forbidden token at runtime so the test's
+    /// own source doesn't trigger itself.
+    #[test]
+    fn cr8_dispatch_must_not_use_single_event_pattern() {
+        // Build the forbidden token from fragments so this test's
+        // source doesn't contain the literal substring.
+        let needle = format!("events.into_iter().{}()", "next");
+
+        let src = include_str!("mesh.rs");
+        for (lineno, line) in src.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // Skip line comments and doc comments — these are
+            // ALLOWED to mention the pre-fix shape (the fix-doc
+            // narratives are load-bearing context for future
+            // maintainers).
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // Skip lines inside doc-string-style comments inside
+            // string literals: we don't try to be too clever here,
+            // since a code line containing `events.into_iter().next()`
+            // outside a comment is the regression we want to catch.
+            assert!(
+                !trimmed.contains(&needle),
+                "CR-8 regression: single-event dispatch pattern reintroduced \
+                 at mesh.rs:{} — multi-event frames will silently drop \
+                 every payload past the first.\n  line: {}",
+                lineno + 1,
+                line
             );
         }
     }

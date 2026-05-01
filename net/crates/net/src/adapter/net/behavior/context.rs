@@ -15,10 +15,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::NodeId;
 
-/// Generate random bytes using getrandom
+/// Generate random bytes using getrandom.
+///
+/// CR-21 / BUG #150: aborts on `getrandom` failure rather than
+/// panic-unwinding through the FFI boundary. Trace IDs are not
+/// directly auth-bearing, but this function is reachable from
+/// hot paths called by `extern "C"` FFI consumers (Python /
+/// Node / Go bindings) — a `getrandom` failure (kernel rng
+/// exhaustion, container-restricted /dev/urandom) would otherwise
+/// unwind across the C ABI = undefined behaviour. `process::abort`
+/// is `extern "C"`-safe (terminates rather than unwinds) and
+/// loss-of-availability is the only safe response when the
+/// system can't produce randomness.
 fn random_u64() -> u64 {
     let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).expect("getrandom failed");
+    if let Err(e) = getrandom::fill(&mut bytes) {
+        eprintln!(
+            "FATAL: behavior::context::random_u64 getrandom failure ({e:?}); \
+             aborting to avoid panic across the FFI boundary"
+        );
+        std::process::abort();
+    }
     u64::from_le_bytes(bytes)
 }
 
@@ -821,15 +838,26 @@ impl ContextStore {
     }
 
     /// Atomically reserve a slot if `active_count < max_traces`.
-    /// Returns `true` on success (caller must follow up with a real
-    /// insert + decrement on failure), `false` when the cap is
-    /// already full. This is the BUG #136 admission gate — pre-fix
-    /// the check was `dashmap.len() >= max`, which lost the race
-    /// against concurrent inserters.
-    fn try_reserve_slot(&self) -> bool {
+    ///
+    /// CR-14: returns an [`Option<SlotReservation<'_>>`]; the
+    /// `Some` arm carries an RAII guard whose `Drop` releases the
+    /// reservation automatically. The success-path caller MUST
+    /// invoke [`SlotReservation::commit`] to keep the slot once the
+    /// matching insert lands. Any other exit (early return, error,
+    /// panic between reserve and insert) drops the guard, which
+    /// undoes the reservation atomically. Pre-CR-14 the bookkeeping
+    /// was a `bool` return and a manual `release_slot` call on each
+    /// failure path — easy to miss, leaking a slot permanently
+    /// across an `active_count` underflow guard.
+    ///
+    /// This is the BUG #136 admission gate — pre-#136 the check
+    /// was `dashmap.len() >= max`, which lost the race against
+    /// concurrent inserters.
+    fn try_reserve_slot(&self) -> Option<SlotReservation<'_>> {
         use std::sync::atomic::Ordering;
         // Fetch-update CAS loop: only commit if `cur < max`.
-        self.active_count
+        let ok = self
+            .active_count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 if cur < self.max_traces {
                     Some(cur + 1)
@@ -837,12 +865,20 @@ impl ContextStore {
                     None
                 }
             })
-            .is_ok()
+            .is_ok();
+        if ok {
+            Some(SlotReservation { store: self })
+        } else {
+            None
+        }
     }
 
-    /// Release a slot reserved by `try_reserve_slot` — call this on
-    /// the failure path of an insert that aborts after reserving,
-    /// or after a successful eviction.
+    /// Release a slot reserved by `try_reserve_slot` — used for the
+    /// post-insert duplicate-trace-id detection path in
+    /// `continue_context` (where the reservation is committed but
+    /// the matching insert turned out to be a no-op overwrite of
+    /// an existing entry). Most callers should rely on
+    /// [`SlotReservation`]'s automatic Drop release instead.
     fn release_slot(&self) {
         use std::sync::atomic::Ordering;
         self.active_count
@@ -851,7 +887,51 @@ impl ContextStore {
             })
             .ok();
     }
+}
 
+/// CR-14: RAII guard returned by [`ContextStore::try_reserve_slot`].
+/// The Drop impl decrements `active_count` UNLESS [`Self::commit`]
+/// was called first (which `mem::forget`-equivalent the guard, so
+/// no decrement runs).
+///
+/// Pattern:
+/// ```ignore
+/// let guard = self.try_reserve_slot()?;       // reserve
+/// // ... do work that may panic / early-return ...
+/// // success path:
+/// guard.commit();                              // keep the slot
+/// ```
+///
+/// On any non-commit exit (panic, error, early return) the slot
+/// reservation is rolled back automatically — the BUG #136
+/// admission cap stays accurate even when the matching insert
+/// never lands.
+pub(super) struct SlotReservation<'a> {
+    store: &'a ContextStore,
+}
+
+impl<'a> SlotReservation<'a> {
+    /// Forget the guard so its Drop does NOT release the slot.
+    /// Call this only on the success path AFTER the matching
+    /// insert has landed.
+    fn commit(self) {
+        // `mem::forget` skips the Drop impl; the reserved slot
+        // stays counted against `active_count`, where it
+        // correctly reflects the live entry.
+        std::mem::forget(self);
+    }
+}
+
+impl<'a> Drop for SlotReservation<'a> {
+    fn drop(&mut self) {
+        // Roll back the reservation. `release_slot` is itself
+        // saturating so a double-Drop (which `mem::forget`
+        // already prevents structurally) would not underflow.
+        self.store.release_slot();
+    }
+}
+
+impl ContextStore {
     /// Override the default sampling strategy for this store
     pub fn with_sampling(mut self, strategy: SamplingStrategy) -> Self {
         self.sampler = Sampler::new(strategy);
@@ -869,14 +949,24 @@ impl ContextStore {
     /// the insert; if the reserve fails after a `cleanup_expired`
     /// retry, we surface `CapacityExceeded`.
     pub fn create_context(&self, origin_node: NodeId) -> Result<Context, ContextError> {
-        // First reserve; on failure, run cleanup_expired and retry once.
-        if !self.try_reserve_slot() {
-            self.cleanup_expired();
-            if !self.try_reserve_slot() {
-                self.dropped_count.fetch_add(1, Ordering::Relaxed);
-                return Err(ContextError::CapacityExceeded);
+        // CR-14: hold the reservation as a RAII guard. Any path
+        // out before `guard.commit()` (early return, panic in
+        // `Context::new` / `should_sample`, future refactor that
+        // adds another fallible step) drops the guard and the
+        // slot is released automatically.
+        let guard = match self.try_reserve_slot() {
+            Some(g) => g,
+            None => {
+                self.cleanup_expired();
+                match self.try_reserve_slot() {
+                    Some(g) => g,
+                    None => {
+                        self.dropped_count.fetch_add(1, Ordering::Relaxed);
+                        return Err(ContextError::CapacityExceeded);
+                    }
+                }
             }
-        }
+        };
 
         let ctx = Context::new(origin_node);
 
@@ -884,9 +974,8 @@ impl ContextStore {
         if !self.sampler.should_sample(None) {
             let mut unsampled = ctx.clone();
             unsampled.trace_flags = TraceFlags::not_sampled();
-            // Sampling-skip path: no insert happens, so the
-            // reserved slot must be released.
-            self.release_slot();
+            // Sampling-skip path: no insert happens — `guard`'s
+            // Drop releases the slot. No manual release needed.
             return Ok(unsampled);
         }
 
@@ -900,6 +989,10 @@ impl ContextStore {
                 spans: Vec::new(),
             },
         );
+
+        // Insert succeeded — commit the reservation so its slot
+        // stays counted against `active_count`.
+        guard.commit();
 
         Ok(ctx)
     }
@@ -921,22 +1014,28 @@ impl ContextStore {
             return Ok(ctx);
         }
 
-        // BUG #136: atomic reserve; on failure cleanup + retry once.
-        if !self.try_reserve_slot() {
-            self.cleanup_expired();
-            if !self.try_reserve_slot() {
-                self.dropped_count.fetch_add(1, Ordering::Relaxed);
-                return Err(ContextError::CapacityExceeded);
+        // CR-14 / BUG #136: RAII reserve. Drop releases on any
+        // non-commit exit (sampling-skip, panic, error).
+        let guard = match self.try_reserve_slot() {
+            Some(g) => g,
+            None => {
+                self.cleanup_expired();
+                match self.try_reserve_slot() {
+                    Some(g) => g,
+                    None => {
+                        self.dropped_count.fetch_add(1, Ordering::Relaxed);
+                        return Err(ContextError::CapacityExceeded);
+                    }
+                }
             }
-        }
+        };
 
         // Check sampling (parent-based)
         if !self
             .sampler
             .should_sample(Some(ctx.trace_flags.is_sampled()))
         {
-            // Sampling-skip path — release the reserved slot.
-            self.release_slot();
+            // Sampling-skip path — `guard` Drop releases the slot.
             return Ok(ctx);
         }
 
@@ -947,9 +1046,10 @@ impl ContextStore {
         // slot via `try_reserve_slot`. `DashMap::insert` overwrites
         // the existing entry and returns the prior value; the
         // losing thread did not actually grow the map, so its
-        // reservation is a leak. Inspect the return: when a prior
-        // entry existed we release one slot to keep `active_count`
-        // in lockstep with the map size.
+        // reservation is a leak. Commit the guard FIRST (so we
+        // own the reservation) then inspect the return: when a
+        // prior entry existed, manually release one slot to keep
+        // `active_count` in lockstep with the map size.
         let prev = self.contexts.insert(
             ctx.trace_id,
             ContextEntry {
@@ -958,7 +1058,10 @@ impl ContextStore {
                 spans: Vec::new(),
             },
         );
+        guard.commit();
         if prev.is_some() {
+            // Insert was an overwrite, not a growth — undo the
+            // reservation we just committed.
             self.release_slot();
         }
 
@@ -1585,5 +1688,112 @@ mod tests {
         assert_eq!(stats.active_traces, 1);
         assert_eq!(stats.total_spans, 2);
         assert_eq!(stats.sampled_traces, 1);
+    }
+
+    /// CR-14: pin that an early-return path between
+    /// `try_reserve_slot` and the matching insert correctly
+    /// rolls back the reservation via the `SlotReservation` guard's
+    /// Drop impl. Pre-CR-14 each early-return path had to manually
+    /// call `release_slot()` — easy to miss, leaks a slot
+    /// permanently across `active_count` underflow guard.
+    ///
+    /// We exercise the sampling-skip path which bails out BEFORE
+    /// calling `commit()` on the guard. Pre-CR-14 the code had a
+    /// manual `release_slot` here; with the guard it's automatic
+    /// — the test ensures the release still happens.
+    #[test]
+    fn cr14_sampling_skip_releases_reservation_via_drop_guard() {
+        // Sampler that ALWAYS skips — every reserved slot must
+        // be released via the guard's Drop.
+        let store = ContextStore::new(8, 100, std::time::Duration::from_secs(60))
+            .with_sampling(SamplingStrategy::AlwaysOff);
+
+        let node = test_node_id();
+        for _ in 0..50 {
+            let _ = store.create_context(node).unwrap();
+        }
+
+        let stats = store.stats();
+        assert_eq!(
+            stats.active_traces, 0,
+            "all 50 contexts were sampling-skipped; the SlotReservation \
+             Drop guard must have released every reservation. Got \
+             active_traces = {} (CR-14 regression).",
+            stats.active_traces
+        );
+    }
+
+    /// CR-14: pin that a panic between reserve and commit ALSO
+    /// releases the slot via Drop. We use `catch_unwind` to
+    /// observe the panic without poisoning the test harness, then
+    /// verify `active_count` rolled back.
+    #[test]
+    fn cr14_panic_between_reserve_and_commit_releases_slot() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let store = ContextStore::new(8, 100, std::time::Duration::from_secs(60));
+        let initial_active = store.stats().active_traces;
+
+        // Synthesize "reserve then panic before commit" via direct
+        // guard manipulation — mirrors what would happen if a
+        // future refactor added a fallible step between reserve
+        // and `guard.commit()`.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = store
+                .try_reserve_slot()
+                .expect("first reserve must succeed against an empty store");
+            // Simulate a panic on the path between reserve and
+            // commit. The guard's Drop runs as part of unwind.
+            panic!("simulated mid-path failure");
+        }));
+
+        assert!(result.is_err(), "the closure must have panicked");
+        let after_active = store.stats().active_traces;
+        assert_eq!(
+            after_active, initial_active,
+            "CR-14 regression: panic between reserve and commit MUST roll \
+             back the slot reservation via SlotReservation::drop. \
+             Got active before={} after={}",
+            initial_active, after_active
+        );
+    }
+
+    /// CR-21 / BUG #150: pin that this module's `random_u64`
+    /// uses the abort-on-fail pattern, NOT `expect()` or
+    /// `.unwrap()`. A getrandom panic here would unwind across
+    /// any `extern "C"` FFI frame that called into the trace
+    /// context layer — undefined behaviour. Source-level
+    /// tripwire (assemble forbidden token at runtime so the test
+    /// file doesn't trigger itself).
+    #[test]
+    fn cr21_random_u64_must_not_panic_on_getrandom_failure() {
+        // Forbidden shapes — assembled at runtime to prevent the
+        // test's own source from triggering the scan.
+        let needle_expect = format!("getrandom::fill({}{})", "&mut bytes).", "expect");
+        let needle_unwrap = format!("getrandom::fill({}{})", "&mut bytes).", "unwrap");
+
+        let src = include_str!("context.rs");
+        for (lineno, line) in src.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !trimmed.contains(&needle_expect),
+                "CR-21 regression: getrandom::fill(...).expect(...) reintroduced \
+                 at context.rs:{}. Use the abort-on-fail pattern (eprintln + \
+                 std::process::abort).\n  line: {}",
+                lineno + 1,
+                line
+            );
+            assert!(
+                !trimmed.contains(&needle_unwrap),
+                "CR-21 regression: getrandom::fill(...).unwrap() reintroduced \
+                 at context.rs:{}. Use the abort-on-fail pattern (eprintln + \
+                 std::process::abort).\n  line: {}",
+                lineno + 1,
+                line
+            );
+        }
     }
 }

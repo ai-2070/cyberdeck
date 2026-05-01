@@ -396,29 +396,93 @@ impl EndpointState {
         self.half_open_probe.load(Ordering::Acquire)
     }
 
-    /// Try to claim the half-open probe slot. Returns `true` if
-    /// claimed (caller is now the in-flight probe and MUST drive
-    /// the request to completion so `record_completion` clears
-    /// the flag), or `false` if another probe already holds it.
+    /// Try to claim the half-open probe slot.
     ///
-    /// Closes BUG #101 — the load balancer's selection path
-    /// claims this only on the chosen endpoint, never on the
-    /// filter-time scan.
-    fn try_claim_half_open_probe(&self) -> bool {
+    /// CR-19: returns an [`Option<ProbeGuard<'_>>`]; the `Some`
+    /// arm carries an RAII guard whose `Drop` releases the slot
+    /// automatically. Callers that successfully drive the request
+    /// to completion MUST invoke [`ProbeGuard::commit`] before
+    /// dispatching to the network — `record_completion` is then
+    /// the path that clears the flag. Any other exit (panic
+    /// between claim and dispatch, future cancellation, fall-
+    /// through error) drops the guard and the slot rolls back
+    /// atomically.
+    ///
+    /// This guard API is intended for ASYNC callers where the
+    /// claim → completion window is materially wide (a request
+    /// future spanning a network round-trip, where cancellation
+    /// or panic between the two is plausible). The synchronous
+    /// `select` path at this module's top uses a direct
+    /// `compare_exchange` on `half_open_probe` because its claim
+    /// → release window is a few atomic ops; the borrow checker
+    /// forbids holding a `ProbeGuard<'_>` across the dashmap
+    /// `Ref`'s `drop(state)` boundary in that loop.
+    ///
+    /// Closes BUG #101 / CR-19.
+    #[allow(dead_code)]
+    fn try_claim_half_open_probe(&self) -> Option<ProbeGuard<'_>> {
         self.half_open_probe
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .ok()
+            .map(|_| ProbeGuard { state: self })
     }
 
     /// Release the half-open probe slot without recording a
-    /// completion outcome. Used by the load balancer when a
-    /// selected endpoint's `try_record_request` fails (max-conn
-    /// cap, race with another selector) AFTER the probe was
-    /// claimed — without this, the probe slot would leak just
-    /// like the pre-fix code path. The next selection cycle will
-    /// re-test the circuit and may re-claim the slot.
+    /// completion outcome. CR-19 prefers [`ProbeGuard`]'s Drop
+    /// for routine release; this method exists for paths where
+    /// the slot must be cleared via direct atomic write (e.g.
+    /// `record_completion` once the breaker fully reopens).
     fn release_half_open_probe(&self) {
         self.half_open_probe.store(false, Ordering::Release);
+    }
+}
+
+/// CR-19: RAII guard returned by
+/// [`EndpointState::try_claim_half_open_probe`]. The Drop impl
+/// clears the `half_open_probe` slot UNLESS [`Self::commit`] was
+/// called first (which `mem::forget`-equivalent the guard, so
+/// no atomic write runs).
+///
+/// Pattern:
+/// ```ignore
+/// let probe = state.try_claim_half_open_probe()?;   // claim
+/// // ... checks that may early-return / panic ...
+/// if !state.try_record_request(max_conn) {
+///     return Err(...);                                // probe drops, slot released
+/// }
+/// probe.commit();                                     // success: ownership
+///                                                     //   transfers to record_completion
+/// // ... dispatch ...
+/// ```
+///
+/// Pre-CR-19 the success vs failure path was tracked by a `bool`
+/// + manual `release_half_open_probe` at every fall-through —
+/// easy to miss on a future-cancel where neither `Ok` nor `Err`
+/// runs to completion.
+#[allow(dead_code)]
+pub(super) struct ProbeGuard<'a> {
+    state: &'a EndpointState,
+}
+
+impl<'a> ProbeGuard<'a> {
+    /// Forget the guard so its Drop does NOT release the slot.
+    /// Call this only on the success path AFTER the matching
+    /// `try_record_request` succeeded — `record_completion` is
+    /// then the path that clears the flag.
+    #[allow(dead_code)]
+    fn commit(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl<'a> Drop for ProbeGuard<'a> {
+    fn drop(&mut self) {
+        // Roll back the claim. Idempotent at the atomic level
+        // (`store(false)` always lands false), but the structural
+        // invariant is that this Drop only runs on the
+        // non-commit path — `mem::forget` (via `commit`) prevents
+        // it on the success path.
+        self.state.release_half_open_probe();
     }
 }
 
@@ -749,8 +813,31 @@ impl LoadBalancer {
                 // endpoint or surface `NoEndpointsAvailable` if
                 // this was the only option.
                 let circuit_open = state.circuit_open.load(Ordering::Acquire);
+                // CR-19: the new `ProbeGuard` RAII type is the
+                // preferred API for future async callers (where
+                // the request future may panic / cancel between
+                // claim and `record_completion`, leaking the slot
+                // without a guard). At THIS synchronous selection
+                // callsite, the guard's lifetime is tied to the
+                // dashmap `Ref` we hold via `state`; carrying it
+                // across the `drop(state); continue;` path the
+                // lost-race branch needs is forbidden by the
+                // borrow checker. Since this loop is fully
+                // synchronous (a few atomic ops between claim
+                // and either `Ok(selection)` or
+                // `release_half_open_probe`), the bool +
+                // explicit-release pattern is panic-free in
+                // practice — the only ops between claim and
+                // release are atomic loads / stores that don't
+                // unwind. We use a direct CAS here rather than
+                // `try_claim_half_open_probe` so we don't have
+                // to immediately drop the guard returned by it.
                 let claimed_probe = if circuit_open {
-                    if !state.try_claim_half_open_probe() {
+                    let claim_ok = state
+                        .half_open_probe
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok();
+                    if !claim_ok {
                         // Lost the half-open probe race. Drop the
                         // ref guard so the retry's `endpoints.get`
                         // doesn't deadlock, and continue to the
@@ -1225,10 +1312,26 @@ impl LoadBalancer {
     }
 }
 
-/// Generate random usize
+/// Generate random usize.
+///
+/// CR-21 / BUG #150: aborts on `getrandom` failure rather than
+/// panic-unwinding through the FFI boundary. Load-balance random
+/// numbers are not directly auth-bearing, but this function is
+/// reachable from hot paths called by `extern "C"` FFI consumers
+/// (Python / Node / Go bindings) — a `getrandom` failure would
+/// otherwise unwind across the C ABI = undefined behaviour.
+/// `process::abort` is `extern "C"`-safe (terminates rather than
+/// unwinds) and loss-of-availability is the only safe response
+/// when the system can't produce randomness.
 fn random_usize() -> usize {
     let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).expect("getrandom failed");
+    if let Err(e) = getrandom::fill(&mut bytes) {
+        eprintln!(
+            "FATAL: behavior::loadbalance::random_usize getrandom failure ({e:?}); \
+             aborting to avoid panic across the FFI boundary"
+        );
+        std::process::abort();
+    }
     usize::from_le_bytes(bytes)
 }
 
@@ -2097,6 +2200,118 @@ mod tests {
                 ep.half_open_probe.load(Ordering::Acquire),
                 "endpoint {} probe slot must be claimed (one probe per endpoint)",
                 i
+            );
+        }
+    }
+
+    /// CR-19: the `ProbeGuard` Drop must release the
+    /// half-open probe slot when the guard is dropped without
+    /// committing. We construct an `EndpointState`, manually
+    /// claim the probe via the guard API, drop the guard, and
+    /// verify the slot returned to false.
+    #[test]
+    fn cr19_probe_guard_drop_releases_probe_slot() {
+        let ep = EndpointState::new(Endpoint::new(make_node_id(0xCA)));
+        // Pre: slot is open.
+        assert!(!ep.half_open_probe.load(Ordering::Acquire));
+
+        let guard = ep
+            .try_claim_half_open_probe()
+            .expect("first claim must succeed");
+        // Probe slot is now claimed.
+        assert!(ep.half_open_probe.load(Ordering::Acquire));
+
+        // Drop without commit: slot must roll back.
+        drop(guard);
+        assert!(
+            !ep.half_open_probe.load(Ordering::Acquire),
+            "CR-19 regression: ProbeGuard Drop must release the probe slot"
+        );
+
+        // Subsequent claim succeeds — slot is reusable.
+        let _g = ep
+            .try_claim_half_open_probe()
+            .expect("post-Drop reclaim must succeed");
+    }
+
+    /// CR-19: `commit()` must SUPPRESS the Drop release. The
+    /// committed claim survives the guard going out of scope —
+    /// `record_completion` is then the path that clears it.
+    #[test]
+    fn cr19_probe_guard_commit_suppresses_release() {
+        let ep = EndpointState::new(Endpoint::new(make_node_id(0xBE)));
+        let guard = ep
+            .try_claim_half_open_probe()
+            .expect("first claim must succeed");
+        guard.commit();
+        // Slot remains claimed because commit() ran mem::forget.
+        assert!(
+            ep.half_open_probe.load(Ordering::Acquire),
+            "CR-19 regression: ProbeGuard::commit must SUPPRESS Drop release"
+        );
+        // A second claim must fail because the slot is taken.
+        assert!(
+            ep.try_claim_half_open_probe().is_none(),
+            "second claim must fail while the first is committed"
+        );
+    }
+
+    /// CR-19: panic between claim and commit MUST release the
+    /// slot via Drop. We use `catch_unwind` to confirm the slot
+    /// rolls back even when the path between claim and the
+    /// would-be commit unwinds.
+    #[test]
+    fn cr19_panic_between_claim_and_commit_releases_probe_slot() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let ep = EndpointState::new(Endpoint::new(make_node_id(0xF0)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = ep
+                .try_claim_half_open_probe()
+                .expect("first claim must succeed");
+            // Simulate a panic on the path between claim and
+            // commit — exactly what a future-cancel or in-flight
+            // panic looks like.
+            panic!("simulated mid-path failure");
+        }));
+
+        assert!(result.is_err(), "the closure must have panicked");
+        assert!(
+            !ep.half_open_probe.load(Ordering::Acquire),
+            "CR-19 regression: panic between claim and commit MUST roll \
+             back the probe slot via ProbeGuard::drop"
+        );
+    }
+
+    /// CR-21 / BUG #150: pin that this module's `random_usize`
+    /// uses the abort-on-fail pattern, NOT `expect()` or
+    /// `.unwrap()`. A getrandom panic here would unwind across
+    /// any `extern "C"` FFI frame that called into the load-
+    /// balance layer — undefined behaviour.
+    #[test]
+    fn cr21_random_usize_must_not_panic_on_getrandom_failure() {
+        let needle_expect = format!("getrandom::fill({}{})", "&mut bytes).", "expect");
+        let needle_unwrap = format!("getrandom::fill({}{})", "&mut bytes).", "unwrap");
+
+        let src = include_str!("loadbalance.rs");
+        for (lineno, line) in src.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !trimmed.contains(&needle_expect),
+                "CR-21 regression: getrandom::fill(...).expect(...) reintroduced \
+                 at loadbalance.rs:{}.\n  line: {}",
+                lineno + 1,
+                line
+            );
+            assert!(
+                !trimmed.contains(&needle_unwrap),
+                "CR-21 regression: getrandom::fill(...).unwrap() reintroduced \
+                 at loadbalance.rs:{}.\n  line: {}",
+                lineno + 1,
+                line
             );
         }
     }

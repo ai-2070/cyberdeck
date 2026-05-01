@@ -101,6 +101,44 @@ async fn initiator_connect_after_start_completes_handshake() {
     assert!(a.peer_count() > 0, "A must have registered the peer");
 }
 
+/// CR-7: `accept()` called AFTER `start()` must error explicitly,
+/// not hang. Pre-CR-7 the responder-side handshake polled
+/// `socket_arc.recv_from` directly and raced the dispatch loop; the
+/// dispatcher's handshake branch consumed every msg1 and silently
+/// dropped it (`return;` at the dispatch site). The responder
+/// awaited a packet that never arrived and `accept` hung forever.
+///
+/// Post-CR-7 the function checks `self.started` on entry and surfaces
+/// `AdapterError::Fatal(...)` immediately. Operators see a real
+/// error message rather than a hang.
+///
+/// This test pins the new contract: `accept` after `start` must
+/// return `Err` within a small timeout (well under any plausible
+/// hang threshold).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accept_after_start_returns_explicit_error() {
+    let a = build_node().await;
+    a.start(); // dispatch loop is running
+
+    // Now try to call `accept`. Pre-CR-7 this would hang for the
+    // full handshake-timeout (3s in `test_config`). Post-CR-7 it
+    // must return an error immediately.
+    let result = tokio::time::timeout(Duration::from_millis(500), a.accept(0xDEADBEEF)).await;
+
+    let inner = result.expect("accept-after-start must NOT hang past the guard timeout");
+    assert!(
+        inner.is_err(),
+        "accept-after-start must return Err, got Ok({:?})",
+        inner
+    );
+    let msg = format!("{}", inner.unwrap_err());
+    assert!(
+        msg.contains("CR-7") || msg.contains("after start"),
+        "error message must reference the ordering contract; got: {}",
+        msg
+    );
+}
+
 /// Sequential reconnect after a session times out. This exercises
 /// the post-`start()` initiator path: A's dispatcher is running,
 /// so `try_handshake_initiator` MUST go through the

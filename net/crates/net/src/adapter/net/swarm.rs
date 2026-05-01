@@ -591,11 +591,40 @@ impl LocalGraph {
                 // older (pw.seq is small, indicating a fresh
                 // restart). On restart, accept the regression
                 // and reset our recorded state.
+                // CR-6: pingwaves are unauthenticated UDP. Pre-fix
+                // the `likely_restart` heuristic (BUG #120)
+                // unconditionally overwrote `n.addr = from` on a
+                // detected seq regression — any peer with line-of-
+                // sight to the wire could spoof
+                // `(origin_id=Y, seq=1, hops=0)` from their own UDP
+                // source and repoint Y's recorded routing target
+                // at the attacker. We split the two update paths:
+                //
+                //   * Strict-progress / better-hops: address can
+                //     update (the pre-existing behavior — also
+                //     spoofable, but materially harder since the
+                //     attacker must reach a higher seq than the
+                //     legitimate origin's monotone counter).
+                //   * Likely-restart: only refresh `last_seq` and
+                //     `touch()`. The liveness goal of BUG #120
+                //     (don't go stale during a peer restart) is
+                //     preserved; the address-overwrite vector is
+                //     gone. Once the restarted peer's seq advances
+                //     past `pw.seq`, the strict-progress branch
+                //     takes over and `n.addr` updates the normal
+                //     way.
                 let likely_restart = n.last_seq > 1 && pw.seq < n.last_seq.saturating_div(2);
-                if pw.seq > n.last_seq || hops < n.hops || likely_restart {
+                let strict_progress = pw.seq > n.last_seq || hops < n.hops;
+                if strict_progress {
                     n.last_seq = pw.seq;
                     n.hops = hops;
                     n.addr = from;
+                    n.touch();
+                } else if likely_restart {
+                    // Liveness-only update — DO NOT overwrite addr
+                    // or hops on an unauthenticated seq-regression
+                    // signal.
+                    n.last_seq = pw.seq;
                     n.touch();
                 }
             })
@@ -931,8 +960,17 @@ mod tests {
     /// gap.
     ///
     /// Post-fix: a likely restart (`pw.seq <= n.last_seq / 2`
-    /// when `n.last_seq > 1`) accepts the regression and
-    /// resets our recorded state.
+    /// when `n.last_seq > 1`) accepts the seq regression so
+    /// `last_seq` advances forward and `last_seen` refreshes,
+    /// keeping the entry off the stale-cleanup path.
+    ///
+    /// CR-6 update: the LIVENESS half of the BUG #120 fix is
+    /// preserved — `last_seq` advances and `touch()` fires —
+    /// but the ADDRESS-OVERWRITE half was REVERTED. Pingwaves
+    /// are unauthenticated UDP and the original fix let any
+    /// peer spoof a restart to repoint a victim's address.
+    /// See `on_pingwave_likely_restart_must_not_overwrite_addr`
+    /// for the security invariant pin.
     #[test]
     fn on_pingwave_accepts_seq_regression_on_likely_peer_restart() {
         let graph = LocalGraph::new(0x1, 8);
@@ -947,6 +985,9 @@ mod tests {
         assert_eq!(pre_restart_last_seq, 1000);
 
         // Peer "restarts" — fresh seq=1 (well below 1000/2 = 500).
+        // We send the restart pingwave from a NEW address to
+        // also exercise the post-CR-6 invariant: address must
+        // NOT auto-update on the restart-only path.
         let restart_from: SocketAddr = "127.0.0.1:9001".parse().unwrap();
         let pw = Pingwave::new(0xCAFE, 1, 3);
         graph.on_pingwave(pw, restart_from);
@@ -958,23 +999,81 @@ mod tests {
             .get(&0xCAFE)
             .map(|n| (n.last_seq, n.addr))
             .unwrap();
-        // Pre-fix: last_seq would still be 1000 and addr would
-        // still be the old `from`. Post-fix: restart accepted
-        // and state updated.
+        // Liveness half: last_seq must advance to 1.
         assert_eq!(
             post_restart_last_seq, 1,
             "restart pingwave with seq << last_seq must update last_seq"
         );
+        // CR-6: address-overwrite half is GONE. The recorded
+        // address stays as the pre-restart address until a
+        // strict-progress pingwave (seq > last_seq) fires.
         assert_eq!(
-            post_restart_addr, restart_from,
-            "restart pingwave must update the recorded address"
+            post_restart_addr, from,
+            "CR-6: address must NOT auto-update on the unauthenticated \
+             restart-only path; this prevents proximity poisoning"
         );
 
-        // A subsequent regular advance also works.
+        // Subsequent strict-progress advance from restart_from
+        // (seq=2 > 1) DOES update addr — this is the legitimate
+        // post-restart path. The peer's seq advancing beyond the
+        // initial restart value is the "credential" the receiver
+        // uses to accept the new address.
         let pw2 = Pingwave::new(0xCAFE, 2, 3);
         graph.on_pingwave(pw2, restart_from);
-        let final_last_seq = graph.nodes.get(&0xCAFE).map(|n| n.last_seq).unwrap();
+        let (final_last_seq, final_addr) = graph
+            .nodes
+            .get(&0xCAFE)
+            .map(|n| (n.last_seq, n.addr))
+            .unwrap();
         assert_eq!(final_last_seq, 2);
+        assert_eq!(
+            final_addr, restart_from,
+            "strict-progress pingwave from new addr must update n.addr"
+        );
+    }
+
+    /// CR-6: pin the security invariant. An attacker who has
+    /// observed at least one pingwave for `origin_id` (so they
+    /// know it exists in the graph at some seq) can craft a
+    /// `(origin_id, seq=1, hops=0)` packet from their own UDP
+    /// source. Pre-CR-6 the `likely_restart` heuristic accepted
+    /// this and overwrote `n.addr = attacker_addr`, repointing
+    /// the victim's recorded routing target at the attacker.
+    /// Post-CR-6 the address stays at the legitimately-recorded
+    /// value; only `last_seq` and `last_seen` update.
+    #[test]
+    fn on_pingwave_likely_restart_must_not_overwrite_addr() {
+        let graph = LocalGraph::new(0x1, 8);
+        let legit: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+
+        // Establish a high seq from the legitimate peer.
+        for seq in [100u64, 500, 1000].iter() {
+            let pw = Pingwave::new(0xBEEF, *seq, 3);
+            graph.on_pingwave(pw, legit);
+        }
+        assert_eq!(
+            graph.nodes.get(&0xBEEF).map(|n| n.addr).unwrap(),
+            legit,
+            "sanity: legit addr is recorded"
+        );
+
+        // Attacker spoofs a restart-shaped pingwave from THEIR
+        // address. Pre-CR-6 this overwrote n.addr.
+        let attacker: SocketAddr = "192.0.2.99:31337".parse().unwrap();
+        let spoof = Pingwave::new(0xBEEF, 1, 3);
+        graph.on_pingwave(spoof, attacker);
+
+        let recorded_addr = graph.nodes.get(&0xBEEF).map(|n| n.addr).unwrap();
+        assert_eq!(
+            recorded_addr, legit,
+            "CR-6: spoofed restart MUST NOT repoint the recorded address \
+             to the attacker; got {:?}",
+            recorded_addr
+        );
+        // Liveness half still works: last_seq updates so the
+        // entry doesn't go stale during a real peer restart.
+        let last_seq = graph.nodes.get(&0xBEEF).map(|n| n.last_seq).unwrap();
+        assert_eq!(last_seq, 1, "liveness half: last_seq must advance");
     }
 
     /// Sanity: a small seq regression that is NOT below

@@ -776,6 +776,77 @@ mod tests {
     /// genuinely need to refresh-at-same-seq (e.g. legitimate
     /// rebind) must `remove` first.
     #[test]
+    /// CR-17: pin the ABA-via-retention behavior. `store` correctly
+    /// rejects an older `through_seq` against a newer one, BUT
+    /// `remove` does NOT carry forward the high-water mark — once
+    /// the store is `remove`d, a stale producer can re-`store` an
+    /// older snapshot and the cycle starts fresh.
+    ///
+    /// This is a documented limitation, not a fix: callers that
+    /// invoke `remove` MUST take responsibility for not letting
+    /// stale producers race in afterward (typically by holding a
+    /// channel-level lock, or by only calling `remove` during
+    /// channel teardown when no producers are live). The test
+    /// pins the behavior so a future maintainer who tries to
+    /// "fix" it inadvertently doesn't break the deliberate
+    /// retention-clears-the-slot semantics that operators rely on.
+    ///
+    /// If retention is ever wired into a multi-producer code path,
+    /// the right move is to add a per-entity high-water-mark cache
+    /// that survives `remove` — but that's a separate audit
+    /// entry. For now: this test documents the gap.
+    #[test]
+    fn cr17_remove_does_not_carry_forward_through_seq_high_water_mark() {
+        let store = SnapshotStore::new();
+        let kp = EntityKeypair::generate();
+        let entity_id = kp.entity_id().clone();
+
+        // Store a snapshot at seq=3.
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+        for _ in 0..3 {
+            builder.append(Bytes::from_static(b"e"), 0).unwrap();
+        }
+        let high = snap_at(entity_id.clone(), &mut builder, b"high");
+        assert_eq!(high.through_seq, 3);
+        assert!(store.store(high));
+
+        // Older snapshot at seq=1 is correctly rejected against
+        // the live high-water mark.
+        let mut older_builder = CausalChainBuilder::new(kp.origin_hash());
+        older_builder.append(Bytes::from_static(b"e"), 0).unwrap();
+        let older = snap_at(entity_id.clone(), &mut older_builder, b"stale");
+        assert_eq!(older.through_seq, 1);
+        assert!(
+            !store.store(older.clone()),
+            "older through_seq must be rejected against the live high-water mark"
+        );
+
+        // Now retention removes the entry. `remove` returns the
+        // stored snapshot but does NOT cache its through_seq.
+        let removed = store.remove(&entity_id);
+        assert!(removed.is_some(), "remove must return the stored snapshot");
+
+        // CR-17: a stale producer that races AFTER the retention
+        // remove succeeds in storing the older snapshot. There
+        // is no "max-ever-seen seq per entity" record. This is
+        // the documented behavior — pin it so a future fix has
+        // to also update this test.
+        let stale_accepted = store.store(older);
+        assert!(
+            stale_accepted,
+            "CR-17: post-`remove`, an older snapshot is accepted because \
+             the store does not cache the prior through_seq high-water \
+             mark across removes. This is the documented behavior; if \
+             you're 'fixing' this, ensure a follow-up audit entry tracks \
+             the design change."
+        );
+
+        // The store now has the OLDER snapshot — caller-visible
+        // rollback. Documented as a `remove` precondition.
+        let retrieved = store.get(&entity_id).unwrap();
+        assert_eq!(retrieved.state, Bytes::from_static(b"stale"));
+    }
+
     fn store_rejects_equal_through_seq_against_existing_entry() {
         let store = SnapshotStore::new();
         let kp = EntityKeypair::generate();
