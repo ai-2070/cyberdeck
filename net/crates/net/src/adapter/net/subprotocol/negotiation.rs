@@ -37,32 +37,30 @@ pub struct ManifestEntry {
 impl SubprotocolManifest {
     /// Build a manifest from the local registry.
     ///
-    /// BUG #149: entries are sorted by `id` so the wire bytes
-    /// are deterministic across runs and builds. Pre-fix
-    /// `registry.list()` walked a `DashMap` whose iteration order
-    /// is non-deterministic, producing different `to_bytes()`
-    /// output for identical content. Today the manifest is
-    /// unsigned and not used in any digest dedup, so the
-    /// non-determinism was dormant — but the architecture comment
-    /// at the top of this module describes the manifest as
-    /// "exchanged during session setup," a surface that typically
-    /// ends up signed once a security model is added; sort by id
-    /// preempts that breakage.
+    /// Entries are sorted by `id` so the wire bytes are
+    /// deterministic across runs and builds. Walking
+    /// `registry.list()` directly returns a `DashMap` iteration
+    /// order that is non-deterministic, which would produce
+    /// different `to_bytes()` output for identical content. Today
+    /// the manifest is unsigned and not used in any digest dedup,
+    /// so the non-determinism would be dormant — but the
+    /// architecture comment at the top of this module describes
+    /// the manifest as "exchanged during session setup," a
+    /// surface that typically ends up signed once a security
+    /// model is added; sort by id preempts that breakage.
     ///
-    /// BUG #131: forwarding-only descriptors (`handler_present ==
-    /// false`) are now filtered out before serialization. Pre-fix
-    /// the manifest advertised every registered descriptor, but the
-    /// 6-byte wire format has no `handler_present` flag and
-    /// `from_bytes` reconstructs every entry as
-    /// `handler_present: true`. After `negotiate()`, the receiver
-    /// then believed the sender had a local handler for every
-    /// id in the manifest — scheduling RPCs to that id would
-    /// silently drop on the sender. The parallel
-    /// `capability_tags()` discovery path already filters by
-    /// `handler_present`; this direct-manifest path now mirrors
-    /// that filter so the two channels agree. Forwarding-only
-    /// peers can still receive opaque-forward traffic; they just
-    /// don't claim to handle it locally.
+    /// Forwarding-only descriptors (`handler_present == false`)
+    /// are filtered out before serialization. The 6-byte wire
+    /// format has no `handler_present` flag and `from_bytes`
+    /// reconstructs every entry as `handler_present: true`.
+    /// Without this filter, the receiver would believe the sender
+    /// had a local handler for every id in the manifest and
+    /// scheduling RPCs to that id would silently drop on the
+    /// sender. The parallel `capability_tags()` discovery path
+    /// already filters by `handler_present`; this direct-manifest
+    /// path mirrors that filter so the two channels agree.
+    /// Forwarding-only peers can still receive opaque-forward
+    /// traffic; they just don't claim to handle it locally.
     pub fn from_registry(registry: &SubprotocolRegistry) -> Self {
         let mut entries: Vec<ManifestEntry> = registry
             .list()

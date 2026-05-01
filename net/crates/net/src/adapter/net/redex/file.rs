@@ -956,19 +956,17 @@ impl RedexFile {
             None => state.segment.base_offset() + state.segment.live_bytes() as u64,
         };
 
-        // BUG #95: previously we mutated `state.index`,
-        // `state.timestamps`, and `state.segment` *before* calling
-        // into `disk.compact_to`. If the disk write failed, the
-        // log message admitted that "in-memory eviction succeeded
-        // but on-disk files retain evicted entries" — which on
-        // reopen replayed the full on-disk state and resurrected
-        // the entries that had been evicted only in memory.
-        //
-        // Now we attempt the disk compaction FIRST against a slice
-        // of the surviving entries, and only mutate in-memory
-        // state on success. On failure, in-memory state is left
-        // untouched so reopen replays a consistent picture rather
-        // than corrupting the channel.
+        // Attempt the disk compaction FIRST against a slice of the
+        // surviving entries, and only mutate `state.index`,
+        // `state.timestamps`, and `state.segment` on success. On
+        // failure, in-memory state is left untouched so reopen
+        // replays a consistent picture rather than corrupting the
+        // channel. Mutating in-memory state first and then calling
+        // `disk.compact_to` would leave a permanent skew on disk
+        // failure: in-memory eviction succeeds but on-disk files
+        // retain the evicted entries, and reopen would replay the
+        // full on-disk state and resurrect entries that had been
+        // evicted only in memory.
         //
         // The state lock is held *across* `compact_to`. Releasing
         // it earlier opens a window where a concurrent
@@ -1004,9 +1002,9 @@ impl RedexFile {
         state.timestamps.drain(..drop);
         state.segment.evict_prefix_to(dat_base);
 
-        // BUG #92 fix: renormalize in-memory state to match the
-        // new on-disk format (segment-relative offsets, 0-based
-        // segment). `compact_to` rewrote each surviving entry's
+        // Renormalize in-memory state to match the new on-disk
+        // format (segment-relative offsets, 0-based segment).
+        // `compact_to` rewrote each surviving entry's
         // `payload_offset` as `entry.payload_offset - dat_base`;
         // mirror that here so subsequent appends compute disk
         // offsets (`segment.base_offset() + live_bytes()`) that

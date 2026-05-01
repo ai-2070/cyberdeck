@@ -82,17 +82,17 @@ impl SubprotocolDescriptor {
 
     /// Set the minimum compatible version.
     ///
-    /// BUG #132: enforces the wire-format invariant
-    /// `min_compatible <= version` — pre-fix, a descriptor could be
-    /// built with `min_compatible > version`, which would break
-    /// `is_compatible_with`'s contract (every honest peer
+    /// Enforces the wire-format invariant
+    /// `min_compatible <= version`. Allowing
+    /// `min_compatible > version` would break
+    /// `is_compatible_with`'s contract — every honest peer
     /// computes `local.version.satisfies(other.min_compatible)`,
     /// which silently fails for any version of `local` once
-    /// `other.min_compatible > other.version`). On the wire-format
-    /// side this enabled a phantom-incompatibility DoS where a
-    /// peer advertised `min_compatible=255.255` against
-    /// `version=1.0` and unilaterally evicted the subprotocol
-    /// from negotiation. The constructor (`new`) initializes
+    /// `other.min_compatible > other.version`. On the wire-format
+    /// side that enables a phantom-incompatibility DoS where a
+    /// peer advertises `min_compatible=255.255` against
+    /// `version=1.0` and unilaterally evicts the subprotocol from
+    /// negotiation. The constructor (`new`) initializes
     /// `min_compatible = version` so the invariant holds by
     /// default; this setter clamps `min` to `self.version` if a
     /// caller passes a higher value.
@@ -150,8 +150,8 @@ pub fn write_manifest_entry(desc: &SubprotocolDescriptor, buf: &mut impl BufMut)
 
 /// Deserialize a manifest entry from bytes.
 ///
-/// BUG #132: now rejects entries that violate the wire-format
-/// invariant `min_compatible <= version`. Pre-fix, a peer could
+/// Rejects entries that violate the wire-format invariant
+/// `min_compatible <= version`. Without this guard, a peer could
 /// advertise `version=1.0, min_compatible=255.255` and every
 /// honest peer's `negotiate()` would mark the subprotocol
 /// `incompatible` (because `local.version.satisfies(remote.min)`

@@ -286,18 +286,16 @@ impl ClassifyFsm {
         // via stage 4 produces the same shape (bind == external),
         // so this check naturally subsumes that case.
         //
-        // BUG #107: when `bind_addr.ip()` is wildcard (0.0.0.0 or
-        // ::), a reflex observation like `192.0.2.1:9001` would
-        // never compare equal under the strict `reflex.ip() ==
+        // When `bind_addr.ip()` is wildcard (0.0.0.0 or ::), a
+        // reflex observation like `192.0.2.1:9001` would never
+        // compare equal under a strict `reflex.ip() ==
         // bind_addr.ip()` check — even though the ports match and
-        // the node is in fact directly reachable. The FSM then
-        // classified as `Cone` (or `Symmetric`) and
-        // `pair_action` triggered an unnecessary `SinglePunch`.
-        // Capability tags advertised `nat:cone` instead of
-        // `nat:open`, biasing peer-side decisions. The docstring
-        // says callers should pre-resolve `bind_addr` to an
-        // interface address, but no runtime guard enforced it.
-        // Now an unspecified bind IP is treated as a wildcard
+        // the node is in fact directly reachable. The FSM would
+        // then classify as `Cone` (or `Symmetric`) and
+        // `pair_action` would trigger an unnecessary `SinglePunch`,
+        // and capability tags would advertise `nat:cone` instead
+        // of `nat:open`, biasing peer-side decisions. An
+        // unspecified bind IP is therefore treated as a wildcard
         // match — port-only equality suffices.
         let bind_ip_is_wildcard = bind_addr.ip().is_unspecified();
         if self.probes.iter().any(|(_, reflex)| {

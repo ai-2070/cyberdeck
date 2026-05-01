@@ -53,15 +53,14 @@ impl TasksFilterSpec {
                 return false;
             }
         }
-        // BUG #142: pre-fix used strict `>` / `<` (rejection
-        // via `<=` / `>=`), so an event with `created_ns ==
-        // cutoff` was dropped by both `created_after(cutoff)`
-        // and `created_before(cutoff)` — fell through holes
-        // between paginations using "last sync ns" as cutoff.
-        // Inclusive bounds (rejection via `<` / `>`) close that
-        // gap and also handle two events written in the same
-        // ns (achievable on Windows where wall-clock granularity
-        // is ~15ms).
+        // Inclusive bounds (rejection via `<` / `>`). Strict `>` /
+        // `<` (rejection via `<=` / `>=`) would drop an event
+        // with `created_ns == cutoff` from both
+        // `created_after(cutoff)` and `created_before(cutoff)` —
+        // events would fall through holes between paginations
+        // using "last sync ns" as cutoff. Inclusive bounds also
+        // handle two events written in the same ns (achievable on
+        // Windows where wall-clock granularity is ~15ms).
         if let Some(ns) = self.created_after_ns {
             if t.created_ns < ns {
                 return false;
@@ -156,25 +155,25 @@ impl<'a> TasksQuery<'a> {
         self
     }
 
-    /// Restrict to `created_ns >= ns` (inclusive — see BUG #142).
+    /// Restrict to `created_ns >= ns` (inclusive).
     pub fn created_after(mut self, ns: u64) -> Self {
         self.spec.created_after_ns = Some(ns);
         self
     }
 
-    /// Restrict to `created_ns <= ns` (inclusive — see BUG #142).
+    /// Restrict to `created_ns <= ns` (inclusive).
     pub fn created_before(mut self, ns: u64) -> Self {
         self.spec.created_before_ns = Some(ns);
         self
     }
 
-    /// Restrict to `updated_ns >= ns` (inclusive — see BUG #142).
+    /// Restrict to `updated_ns >= ns` (inclusive).
     pub fn updated_after(mut self, ns: u64) -> Self {
         self.spec.updated_after_ns = Some(ns);
         self
     }
 
-    /// Restrict to `updated_ns <= ns` (inclusive — see BUG #142).
+    /// Restrict to `updated_ns <= ns` (inclusive).
     pub fn updated_before(mut self, ns: u64) -> Self {
         self.spec.updated_before_ns = Some(ns);
         self

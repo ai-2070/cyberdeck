@@ -385,10 +385,10 @@ impl RouteEntry {
 
 /// Soft cap on `RoutingTable::stream_stats` size.
 ///
-/// Closes BUG #89: `record_in` (and friends) insert into
-/// `stream_stats` keyed by `stream_id` extracted from raw packet
-/// bytes BEFORE AEAD verification, since the router is upstream
-/// of session keys. A malicious peer could spam routed packets
+/// `record_in` (and friends) insert into `stream_stats` keyed by
+/// `stream_id` extracted from raw packet bytes BEFORE AEAD
+/// verification, since the router is upstream of session keys.
+/// Without the cap, a malicious peer could spam routed packets
 /// with random `stream_id`s to exhaust router memory between
 /// `cleanup_idle_streams` ticks. The cap turns that into a
 /// bounded memory footprint:
@@ -587,7 +587,7 @@ impl RoutingTable {
     /// Returns true if this stream id may be inserted into
     /// `stream_stats`. Existing entries always proceed; new
     /// entries are admitted only if the map is below
-    /// [`MAX_STREAM_STATS`] (BUG #89). The check has a TOCTOU
+    /// [`MAX_STREAM_STATS`]. The check has a TOCTOU
     /// race against concurrent inserters but is intentionally
     /// soft — we only need to bound growth, not enforce a strict
     /// upper bound.

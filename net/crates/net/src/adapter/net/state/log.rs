@@ -161,20 +161,17 @@ impl EntityLog {
     ///
     /// Called after a snapshot is taken at that sequence.
     ///
-    /// BUG #129: pre-fix `snapshot_seq` was unconditionally bumped
-    /// to `seq` whenever `seq > self.snapshot_seq`, even when no
-    /// events matched the prune (e.g. on an empty log, or when
-    /// `seq < first_event.sequence`). The pruning side-effects
-    /// (`base_link`, `head_payload`) only fired when at least one
-    /// event was actually removed — so calling `prune_through` on
-    /// an empty log advanced `snapshot_seq` while `base_link.sequence`
-    /// stayed put, producing a permanent desync where `head_seq()
-    /// .max(snapshot_seq())` returned a value the next append
-    /// couldn't agree with. Now `snapshot_seq` is only advanced
-    /// when `last_pruned.is_some()` — i.e. a real event was
-    /// pruned. Callers that need to install an externally-
-    /// coordinated snapshot anchor on an empty log should use
-    /// `from_snapshot` instead.
+    /// `snapshot_seq` is only advanced when `last_pruned.is_some()`
+    /// — i.e. a real event was actually pruned. The pruning
+    /// side-effects (`base_link`, `head_payload`) only fire when
+    /// at least one event is removed, so unconditionally bumping
+    /// `snapshot_seq` whenever `seq > self.snapshot_seq` (even on
+    /// an empty log, or when `seq < first_event.sequence`) would
+    /// leave `base_link.sequence` behind, producing a permanent
+    /// desync where `head_seq().max(snapshot_seq())` returns a
+    /// value the next append can't agree with. Callers that need
+    /// to install an externally-coordinated snapshot anchor on an
+    /// empty log should use `from_snapshot` instead.
     pub fn prune_through(&mut self, seq: u64) {
         // Capture the last pruned event's link and payload so that base_link
         // remains a valid chain anchor if all events are removed. Without this,
@@ -188,9 +185,9 @@ impl EntityLog {
             .map(|e| (e.link, e.payload.clone()));
 
         self.events.retain(|e| e.link.sequence > seq);
-        // BUG #129: gate the snapshot_seq bump on having actually
-        // pruned something. A no-op prune (empty log, or seq below
-        // the first event) must not advance the marker — otherwise
+        // Gate the snapshot_seq bump on having actually pruned
+        // something. A no-op prune (empty log, or seq below the
+        // first event) must not advance the marker — otherwise
         // `snapshot_seq` desyncs from `base_link.sequence` and
         // future appends are rejected against the implied gap.
         if last_pruned.is_some() && seq > self.snapshot_seq {

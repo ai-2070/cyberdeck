@@ -197,7 +197,7 @@ impl IdentityEnvelope {
         // Ephemeral X25519 keypair. `StaticSecret` is zeroize-on-drop,
         // so `eph_sk` is wiped as soon as the function returns.
         //
-        // BUG #150: aborts on `getrandom` failure rather than
+        // Aborts on `getrandom` failure rather than
         // panic-unwinding through the FFI boundary; same
         // rationale as `EntityKeypair::generate`. A predictable
         // X25519 ephemeral secret defeats the envelope's forward
@@ -218,13 +218,13 @@ impl IdentityEnvelope {
         let mut key = derive_key(shared.as_bytes(), KDF_DOMAIN_KEY);
         let nonce = derive_nonce(eph_pk.as_bytes(), &target_static_pub);
 
-        // BUG #127: bind `chain_link` to the AEAD via AAD so a
-        // tampered link breaks BOTH the attestation signature
-        // (already covered) AND the AEAD tag. Pre-fix used
-        // `aad: &[]`, leaving the chain_link bound only to the
-        // signature — an attacker who can swap the on-the-wire
-        // chain_link for a different one (and re-attest) didn't
-        // also break the AEAD, narrowing the verification surface.
+        // Bind `chain_link` to the AEAD via AAD so a tampered link
+        // breaks BOTH the attestation signature (already covered)
+        // AND the AEAD tag. With `aad: &[]` the chain_link would
+        // be bound only to the signature — an attacker who can
+        // swap the on-the-wire chain_link for a different one (and
+        // re-attest) wouldn't also break the AEAD, narrowing the
+        // verification surface.
         let aad_bytes = chain_link.to_bytes();
         let aead = XChaCha20Poly1305::new((&key).into());
         let ciphertext = aead
@@ -281,7 +281,7 @@ impl IdentityEnvelope {
     /// cross-check (`state/snapshot.rs::open_identity_envelope`),
     /// so passing `None` there is sound. New call sites should
     /// pass `Some` whenever the expected source identity is known
-    /// up front. (BUG #127.)
+    /// up front.
     ///
     /// # Errors
     ///

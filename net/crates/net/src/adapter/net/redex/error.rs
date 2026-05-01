@@ -50,7 +50,7 @@ pub enum RedexError {
     /// fold-error-policy interpreter can treat per-event decode
     /// failures as skip-and-continue even under the `Stop` policy
     /// — otherwise a single corrupt or attacker-crafted event
-    /// could wedge the fold task forever (BUG #141).
+    /// could wedge the fold task forever.
     #[error("decode failed: {0}")]
     Decode(String),
 
@@ -86,9 +86,9 @@ impl RedexError {
     /// event). The cortex fold-error-policy interpreter treats
     /// these as "always skip-and-continue" even under the `Stop`
     /// policy — otherwise a single corrupt postcard tail (or a
-    /// 32-bit checksum collision; see BUG #135) wedges the fold
-    /// task permanently and DoSes a multi-tenant cortex instance
-    /// via one bad event. (BUG #141.)
+    /// 32-bit checksum collision) would wedge the fold task
+    /// permanently and DoS a multi-tenant cortex instance via one
+    /// bad event.
     ///
     /// Only `Decode` qualifies — it's stamped by the cortex fold
     /// implementations specifically on postcard / EventMeta /

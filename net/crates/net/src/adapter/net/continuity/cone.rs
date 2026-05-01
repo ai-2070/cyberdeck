@@ -34,10 +34,10 @@ pub struct CausalCone {
     sequence: u64,
     /// Full horizon at this point (exact, if available locally).
     horizon: Option<ObservedHorizon>,
-    /// Compressed horizon from the wire (always available). 64-bit
-    /// bloom filter as of BUG #130 — see `state/horizon.rs` for the
-    /// FPR-vs-cardinality table and the out-of-band-fallback escape
-    /// hatch when n > 16 active origins.
+    /// Compressed horizon from the wire (always available).
+    /// 64-bit bloom filter — see `state/horizon.rs` for the
+    /// FPR-vs-cardinality table and the out-of-band-fallback
+    /// escape hatch when n > 16 active origins.
     horizon_encoded: u64,
 }
 
@@ -93,13 +93,15 @@ impl CausalCone {
     /// Check if this event is concurrent with another (neither
     /// causally preceded the other).
     ///
-    /// CR-16: when BOTH cones carry the full [`ObservedHorizon`]
+    /// When BOTH cones carry the full [`ObservedHorizon`]
     /// out-of-band (`horizon` is `Some` on both), use the exact
     /// `has_observed` path. The compressed `horizon_encoded`
     /// (64-bit bloom) saturates past ~16 distinct origins —
     /// `potentially_concurrent` then collapses toward
     /// constant-`false`, silently mis-reporting genuinely
-    /// concurrent events as causally ordered.
+    /// concurrent events as causally ordered. Above the bloom's
+    /// cardinality ceiling the bloom-only path would regress to
+    /// "every pair looks ordered."
     ///
     /// We need head sequences to call `has_observed`. The
     /// `CausalCone` model treats `(origin_hash, ?)` — without a
@@ -109,10 +111,6 @@ impl CausalCone {
     /// [`ObservedHorizon::contains_origin`] for that — answers
     /// "have I observed any event from `origin_hash`" without
     /// needing a seq.
-    ///
-    /// Pre-CR-16 callers above the bloom's cardinality ceiling
-    /// silently regressed to "every pair looks ordered." Fix:
-    /// honour the full horizon when both sides carry it.
     pub fn is_concurrent_with(&self, other: &CausalCone) -> bool {
         match (&self.horizon, &other.horizon) {
             (Some(self_h), Some(other_h)) => {

@@ -21,13 +21,13 @@ pub struct TasksFilter {
     pub status: Option<TaskStatus>,
     /// Case-insensitive substring match on `title`.
     pub title_contains: Option<String>,
-    /// `created_ns >= ns` (inclusive — see BUG #142 in audit doc).
+    /// `created_ns >= ns` (inclusive).
     pub created_after_ns: Option<u64>,
-    /// `created_ns <= ns` (inclusive — see BUG #142 in audit doc).
+    /// `created_ns <= ns` (inclusive).
     pub created_before_ns: Option<u64>,
-    /// `updated_ns >= ns` (inclusive — see BUG #142 in audit doc).
+    /// `updated_ns >= ns` (inclusive).
     pub updated_after_ns: Option<u64>,
-    /// `updated_ns <= ns` (inclusive — see BUG #142 in audit doc).
+    /// `updated_ns <= ns` (inclusive).
     pub updated_before_ns: Option<u64>,
     /// Result ordering.
     pub order_by: Option<OrderBy>,
