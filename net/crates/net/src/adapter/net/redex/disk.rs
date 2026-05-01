@@ -2351,8 +2351,8 @@ mod tests {
         // this is a permanent failure.
         let bogus = dir.join("does_not_exist_subdir").join("idx");
         let start = std::time::Instant::now();
-        let err = super::reopen_with_retries(&bogus)
-            .expect_err("nonexistent parent dir must fail open");
+        let err =
+            super::reopen_with_retries(&bogus).expect_err("nonexistent parent dir must fail open");
         let elapsed = start.elapsed();
         // We attempt 5 times with 0+25+50+100+200 = 375ms of
         // total sleep across the retries. Allow generous slack
@@ -2405,8 +2405,7 @@ mod tests {
         let payloads: [&[u8]; 3] = [b"alpha_aaaa", b"beta_bbbbb", b"gamma_cccc"];
         let mut offset = 0u32;
         for (i, p) in payloads.iter().enumerate() {
-            let e =
-                RedexEntry::new_heap(i as u64, offset, p.len() as u32, 0, payload_checksum(p));
+            let e = RedexEntry::new_heap(i as u64, offset, p.len() as u32, 0, payload_checksum(p));
             recovered
                 .disk
                 .append_entry_at(&e, p, 1_000 * (i as u64 + 1))

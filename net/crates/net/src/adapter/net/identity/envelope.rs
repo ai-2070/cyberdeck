@@ -380,14 +380,8 @@ impl IdentityEnvelope {
                 // succeeds under v0 AAD also passed the v1
                 // attestation, so it's a legitimate pre-#127
                 // envelope from a rolling-upgrade peer.
-                aead.decrypt(
-                    (&nonce).into(),
-                    Payload {
-                        msg: ct,
-                        aad: &[],
-                    },
-                )
-                .map_err(|_| EnvelopeError::SealOpenFailed)?
+                aead.decrypt((&nonce).into(), Payload { msg: ct, aad: &[] })
+                    .map_err(|_| EnvelopeError::SealOpenFailed)?
             }
         };
         if seed_vec.len() != SEED_LEN {
