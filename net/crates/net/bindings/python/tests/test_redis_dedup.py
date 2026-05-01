@@ -13,8 +13,12 @@ hit ImportError. This file pins both:
    storage was `Rc<str>`; this test pins the post-fix `Arc<str>`
    guarantee at the Python layer).
 
-The tests are skip-on-ImportError so they no-op cleanly on builds
-without the `redis` feature.
+Cubic P2: skip on whether the underlying NAPI/PyO3 binding was
+built with the `redis` feature, NOT on the public re-export
+itself. The earlier shape `try: from net import RedisStreamDedup`
+would silently pass if the re-export was missing, defeating the
+test. Now we probe the lower-level `_net` module (which always
+exists when the binding is loadable) to decide whether to skip.
 """
 
 from __future__ import annotations
@@ -23,16 +27,29 @@ import threading
 
 import pytest
 
+# Skip-decision probe: does the underlying binding have the
+# RedisStreamDedup symbol? This is independent of the public
+# `from net import RedisStreamDedup` we're trying to verify.
+_BINDING_HAS_REDIS_DEDUP = False
 try:
-    from net import RedisStreamDedup
+    from net import _net  # type: ignore[attr-defined]
+    _BINDING_HAS_REDIS_DEDUP = hasattr(_net, "RedisStreamDedup")
 except ImportError:
-    RedisStreamDedup = None  # type: ignore[assignment]
+    # Whole `net` package missing — treat as skip.
+    _BINDING_HAS_REDIS_DEDUP = False
 
 
 pytestmark = pytest.mark.skipif(
-    RedisStreamDedup is None,
-    reason="binding built without `redis` feature; RedisStreamDedup not exposed",
+    not _BINDING_HAS_REDIS_DEDUP,
+    reason="binding built without `redis` feature; RedisStreamDedup not in _net",
 )
+
+
+# CR-3 / Cubic P2: the load-bearing import is THIS one — public
+# `from net import RedisStreamDedup`. If the re-export is broken
+# this raises ImportError and every test below errors out
+# (not skipped). That's the contract we want to pin.
+from net import RedisStreamDedup  # noqa: E402
 
 
 def test_first_observation_is_not_a_duplicate() -> None:

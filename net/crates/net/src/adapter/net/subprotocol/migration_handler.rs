@@ -1320,7 +1320,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
 
         // Wire the identity context so `peer_static_lookup` returns
@@ -1405,7 +1405,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
         let passthrough = handler_no_ctx
             .maybe_seal_envelope(snapshot2, origin_hash, target_node_id)
@@ -1620,7 +1620,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: Some(envelope),
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
 
         // Build a handler with an identity_context whose unseal
@@ -1673,7 +1673,7 @@ mod tests {
         // branch above wasn't passing by coincidence.
         let snapshot_no_envelope = StateSnapshot {
             identity_envelope: None,
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
             ..snapshot.clone()
         };
         let resolved_fallback = handler
@@ -1734,7 +1734,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: Some(envelope),
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
 
         // Misbehaving unsealer: always returns `Ok(None)`, even
@@ -1801,9 +1801,45 @@ mod tests {
         let standby_src = include_str!("../compute/standby_group.rs");
         let capability_src = include_str!("../behavior/capability.rs");
 
+        // Cubic P2: strip both line comments (`// ...`) AND block
+        // comments (`/* ... */`, including `/** ... */` doc
+        // comments) before scanning. The earlier filter only
+        // skipped `//` lines, so a token mention inside
+        // `/** ... */` would falsely trip the regression. We
+        // strip block-comment ranges first; the per-line filter
+        // then handles the line-comment case.
+        fn strip_comments(src: &str) -> String {
+            let bytes = src.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut i = 0;
+            while i < bytes.len() {
+                // Skip block comment.
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        // Preserve newlines so per-line scanning still aligns.
+                        if bytes[i] == b'\n' {
+                            out.push(b'\n');
+                        }
+                        i += 1;
+                    }
+                    if i + 1 < bytes.len() {
+                        i += 2; // skip closing */
+                    }
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        }
+
+        let capability_clean = strip_comments(capability_src);
+        let standby_clean = strip_comments(standby_src);
+
         // CapabilityIndex must NOT index by daemon_origin. Pinned
         // separately because it's the audit's specific claim.
-        let capability_uses_daemon_origin = capability_src.lines().any(|line| {
+        let capability_uses_daemon_origin = capability_clean.lines().any(|line| {
             let trimmed = line.trim_start();
             !trimmed.starts_with("//") && trimmed.contains("daemon_origin")
         });
@@ -1823,7 +1859,7 @@ mod tests {
         // would need to be a state field (e.g. `pending_promotion:
         // Option<...>`) that survives across multiple migration-
         // handler dispatches.
-        let standby_has_pending = standby_src.lines().any(|line| {
+        let standby_has_pending = standby_clean.lines().any(|line| {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") {
                 return false;

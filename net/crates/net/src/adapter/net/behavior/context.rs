@@ -27,10 +27,20 @@ use super::NodeId;
 /// is `extern "C"`-safe (terminates rather than unwinds) and
 /// loss-of-availability is the only safe response when the
 /// system can't produce randomness.
+///
+/// Cubic P2: the diagnostic uses a fallible `writeln!` rather
+/// than `eprintln!` because the latter panics if the underlying
+/// stderr write fails (closed fd, sandboxed process). A panic
+/// here would defeat the whole point of the abort path —
+/// unwinding across the FFI boundary that we're trying to
+/// protect — so we ignore any write error and proceed straight
+/// to `abort()`.
 fn random_u64() -> u64 {
     let mut bytes = [0u8; 8];
     if let Err(e) = getrandom::fill(&mut bytes) {
-        eprintln!(
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
             "FATAL: behavior::context::random_u64 getrandom failure ({e:?}); \
              aborting to avoid panic across the FFI boundary"
         );
@@ -1727,12 +1737,19 @@ mod tests {
     /// releases the slot via Drop. We use `catch_unwind` to
     /// observe the panic without poisoning the test harness, then
     /// verify `active_count` rolled back.
+    ///
+    /// Cubic P2: read `active_count` directly rather than
+    /// `stats().active_traces`. The latter is `contexts.len()` —
+    /// the DashMap size — and a leaked reservation would bump the
+    /// atomic but never reach an insert, leaving the map size
+    /// unchanged and silently masking the regression.
     #[test]
     fn cr14_panic_between_reserve_and_commit_releases_slot() {
         use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::sync::atomic::Ordering;
 
         let store = ContextStore::new(8, 100, std::time::Duration::from_secs(60));
-        let initial_active = store.stats().active_traces;
+        let initial_active = store.active_count.load(Ordering::Relaxed);
 
         // Synthesize "reserve then panic before commit" via direct
         // guard manipulation — mirrors what would happen if a
@@ -1748,7 +1765,7 @@ mod tests {
         }));
 
         assert!(result.is_err(), "the closure must have panicked");
-        let after_active = store.stats().active_traces;
+        let after_active = store.active_count.load(Ordering::Relaxed);
         assert_eq!(
             after_active, initial_active,
             "CR-14 regression: panic between reserve and commit MUST roll \
@@ -1781,16 +1798,16 @@ mod tests {
             assert!(
                 !trimmed.contains(&needle_expect),
                 "CR-21 regression: getrandom::fill(...).expect(...) reintroduced \
-                 at context.rs:{}. Use the abort-on-fail pattern (eprintln + \
-                 std::process::abort).\n  line: {}",
+                 at context.rs:{}. Use the abort-on-fail pattern (fallible \
+                 writeln to stderr + std::process::abort).\n  line: {}",
                 lineno + 1,
                 line
             );
             assert!(
                 !trimmed.contains(&needle_unwrap),
                 "CR-21 regression: getrandom::fill(...).unwrap() reintroduced \
-                 at context.rs:{}. Use the abort-on-fail pattern (eprintln + \
-                 std::process::abort).\n  line: {}",
+                 at context.rs:{}. Use the abort-on-fail pattern (fallible \
+                 writeln to stderr + std::process::abort).\n  line: {}",
                 lineno + 1,
                 line
             );

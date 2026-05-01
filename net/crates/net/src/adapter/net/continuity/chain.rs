@@ -332,20 +332,27 @@ pub fn assess_continuity(log: &EntityLog, snapshot: Option<&StateSnapshot>) -> C
         if s.through_seq.checked_add(1) == Some(first_seq) {
             // CR-34: a snapshot with `head_payload` empty for a
             // non-genesis (`chain_link.sequence > 0`) snapshot has
-            // not been populated by the caller. The anchor hash
-            // computed against an empty payload will only match
-            // if the producer side ALSO had an empty payload at
-            // through_seq — usually wrong, masquerading as a
-            // legitimate chain mismatch. Surfaces as
-            // `Unverifiable` rather than `Forked` to distinguish
-            // "missing payload context" from "real chain
-            // divergence." Genesis snapshots (sequence == 0)
-            // legitimately have empty head_payload and continue
-            // through the standard path.
-            if s.chain_link.sequence > 0 && s.head_payload.is_empty() {
-                None
-            } else {
-                Some(compute_parent_hash(&s.chain_link, &s.head_payload))
+            // CR-34 + Cubic P2: distinguish "missing payload
+            // context" from "real chain divergence."
+            // `head_payload` is `Option<Bytes>` post-Cubic-P2 so
+            // `None` is the unambiguous "caller didn't populate"
+            // sentinel — a `Some(Bytes::new())` for a legitimate
+            // empty-payload event is a different case and goes
+            // through the normal hash path.
+            //
+            // Special case: a genesis snapshot's head event has
+            // no predecessor payload. The legitimate way to
+            // express that is `Some(Bytes::new())`, but
+            // historically callers also leave it `None` for
+            // genesis since there's nothing to populate. We
+            // accept either for `chain_link.sequence == 0`:
+            // treat None-at-genesis as Some(empty) since that's
+            // what the original genesis-anchor branch used.
+            match (s.chain_link.sequence, &s.head_payload) {
+                (0, Some(payload)) => Some(compute_parent_hash(&s.chain_link, payload)),
+                (0, None) => Some(compute_parent_hash(&s.chain_link, &[])),
+                (_, Some(payload)) => Some(compute_parent_hash(&s.chain_link, payload)),
+                (_, None) => None, // missing context — Unverifiable
             }
         } else {
             None
@@ -578,7 +585,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: event_at_10.payload.clone(),
+            head_payload: Some(event_at_10.payload.clone()),
         };
 
         let status = assess_continuity(&log, Some(&snapshot));
@@ -612,7 +619,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
 
         let status = assess_continuity(&log, Some(&snapshot));
@@ -667,7 +674,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
 
         let status = assess_continuity(&log, Some(&snapshot));
@@ -733,7 +740,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
 
         let status = assess_continuity(&log, Some(&snapshot));
@@ -785,7 +792,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
 
         let status = assess_continuity(&log, Some(&snapshot));
@@ -799,6 +806,80 @@ mod tests {
             other => panic!(
                 "CR-34: genesis snapshot (seq=0) with empty head_payload must \
                  be Continuous (legitimate), got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Cubic P2: pin that `Some(Bytes::new())` is treated as a
+    /// LEGITIMATE empty payload — NOT as missing context. An
+    /// event's actual payload can be empty (zero-byte event)
+    /// and the resulting snapshot's `head_payload` should
+    /// faithfully carry `Some(Bytes::new())`. Pre-Cubic-P2 the
+    /// `head_payload.is_empty()` sentinel conflated this case
+    /// with `None` and falsely marked the snapshot as
+    /// Unverifiable.
+    ///
+    /// Setup: a log where the head event's payload happens to
+    /// be empty bytes. The snapshot anchors at that event; the
+    /// expected anchor hash is `xxh3(chain_link ++ &[])` — and
+    /// the log's seq=11 event has its `parent_hash` computed
+    /// against that exact hash. The chain validates as
+    /// Continuous.
+    #[test]
+    fn cubic_p2_some_empty_head_payload_validates_as_legitimate() {
+        use crate::adapter::net::identity::EntityKeypair;
+        use crate::adapter::net::state::causal::CausalChainBuilder;
+        use crate::adapter::net::state::horizon::ObservedHorizon;
+        use crate::adapter::net::state::EntityLog;
+
+        let kp = EntityKeypair::generate();
+        let mut log = EntityLog::new(kp.entity_id().clone());
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+
+        // Build a chain where event 10 has an EMPTY payload.
+        for i in 0..20usize {
+            let payload = if i == 9 {
+                // Event 10 (1-indexed) — empty payload.
+                bytes::Bytes::new()
+            } else {
+                bytes::Bytes::from(format!("event-{}", i))
+            };
+            let event = builder.append(payload, 0).unwrap();
+            log.append(event).unwrap();
+        }
+        let event_at_10 = log.range(10, 10)[0].clone();
+        assert!(
+            event_at_10.payload.is_empty(),
+            "test setup: event 10 must have an empty payload"
+        );
+        log.prune_through(10);
+
+        // Snapshot anchors at the empty-payload event. The caller
+        // populates `head_payload` honestly with `Some(empty)`.
+        let snapshot = StateSnapshot {
+            version: 1,
+            entity_id: log.entity_id().clone(),
+            through_seq: 10,
+            chain_link: event_at_10.link,
+            state: bytes::Bytes::new(),
+            horizon: ObservedHorizon::default(),
+            created_at: 0,
+            bindings_bytes: Vec::new(),
+            identity_envelope: None,
+            head_payload: Some(event_at_10.payload.clone()),
+        };
+
+        let status = assess_continuity(&log, Some(&snapshot));
+        match status {
+            ContinuityStatus::Continuous { .. } => {
+                // Expected: legitimate empty-payload event,
+                // explicitly populated head_payload, anchor
+                // matches.
+            }
+            other => panic!(
+                "Cubic P2: Some(Bytes::new()) for a legitimate empty-payload \
+                 head event must be Continuous (NOT Unverifiable). got {:?}",
                 other
             ),
         }
@@ -844,7 +925,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
 
         let status = assess_continuity(&log, Some(&snapshot));
@@ -886,7 +967,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: event_at_10.payload.clone(),
+            head_payload: Some(event_at_10.payload.clone()),
         };
 
         let status = assess_continuity(&log, Some(&snapshot));

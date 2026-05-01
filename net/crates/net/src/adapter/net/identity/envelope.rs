@@ -380,8 +380,23 @@ impl IdentityEnvelope {
                 // succeeds under v0 AAD also passed the v1
                 // attestation, so it's a legitimate pre-#127
                 // envelope from a rolling-upgrade peer.
-                aead.decrypt((&nonce).into(), Payload { msg: ct, aad: &[] })
-                    .map_err(|_| EnvelopeError::SealOpenFailed)?
+                //
+                // Cubic P2: on the fallback's decrypt failure
+                // path, scrub the derived AEAD `key` BEFORE
+                // returning Err. Pre-fix the early return via
+                // `?` left the key (a function of the shared
+                // DH output — sensitive material) on the stack
+                // until natural drop, which `[u8; 32]`'s
+                // default Drop does NOT zeroize. The other
+                // failure paths in this function already do
+                // this; the v0-fallback path was missed.
+                match aead.decrypt((&nonce).into(), Payload { msg: ct, aad: &[] }) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        volatile_zero(&mut key);
+                        return Err(EnvelopeError::SealOpenFailed);
+                    }
+                }
             }
         };
         if seed_vec.len() != SEED_LEN {

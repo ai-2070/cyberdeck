@@ -125,11 +125,22 @@ pub struct StateSnapshot {
     /// event through the migration message itself, paired with the
     /// snapshot bytes.
     ///
+    /// Cubic P2: changed from `Bytes` to `Option<Bytes>` so the
+    /// "no head_payload context attached" case is structurally
+    /// distinct from "head event genuinely had an empty payload."
+    /// Pre-Cubic-P2 the empty-Bytes sentinel conflated both:
+    /// `assess_continuity` rejected legitimate non-genesis
+    /// snapshots whose head event happened to carry an empty
+    /// payload as if they were missing-context. With the Option,
+    /// `Some(Bytes::new())` is "head event payload is empty"
+    /// (legitimate) and `None` is "caller hasn't populated this
+    /// field" (verification can't proceed).
+    ///
     /// Default for snapshots deserialized from wire bytes is
-    /// `Bytes::new()`; callers must populate it from the head event
-    /// before `EntityLog::from_snapshot` can validate subsequent
-    /// events.
-    pub head_payload: Bytes,
+    /// `None`; callers populate it from the head event via
+    /// `with_head_payload` before `EntityLog::from_snapshot` can
+    /// validate subsequent events.
+    pub head_payload: Option<Bytes>,
 }
 
 impl StateSnapshot {
@@ -151,7 +162,7 @@ impl StateSnapshot {
             created_at: current_timestamp(),
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: Bytes::new(),
+            head_payload: None,
         }
     }
 
@@ -162,7 +173,7 @@ impl StateSnapshot {
     /// snapshots carry the payload of the event at
     /// `chain_link.sequence`.
     pub fn with_head_payload(mut self, head_payload: Bytes) -> Self {
-        self.head_payload = head_payload;
+        self.head_payload = Some(head_payload);
         self
     }
 
@@ -446,7 +457,7 @@ impl StateSnapshot {
             identity_envelope,
             // Runtime-only: not on the wire. Caller populates from
             // the head event before invoking `EntityLog::from_snapshot`.
-            head_payload: Bytes::new(),
+            head_payload: None,
         })
     }
 
@@ -506,7 +517,7 @@ impl StateSnapshot {
             created_at,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: Bytes::new(),
+            head_payload: None,
         })
     }
 
@@ -1350,17 +1361,17 @@ mod tests {
             ObservedHorizon::new(),
         );
         assert!(
-            snap.head_payload.is_empty(),
-            "default constructor leaves head_payload empty"
+            snap.head_payload.is_none(),
+            "default constructor leaves head_payload as None (Cubic P2)"
         );
 
         // Pin `created_at` so the wire-byte comparison below is
         // deterministic — the field is sampled from the system
         // clock at construction.
         snap.created_at = 0;
-        // with_head_payload stores the bytes.
+        // with_head_payload stores the bytes wrapped in Some.
         let snap = snap.with_head_payload(head_event_payload.clone());
-        assert_eq!(snap.head_payload, head_event_payload);
+        assert_eq!(snap.head_payload.as_ref(), Some(&head_event_payload));
 
         // Wire format is unchanged: head_payload is NOT serialized.
         // We pin this two ways:
@@ -1388,16 +1399,17 @@ mod tests {
             "wire bytes must be identical regardless of head_payload"
         );
 
-        // Round-trip: head_payload defaults to empty after parse.
+        // Round-trip: head_payload is None after parse (Cubic P2:
+        // explicit "context missing" sentinel, not Bytes::new()).
         let parsed = StateSnapshot::from_bytes(&bytes_with).unwrap();
         assert!(
-            parsed.head_payload.is_empty(),
-            "head_payload after round-trip must be empty (runtime-only field)"
+            parsed.head_payload.is_none(),
+            "head_payload after round-trip must be None (runtime-only field)"
         );
 
         // Caller populates head_payload from the head event they
         // already have, then restore can succeed.
         let parsed = parsed.with_head_payload(head_event_payload.clone());
-        assert_eq!(parsed.head_payload, head_event_payload);
+        assert_eq!(parsed.head_payload.as_ref(), Some(&head_event_payload));
     }
 }

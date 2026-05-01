@@ -718,9 +718,28 @@ impl DiffEngine {
                 actual: current_version,
             });
         }
-        // Internal: the version check just succeeded, so we delegate
-        // to the unchecked apply rather than the deprecated public
-        // wrapper (avoids the deprecation warning at this site).
+        // Cubic P1: also reject diffs that don't advance the
+        // version forward. Pre-Cubic-P1 a diff with
+        // `new_version <= base_version` (legitimate base, but
+        // regressing or stationary new_version) was applied —
+        // the receiver's state would change while the tracked
+        // version went backward (or stayed put). `validate_chain`
+        // catches this when chains are validated in bulk, but a
+        // single `apply_with_version` call had no protection.
+        // The check is consistent with `validate_chain`'s
+        // strict-forward-progress invariant and prevents
+        // single-diff rollback even in the absence of chain
+        // validation.
+        if diff.new_version <= diff.base_version {
+            return Err(DiffError::NotApplicable(format!(
+                "non-forward diff version: {} -> {}",
+                diff.base_version, diff.new_version
+            )));
+        }
+        // Internal: the version checks just succeeded, so we
+        // delegate to the unchecked apply rather than the
+        // deprecated public wrapper (avoids the deprecation
+        // warning at this site).
         Self::apply_unchecked(base, diff, strict)
     }
 
@@ -1288,6 +1307,42 @@ mod tests {
             ),
             "expected VersionMismatch {{ expected: 2, actual: 5 }}, got {:?}",
             err,
+        );
+    }
+
+    /// Cubic P1: `apply_with_version` must also reject a diff
+    /// whose `new_version` does not advance forward of
+    /// `base_version`. A regressing diff (`base=5 → new=3`) or a
+    /// stationary diff (`base=5 → new=5`) would otherwise apply
+    /// the ops while leaving the receiver's tracked version at
+    /// or behind where it started — silent state divergence
+    /// across replicas, identical in shape to the BUG #125
+    /// hazard `apply_with_version` was originally introduced to
+    /// fix. `validate_chain` catches this in bulk; the single-
+    /// call apply path now catches it too.
+    #[test]
+    fn cubic_p1_apply_with_version_rejects_non_forward_new_version() {
+        let caps = sample_capability_set();
+
+        // Regression: base=5, new=3 (rolls forward in apply, but
+        // tracked version goes backward).
+        let regressing = CapabilityDiff::new(1, 5, 3, vec![DiffOp::AddTag("a".into())]);
+        let err = DiffEngine::apply_with_version(&caps, 5, &regressing, false)
+            .expect_err("regressing diff must be rejected");
+        assert!(
+            matches!(err, DiffError::NotApplicable(ref msg) if msg.contains("non-forward")),
+            "expected NotApplicable about non-forward diff version, got {:?}",
+            err
+        );
+
+        // Stationary: base=5, new=5. Same hazard at zero rate.
+        let stationary = CapabilityDiff::new(1, 5, 5, vec![DiffOp::AddTag("b".into())]);
+        let err = DiffEngine::apply_with_version(&caps, 5, &stationary, false)
+            .expect_err("stationary diff must be rejected");
+        assert!(
+            matches!(err, DiffError::NotApplicable(ref msg) if msg.contains("non-forward")),
+            "expected NotApplicable about non-forward diff version, got {:?}",
+            err
         );
     }
 

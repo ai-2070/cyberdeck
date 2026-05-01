@@ -143,27 +143,32 @@ impl DaemonHost {
         // the prior behavior — but this fallback only works when
         // the source side made the same choice.
         //
-        // CR-34: warn when the fallback fires for a non-genesis
-        // snapshot. Genesis snapshots (`sequence == 0`) legitimately
-        // carry an empty head_payload — the genesis link's
-        // predecessor doesn't exist, so there's no payload to
-        // forward. For non-genesis the fallback is fragile and
-        // operators need to know.
-        let head_payload = if snapshot.head_payload.is_empty() {
-            if snapshot.chain_link.sequence > 0 {
-                tracing::warn!(
-                    sequence = snapshot.chain_link.sequence,
-                    entity_id = ?snapshot.entity_id,
-                    "DaemonHost::from_snapshot: head_payload is empty for non-genesis \
-                     snapshot — falling back to snapshot.state which only validates \
-                     against subsequent events if the source side made the same choice. \
-                     Production callers MUST populate head_payload via \
-                     `StateSnapshot::with_head_payload` before passing to from_snapshot."
-                );
+        // CR-34 + Cubic P2: `head_payload` is `Option<Bytes>`.
+        // `Some(bytes)` is the legitimate "caller populated the
+        // head event payload" path; `None` is the unambiguous
+        // "context missing" sentinel. Pre-Cubic-P2 the
+        // empty-Bytes sentinel conflated empty payloads with
+        // missing context. For genesis snapshots (sequence == 0)
+        // a missing payload is fine — there's no predecessor.
+        // For non-genesis with no payload, fall back to
+        // snapshot.state and warn loudly.
+        let head_payload = match &snapshot.head_payload {
+            Some(payload) => payload.clone(),
+            None => {
+                if snapshot.chain_link.sequence > 0 {
+                    tracing::warn!(
+                        sequence = snapshot.chain_link.sequence,
+                        entity_id = ?snapshot.entity_id,
+                        "DaemonHost::from_snapshot: head_payload not populated for \
+                         non-genesis snapshot — falling back to snapshot.state which \
+                         only validates against subsequent events if the source side \
+                         made the same choice. Production callers MUST populate \
+                         head_payload via `StateSnapshot::with_head_payload` before \
+                         passing to from_snapshot. (CR-34 / Cubic P2)"
+                    );
+                }
+                snapshot.state.clone()
             }
-            snapshot.state.clone()
-        } else {
-            snapshot.head_payload.clone()
         };
         let chain = CausalChainBuilder::from_head(snapshot.chain_link, head_payload);
 
@@ -279,22 +284,24 @@ impl DaemonHost {
         // logic as `from_snapshot` for the runtime-only
         // `head_payload`.
         //
-        // CR-34: warn when the fallback fires for a non-genesis
-        // snapshot. See `from_snapshot` for the rationale.
-        let head_payload = if snapshot.head_payload.is_empty() {
-            if snapshot.chain_link.sequence > 0 {
-                tracing::warn!(
-                    sequence = snapshot.chain_link.sequence,
-                    entity_id = ?snapshot.entity_id,
-                    "DaemonHost::restore_from_snapshot: head_payload is empty for \
-                     non-genesis snapshot — falling back to snapshot.state. \
-                     Production callers MUST populate head_payload via \
-                     `StateSnapshot::with_head_payload`."
-                );
+        // CR-34 + Cubic P2: see `from_snapshot` for full
+        // rationale. `head_payload: Option<Bytes>` distinguishes
+        // legitimate empty payloads from missing context.
+        let head_payload = match &snapshot.head_payload {
+            Some(payload) => payload.clone(),
+            None => {
+                if snapshot.chain_link.sequence > 0 {
+                    tracing::warn!(
+                        sequence = snapshot.chain_link.sequence,
+                        entity_id = ?snapshot.entity_id,
+                        "DaemonHost::restore_from_snapshot: head_payload not populated \
+                         for non-genesis snapshot — falling back to snapshot.state. \
+                         Production callers MUST populate head_payload via \
+                         `StateSnapshot::with_head_payload`. (CR-34 / Cubic P2)"
+                    );
+                }
+                snapshot.state.clone()
             }
-            snapshot.state.clone()
-        } else {
-            snapshot.head_payload.clone()
         };
         self.chain = CausalChainBuilder::from_head(snapshot.chain_link, head_payload);
         self.horizon = snapshot.horizon.clone();

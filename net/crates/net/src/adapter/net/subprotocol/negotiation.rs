@@ -545,7 +545,7 @@ mod tests {
         let manifest = SubprotocolManifest::from_registry(&reg);
         let manifest_ids: Vec<u16> = manifest.entries.iter().map(|e| e.id).collect();
 
-        let mut tag_ids: Vec<u16> = reg
+        let tag_ids: Vec<u16> = reg
             .capability_tags()
             .iter()
             .filter_map(|t| {
@@ -554,15 +554,16 @@ mod tests {
             })
             .collect();
 
-        // CR-31: pin both as Vecs in ascending id order. The
-        // manifest is sorted (BUG #149); we sort the tag list to
-        // make the comparison fair, then assert the SORTED forms
-        // match exactly. This catches a future divergence even
-        // if `capability_tags()` is unsorted today (DashMap
-        // iteration order).
+        // CR-31 + Cubic P2: pin BOTH channels emit in ascending
+        // id order — DO NOT sort `tag_ids` before comparing.
+        // The earlier shape sorted tag_ids, which only verified
+        // they contained the same SET of ids (already pinned by
+        // `from_registry_and_capability_tags_advertise_the_same_subprotocols`).
+        // The whole point of CR-31 was to catch order-divergence,
+        // so the comparison must be against the sorted manifest
+        // verbatim with NO sort on the tag_ids side.
         let mut expected_sorted = manifest_ids.clone();
         expected_sorted.sort();
-        tag_ids.sort();
 
         assert_eq!(
             manifest_ids, expected_sorted,
@@ -570,10 +571,13 @@ mod tests {
         );
         assert_eq!(
             tag_ids, expected_sorted,
-            "capability_tags must contain the same set of ids as the manifest \
-             (CR-31 / BUG #131): once both channels' bytes are consumed by a \
-             downstream digest optimisation, this divergence becomes a silent \
-             dedup-bypass"
+            "Cubic P2: capability_tags must emit ids in ascending order to \
+             match from_registry. Pre-fix this test sorted tag_ids before \
+             comparing, which silently let an unordered capability_tags() \
+             pass. Once both channels' bytes are consumed by a downstream \
+             digest optimisation (CR-31 / BUG #131), order divergence \
+             becomes a silent dedup-bypass.\nGot:      {:?}\nExpected: {:?}",
+            tag_ids, expected_sorted
         );
     }
 }

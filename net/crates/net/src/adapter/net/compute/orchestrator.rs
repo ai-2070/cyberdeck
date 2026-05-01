@@ -1464,14 +1464,40 @@ mod tests {
     #[test]
     fn cr32_unwired_source_handler_must_emit_loud_warn() {
         let src = include_str!("orchestrator.rs");
-        // Anchor on the unique CR-32 comment marker to avoid
-        // matching the wrong `None =>` site.
-        let anchor = "CR-32: surface the unwired-source-handler";
-        let anchor_idx = src.find(anchor).expect(
-            "CR-32 regression: the CR-32 comment marker in start_migration's None arm \
-             is gone — either the fix was reverted or the comment was rewritten. \
+
+        // Cubic P2: anchor on a string we BUILD at runtime so this
+        // test's own source doesn't contain the verbatim anchor —
+        // otherwise `src.find(anchor)` would match the test's own
+        // literal and the test would silently pass even after the
+        // production warn block was removed.
+        //
+        // The runtime-assembled anchor only matches the
+        // production comment line, which writes the marker as
+        // a plain English phrase rather than concatenating
+        // fragments.
+        let anchor = format!(
+            "{}{}{}",
+            "CR-32: surface ", "the unwired-", "source-handler"
+        );
+        let anchor_idx = src.find(&anchor).expect(
+            "CR-32 regression: the production CR-32 marker in start_migration's None \
+             arm is gone — either the fix was reverted or the comment was rewritten. \
              If the fix is intentionally being changed, update this test.",
         );
+
+        // Sanity: the anchor must occur exactly ONCE so the
+        // production block is the only match (Cubic P2: the
+        // earlier shape would falsely pass if the anchor existed
+        // anywhere else in the file, including in this test's
+        // own source).
+        let occurrences = src.matches(&anchor).count();
+        assert_eq!(
+            occurrences, 1,
+            "CR-32 anchor must occur exactly once in orchestrator.rs (production \
+             site). Got {occurrences} occurrences — the test source likely contains \
+             a verbatim copy of the anchor, defeating the tripwire."
+        );
+
         let block: String = src[anchor_idx..]
             .lines()
             .take(20)
@@ -1487,8 +1513,11 @@ mod tests {
             block.contains("source_handler"),
             "CR-32 regression: warn message must reference source_handler"
         );
+        // Build the BUG/CR-32 needles at runtime too, same reason.
+        let bug_needle = format!("{} {}", "BUG", "#104");
+        let cr32_needle = format!("{}-{}", "CR", "32");
         assert!(
-            block.contains("BUG #104") || block.contains("CR-32"),
+            block.contains(&bug_needle) || block.contains(&cr32_needle),
             "CR-32 regression: warn message must reference BUG #104 or CR-32 \
              so log scrapers can correlate the warn with the audit-doc context"
         );

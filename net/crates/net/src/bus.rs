@@ -815,7 +815,8 @@ impl EventBus {
     /// The total wall-clock budget is the sum of three phases:
     ///   * Phase 1 (ring-buffer drain): up to **5 s**.
     ///   * Phase 2 (channel + pending-batch drain): up to
-    ///     `max(2 s, batch.max_delay × n_workers)`.
+    ///     `min(2 s, batch.max_delay × n_workers)` — capped at 2 s
+    ///     so a misconfigured `max_delay` cannot inflate the budget.
     ///   * Phase 3 (`adapter.flush()` call): up to `adapter_timeout`
     ///     (default **30 s**).
     ///
@@ -1327,9 +1328,40 @@ fn shutdown_via_ref_spin_deadline() -> std::time::Duration {
 /// [`set_shutdown_via_ref_spin_deadline_for_test`] from inside
 /// a test that needs to exercise the deadline-elapsed path
 /// without wall-clock-waiting the full 10s.
+///
+/// Cubic P2: this is a global atomic shared across all tests in
+/// the `cargo test --lib` binary. If two tests touched it
+/// concurrently, one's override would leak into the other's
+/// expectations. Tests that use the override MUST take the
+/// [`SHUTDOWN_DEADLINE_OVERRIDE_GUARD`] mutex for the duration
+/// of their override-setter / read window — see
+/// [`set_shutdown_via_ref_spin_deadline_for_test`].
 #[cfg(test)]
 static SHUTDOWN_VIA_REF_DEADLINE_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Cubic P2: serializes access to the deadline override so
+/// concurrent tests can't observe each other's transient values.
+/// Tests that override the deadline take this mutex via
+/// [`shutdown_deadline_override_lock`] and hold the guard until
+/// they reset the override to 0.
+///
+/// Uses `tokio::sync::Mutex` rather than `std::sync::Mutex` so
+/// the guard can legitimately be held across `.await` points
+/// while the guarded test runs (clippy::await_holding_lock would
+/// otherwise fire on the std variant — and rightly so for
+/// production code).
+#[cfg(test)]
+static SHUTDOWN_DEADLINE_OVERRIDE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Acquire the guard mutex protecting the deadline-override
+/// static. Tests touching the override hold the returned guard
+/// across both the set and the reset, so concurrent tests
+/// observe a consistent default.
+#[cfg(test)]
+pub(crate) async fn shutdown_deadline_override_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    SHUTDOWN_DEADLINE_OVERRIDE_GUARD.lock().await
+}
 
 #[cfg(test)]
 fn shutdown_via_ref_spin_deadline() -> std::time::Duration {
@@ -2287,6 +2319,11 @@ mod tests {
             }
         }
 
+        // Cubic P2: serialize access to the global deadline
+        // override so concurrent tests don't interfere. Hold the
+        // guard until the override is reset to 0 below.
+        let _override_guard = super::shutdown_deadline_override_lock().await;
+
         // Override the second-caller spin deadline to a short
         // value so the test doesn't wall-clock-wait 10s. Production
         // builds use the 10s default (the cfg(test) override is
@@ -2312,11 +2349,20 @@ mod tests {
         let bus_first = Arc::clone(&bus);
         let first_caller = tokio::spawn(async move { bus_first.shutdown_via_ref().await });
 
-        // Give the first caller a moment to win the CAS and enter
-        // the slow flush. Without this yield, both callers might
-        // race for the CAS and the test's outcome depends on
-        // scheduling order.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Cubic P2: poll `is_shutdown()` until the first caller
+        // has set the flag, instead of a fixed sleep. This makes
+        // the test scheduler-independent — we proceed as soon as
+        // the first caller has won the CAS, regardless of how
+        // tokio happens to schedule things. Bounded by a 1s
+        // timeout so a regression that prevents `shutdown_via_ref`
+        // from setting the flag doesn't hang the test.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !bus.is_shutdown() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first caller did not set shutdown flag within 1s");
 
         // The second caller's CAS will fail; it enters the spin
         // and times out at 50ms.
@@ -2324,7 +2370,7 @@ mod tests {
         let second_result = bus.shutdown_via_ref().await;
         let elapsed = start.elapsed();
 
-        // Reset the override for other tests.
+        // Reset the override for other tests, then drop the guard.
         super::set_shutdown_via_ref_spin_deadline_for_test(0);
 
         // CR-25 contract: the second caller MUST get a Transient

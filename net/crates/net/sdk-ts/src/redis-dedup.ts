@@ -33,10 +33,15 @@
  *   const entries = await r.xRange('net:shard:0', start, '+', { COUNT: 100 });
  *   if (entries.length === 0) break;
  *   for (const entry of entries) {
+ *     // Cubic P2: advance the cursor BEFORE the duplicate check.
+ *     // The earlier shape's `continue` skipped the `cursor = entry.id`
+ *     // assignment when an entry was a duplicate, so on a window
+ *     // full of duplicates the loop would spin forever re-reading
+ *     // the same range.
+ *     cursor = entry.id;
  *     const dedupId = entry.message.dedup_id;
  *     if (dedupId && dedup.isDuplicate(dedupId)) continue;
  *     await process(entry);
- *     cursor = entry.id;
  *   }
  * }
  * ```

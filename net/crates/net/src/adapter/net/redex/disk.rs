@@ -161,6 +161,17 @@ pub(super) struct DiskSegment {
     /// AND a worker is listening (spawned by
     /// `RedexFile::open_persistent`).
     pub(super) fsync_signal: Arc<Notify>,
+    /// CR-4 / Cubic P1: segment poisoning. Set to `true` when
+    /// `compact_to`'s post-rename re-open phase fails after the
+    /// renames committed AND the cached file handles are
+    /// pointing at temp-dir placeholders rather than the
+    /// channel files. Once poisoned, every append / sync /
+    /// compact path returns `RedexError::Io` immediately —
+    /// preventing acknowledged writes from landing in
+    /// `/tmp` instead of the channel directory. Operators
+    /// recover by closing and re-opening the channel (which
+    /// constructs a fresh `DiskSegment` with valid handles).
+    poisoned: std::sync::atomic::AtomicBool,
     /// Test-only injection: when set, the next `append_entry` /
     /// `append_entries` call returns `RedexError::Io` before touching
     /// either file. Exercises the caller's rollback paths without
@@ -463,6 +474,7 @@ impl DiskSegment {
                 appends_since_sync: AtomicU64::new(0),
                 bytes_since_sync: AtomicU64::new(0),
                 fsync_signal: Arc::new(Notify::new()),
+                poisoned: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 fail_next_append: AtomicBool::new(false),
                 #[cfg(test)]
@@ -615,6 +627,18 @@ impl DiskSegment {
         payload: &[u8],
         timestamp_ns: u64,
     ) -> Result<(), RedexError> {
+        // Cubic P1: refuse writes against a poisoned segment.
+        // `compact_to` sets this flag when its post-rename
+        // re-open phase fails — the cached file handles are
+        // pointing at temp-dir placeholders and any append
+        // would land in `/tmp` instead of the channel directory.
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RedexError::Io(
+                "redex segment is poisoned (compact_to post-rename reopen failure); \
+                 close and re-open the channel to recover (Cubic P1)"
+                    .into(),
+            ));
+        }
         #[cfg(test)]
         if self.fail_next_append.swap(false, Ordering::AcqRel) {
             return Err(RedexError::Io("test-injected append failure".into()));
@@ -838,6 +862,15 @@ impl DiskSegment {
         entries_and_payloads: &[(RedexEntry, &[u8])],
         timestamps: &[u64],
     ) -> Result<(), RedexError> {
+        // Cubic P1: refuse writes against a poisoned segment.
+        // See `append_entry_inner` for the full rationale.
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RedexError::Io(
+                "redex segment is poisoned (compact_to post-rename reopen failure); \
+                 close and re-open the channel to recover (Cubic P1)"
+                    .into(),
+            ));
+        }
         #[cfg(test)]
         if self.fail_next_append.swap(false, Ordering::AcqRel) {
             return Err(RedexError::Io("test-injected append failure".into()));
@@ -1090,6 +1123,15 @@ impl DiskSegment {
         surviving_timestamps: &[u64],
         dat_base: u64,
     ) -> Result<(), RedexError> {
+        // Cubic P1: refuse compact against a poisoned segment.
+        // A poisoned segment's cached handles point at temp-dir
+        // placeholders; running another compact would compound
+        // the off-channel-directory hazard.
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RedexError::Io(
+                "redex segment is poisoned; refusing compact_to (Cubic P1)".into(),
+            ));
+        }
         #[cfg(test)]
         if self.fail_next_compact.swap(false, Ordering::AcqRel) {
             return Err(RedexError::Io("test-injected compact_to failure".into()));
@@ -1298,9 +1340,36 @@ impl DiskSegment {
         // paths before using the cached handles. This restores
         // correctness even in the post-rename failure window
         // without panicking.
-        let new_idx = reopen_with_retries(&idx_path).map_err(RedexError::io)?;
-        let new_dat = reopen_with_retries(&dat_path).map_err(RedexError::io)?;
-        let new_ts = reopen_with_retries(&ts_path).map_err(RedexError::io)?;
+        // Cubic P1: open all 6 handles into LOCAL VARIABLES first.
+        // If ANY of them fails, the cached guards are still
+        // pointing at the temp-dir placeholders and the segment
+        // becomes unsafe to write to (subsequent appends would
+        // land in `/tmp` instead of the channel dir). Pre-Cubic-P1
+        // we propagated the Err with `?` immediately, leaving the
+        // caller's error path responsible for noticing the
+        // poisoned state — but no caller does. Now: any failure
+        // sets `poisoned = true` and the segment refuses all
+        // further write paths until the channel is re-opened.
+        // This trades a noisy hard-error for the silent
+        // write-to-/tmp regression the audit identified.
+        let open_or_poison = |path: &Path| -> Result<File, RedexError> {
+            reopen_with_retries(path).map_err(|e| {
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::error!(
+                    error = %e,
+                    path = %path.display(),
+                    "redex compact_to: post-rename reopen FAILED — segment \
+                     poisoned to prevent writes from landing in temp-dir \
+                     placeholders. Channel must be re-opened to recover. \
+                     (Cubic P1)"
+                );
+                RedexError::io(e)
+            })
+        };
+        let new_idx = open_or_poison(&idx_path)?;
+        let new_dat = open_or_poison(&dat_path)?;
+        let new_ts = open_or_poison(&ts_path)?;
 
         // CR-11: per-file durability flush. On POSIX `fsync_dir`
         // above already covered the dir-level rename durability;
@@ -1323,9 +1392,25 @@ impl DiskSegment {
             tracing::warn!(error = %e, "post-compact sync_all on ts failed (best-effort)");
         }
 
-        let new_idx_worker = new_idx.try_clone().map_err(RedexError::io)?;
-        let new_dat_worker = new_dat.try_clone().map_err(RedexError::io)?;
-        let new_ts_worker = new_ts.try_clone().map_err(RedexError::io)?;
+        // Cubic P1: clone failures also poison (same hazard —
+        // the cached guard slots aren't yet swapped, but if we
+        // bubble Err with `?` here, the slots remain at temp-dir
+        // placeholders).
+        let clone_or_poison = |f: &File, kind: &str| -> Result<File, RedexError> {
+            f.try_clone().map_err(|e| {
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::error!(
+                    error = %e,
+                    kind = kind,
+                    "redex compact_to: post-rename try_clone FAILED — segment poisoned"
+                );
+                RedexError::io(e)
+            })
+        };
+        let new_idx_worker = clone_or_poison(&new_idx, "idx")?;
+        let new_dat_worker = clone_or_poison(&new_dat, "dat")?;
+        let new_ts_worker = clone_or_poison(&new_ts, "ts")?;
 
         // All six handles open successfully — atomically slot them.
         *idx_guard = new_idx;
@@ -2546,6 +2631,67 @@ mod tests {
             seqs,
             vec![2, 99],
             "post-compact append must be on the channel dat, not a tmp placeholder"
+        );
+
+        cleanup(&base);
+    }
+
+    /// Cubic P1: pin the segment-poisoning recovery contract.
+    /// When `compact_to`'s post-rename re-open fails, the cached
+    /// file handles point at temp-dir placeholders. Subsequent
+    /// appends MUST refuse rather than silently writing into
+    /// `/tmp`. We test the post-condition (poison flag → all
+    /// write paths refuse) by manually flipping the flag,
+    /// independent of the fs-fault-injection seam.
+    #[test]
+    fn cubic_p1_poisoned_segment_refuses_writes() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/poison").unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+
+        // Sanity: a fresh segment accepts appends.
+        let payload: &[u8] = b"first";
+        let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, payload_checksum(payload));
+        recovered
+            .disk
+            .append_entry_at(&entry, payload, 1_000)
+            .expect("fresh segment must accept appends");
+
+        // Poison the segment as if `compact_to`'s re-open phase
+        // had failed.
+        recovered
+            .disk
+            .poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Every write path must refuse.
+        let entry2 = RedexEntry::new_heap(1, 5, payload.len() as u32, 0, payload_checksum(payload));
+        let err = recovered
+            .disk
+            .append_entry_at(&entry2, payload, 2_000)
+            .expect_err("poisoned segment must refuse append_entry_at");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("poisoned"),
+            "error message must reference poisoning; got: {msg}"
+        );
+
+        let err = recovered
+            .disk
+            .append_entries_at(&[(entry2, payload)], &[3_000])
+            .expect_err("poisoned segment must refuse append_entries_at");
+        assert!(
+            format!("{}", err).contains("poisoned"),
+            "append_entries_at error must reference poisoning"
+        );
+
+        let err = recovered
+            .disk
+            .compact_to(&[], &[], 0)
+            .expect_err("poisoned segment must refuse compact_to");
+        assert!(
+            format!("{}", err).contains("poisoned"),
+            "compact_to error must reference poisoning"
         );
 
         cleanup(&base);

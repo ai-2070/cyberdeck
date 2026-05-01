@@ -10,7 +10,11 @@ net/crates/net/sdk-ts/dist/
 net/crates/net/bindings/python/python/net/*.so
 net/crates/net/.claude/settings.local.json
 net/crates/net/bindings/python/.venv/*
-net/crates/net/bindings/python/python/*
+# ignore ALL python source, including new
+# binding files that should be tracked in git.
+net/crates/net/bindings/python/python/**/*.so
+net/crates/net/bindings/python/python/**/*.pyd
+net/crates/net/bindings/python/python/**/__pycache__/
 
 # Env variables
 .env

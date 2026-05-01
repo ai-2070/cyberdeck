@@ -1214,6 +1214,16 @@ pub struct MeshNode {
     shutdown_notify: Arc<Notify>,
     /// Whether the node has been started
     started: AtomicBool,
+    /// CR-7 / Cubic P1: number of `accept()` calls currently
+    /// awaiting `handshake_responder`. The pre-CR-7 guard
+    /// (`started.load(Acquire)` at `accept` entry) was a TOCTOU
+    /// — `start()` could fire between the check and the
+    /// `handshake_responder` poll, after which the dispatcher
+    /// would race the responder for inbound msg1 packets and
+    /// silently swallow them. The counter closes the race:
+    /// `accept()` increments on entry, decrements on exit, and
+    /// `start()` refuses while any `accept()` is in flight.
+    accept_in_flight: std::sync::atomic::AtomicUsize,
 }
 
 impl MeshNode {
@@ -1472,6 +1482,7 @@ impl MeshNode {
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             started: AtomicBool::new(false),
+            accept_in_flight: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1782,11 +1793,43 @@ impl MeshNode {
     /// nightmare, calling `accept()` after `start()` now returns an
     /// explicit error rather than spinning forever.
     pub async fn accept(&self, peer_node_id: u64) -> Result<(SocketAddr, u64), AdapterError> {
-        // CR-7: refuse if `start()` has already spawned the
-        // dispatch loop. The Acquire load pairs with the AcqRel
-        // swap in `start()` so we observe `started == true`
-        // strictly after the dispatcher has been published.
-        if self.started.load(Ordering::Acquire) {
+        use std::sync::atomic::Ordering as AtOrd;
+
+        // CR-7 + Cubic P1: race-free entry guard.
+        //
+        // Pre-Cubic-P1 this was a single `started.load(Acquire)`
+        // check, which is a TOCTOU: `start()` could fire between
+        // the check and `handshake_responder`'s recv_from, after
+        // which the dispatcher would race the responder for
+        // msg1.
+        //
+        // The fix: increment `accept_in_flight` BEFORE checking
+        // `started`. `start()` checks `accept_in_flight` after
+        // its CAS and refuses (or, structurally, the windows are
+        // ordered: accept either sees `started=true` and bails
+        // OUT (so accept_in_flight goes back to 0 and start sees
+        // 0), or `start` sees accept_in_flight > 0 and refuses to
+        // run). Reasoning is symmetric to a reader-writer
+        // SeqCst handshake: the SeqCst total order on these two
+        // atomics makes "either accept observes start and bails,
+        // or start observes accept and refuses" mutually
+        // exclusive.
+        //
+        // RAII guard `AcceptGuard` decrements on drop so any
+        // early-return (Err from handshake_responder, panic in
+        // session construction, future cancellation) doesn't
+        // leak the in-flight count.
+        struct AcceptGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for AcceptGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, AtOrd::AcqRel);
+            }
+        }
+
+        self.accept_in_flight.fetch_add(1, AtOrd::AcqRel);
+        let _guard = AcceptGuard(&self.accept_in_flight);
+
+        if self.started.load(AtOrd::SeqCst) {
             return Err(AdapterError::Fatal(
                 "Mesh::accept called after start() — the dispatch loop is already \
                  consuming inbound packets and would race the responder handshake. \
@@ -1836,9 +1879,42 @@ impl MeshNode {
     ///
     /// Must be called after `connect()` / `accept()` to begin processing
     /// inbound packets.
+    ///
+    /// Cubic P1: refuses (no-op return) if any `accept()` call is
+    /// currently in flight. This closes the TOCTOU race that
+    /// `accept`'s entry guard alone could not — without this
+    /// counter check, `start` could fire between `accept`'s
+    /// `started.load` and its `handshake_responder` poll, after
+    /// which the dispatcher would race the responder for the
+    /// inbound msg1. Symmetric to `accept`'s contract: either
+    /// `accept` observes `started=true` and bails (in-flight
+    /// count goes to 0, then `start` proceeds), or `start`
+    /// observes `accept_in_flight > 0` and refuses. The SeqCst
+    /// orderings make this mutually exclusive.
     pub fn start(&self) {
-        if self.started.swap(true, Ordering::AcqRel) {
+        use std::sync::atomic::Ordering as AtOrd;
+        if self.started.swap(true, AtOrd::SeqCst) {
             return; // already started
+        }
+        // After flipping `started`, observe `accept_in_flight`.
+        // If any accept is mid-handshake, roll back and refuse.
+        // The accept side either saw our SeqCst store before
+        // its load (and bailed cleanly) or saw it after (and
+        // we see its incremented counter). Spurious "concurrent
+        // start + accept" is rare in production (start is
+        // typically called once at boot), but the rollback
+        // keeps semantics honest.
+        if self.accept_in_flight.load(AtOrd::SeqCst) > 0 {
+            // Roll back the flag so a subsequent `start()` after
+            // accept finishes can succeed normally.
+            self.started.store(false, AtOrd::SeqCst);
+            tracing::warn!(
+                "MeshNode::start() called while an accept() is in flight — \
+                 refusing to start the dispatch loop to avoid racing the \
+                 responder handshake. Retry start() after accept() returns. \
+                 (Cubic P1 / CR-7)"
+            );
+            return;
         }
 
         let recv_handle = self.spawn_receive_loop();
