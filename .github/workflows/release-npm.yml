@@ -75,12 +75,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
-          # Pin the linker so cargo doesn't fall back to host `cc`
-          # (which is x86_64 on these runners). Rust 1.95 defaults
-          # to `rust-lld` for some targets and stitches the host
-          # sysroot's `gcc-ld`, producing
-          # "elf64-x86-64 incompatible with elf64-aarch64" link
-          # errors when no explicit linker env is set.
+          # Pin the linker via BOTH `.cargo/config.toml` AND
+          # `CARGO_TARGET_*_LINKER`. Rust 1.95 defaults to a
+          # `gnu-cc` linker flavor that drives `cc -fuse-ld=lld`
+          # and pulls the HOST x86_64 sysroot's `gcc-ld` —
+          # producing "elf64-x86-64 incompatible with elf64-aarch64"
+          # errors. The env-var-only attempt didn't override that
+          # path (rust 1.95's flavor selection ignores it for some
+          # cross targets); the on-disk `[target.X] linker = ...`
+          # config.toml entry does.
+          mkdir -p "$HOME/.cargo"
+          cat >> "$HOME/.cargo/config.toml" <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
       # Cross-compile to musl via Zig. Zig ships a fully-functional
