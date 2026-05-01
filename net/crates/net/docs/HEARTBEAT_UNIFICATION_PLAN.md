@@ -183,10 +183,11 @@ Closed by the implementation: **#11**, **#85**, **#97**, surface area for **#106
 - `mod_rs_production_callers_match_allowlist`: scans the production prefix of `mod.rs` and asserts the only `.build_heartbeat(` call is `let packet = session.build_heartbeat();`.
 - `mesh_rs_production_callers_match_allowlist`: same for `mesh.rs`. A future contributor adding a new production caller has to update the allowlist deliberately, forcing review of the design.
 
-**Test coverage:** 10 heartbeat-related tests, all green:
+**Test coverage:** 11 heartbeat-related tests, all green:
 - `mod.rs::tests::heartbeat_is_aead_authenticated` — legitimate / no-tag / garbage-tag verify outcomes (legacy path).
 - `mesh::heartbeat_aead_tests::aead_authenticated_heartbeat_passes_verification_and_touches_session` — verify+touch fusion on success.
 - `mesh::heartbeat_aead_tests::unauthenticated_heartbeat_fails_verification_and_does_not_touch` — verify+touch fusion on failure (the structural guarantee).
 - `mesh::heartbeat_aead_tests::pooled_heartbeat_builds_succeed_in_sequence_and_verify` — back-to-back builds via `Session::build_heartbeat` produce verifiable packets with monotonic counters.
 - `mesh::heartbeat_aead_tests::replay_of_authenticated_heartbeat_fails_verification_on_second_try` — replay rejected by counter window.
+- `mesh::heartbeat_aead_tests::heartbeat_and_data_share_tx_counter_strictly_monotonic` — interleaves heartbeat / data / heartbeat / data / heartbeat builds and asserts strictly-increasing TX counters across all five. Pins the BUG #106 invariant: a future re-introduction of an independent per-purpose pool/counter would fail this test because both sequences would restart at 0.
 - `session::heartbeat_api_drift_check::*` — the two drift tripwires.
