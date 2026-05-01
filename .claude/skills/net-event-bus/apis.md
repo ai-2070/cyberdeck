@@ -165,7 +165,7 @@ async fn main() -> net_sdk::error::Result<()> {
 ## Go (`bindings/go/net`)
 
 ```go
-import "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
+import "github.com/ai-2070/net/net/crates/net/bindings/go/net"
 
 bus, err := net.New(&net.Config{NumShards: 4})
 if err != nil { log.Fatal(err) }

@@ -28,7 +28,7 @@ cargo build --release --features "netdb redex-disk"
 ## Installation
 
 ```bash
-go get github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net
+go get github.com/ai-2070/net/net/crates/net/bindings/go/net
 ```
 
 ## Usage
@@ -40,7 +40,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
+    "github.com/ai-2070/net/net/crates/net/bindings/go/net"
 )
 
 func main() {
@@ -124,7 +124,7 @@ Net provides encrypted point-to-point UDP transport for high-performance scenari
 import (
     "crypto/rand"
     "encoding/hex"
-    "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
+    "github.com/ai-2070/net/net/crates/net/bindings/go/net"
 )
 
 // Generate keypair for responder
@@ -211,7 +211,7 @@ import (
     "log"
     "strings"
 
-    "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
+    "github.com/ai-2070/net/net/crates/net/bindings/go/net"
 )
 
 func main() {
@@ -392,7 +392,7 @@ import (
     "log"
     "time"
 
-    "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
+    "github.com/ai-2070/net/net/crates/net/bindings/go/net"
 )
 
 func main() {
@@ -511,7 +511,7 @@ logical event becomes filterable at consume time.
 ```go
 import (
     "fmt"
-    netbinding "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
+    netbinding "github.com/ai-2070/net/net/crates/net/bindings/go/net"
     "github.com/redis/go-redis/v9"
 )
 
@@ -825,7 +825,7 @@ package main
 import (
     "log"
 
-    "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
+    "github.com/ai-2070/net/net/crates/net/bindings/go/net"
 )
 
 type echoDaemon struct{}

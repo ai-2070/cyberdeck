@@ -7,7 +7,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
+	"github.com/ai-2070/net/net/crates/net/bindings/go/net"
 )
 
 func main() {
