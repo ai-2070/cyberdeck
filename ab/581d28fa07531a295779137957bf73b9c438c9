@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/continuity/cone.rs
+  64958cb6fb55fe73 93-115,117-137,317-395
+net/crates/net/src/adapter/net/state/horizon.rs
+  64958cb6fb55fe73 88-100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "ab581d28fa07531a295779137957bf73b9c438c9",
+  "prompts": {
+    "64958cb6fb55fe73": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81cf66b-69b3-455c-bab9-06a87305bb12",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 136,
+      "total_deletions": 1065,
+      "accepted_lines": 811,
+      "overriden_lines": 0
+    }
+  }
+}
