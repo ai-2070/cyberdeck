@@ -1,12 +1,18 @@
 [package]
-name = "net-sdk"
+name = "ai2070-net-sdk"
 version = "0.8.0"
 edition = "2021"
 description = "Ergonomic Rust SDK for the Net mesh network"
 license = "Apache-2.0"
 
+[lib]
+# Keep the crate name as `net_sdk` so `use net_sdk::...` resolves
+# without code changes; the published artifact is `ai2070-net-sdk`
+# on crates.io.
+name = "net_sdk"
+
 [dependencies]
-net = { path = "..", features = [] }
+net = { package = "ai2070-net", path = "..", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"

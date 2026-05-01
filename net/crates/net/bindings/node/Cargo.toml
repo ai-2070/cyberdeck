@@ -69,8 +69,8 @@ groups = ["compute", "net-sdk/groups"]
 test-helpers = ["groups"]
 
 [dependencies]
-net = { path = "../..", default-features = false }
-net-sdk = { path = "../../sdk", default-features = false, optional = true }
+net = { package = "ai2070-net", path = "../..", default-features = false }
+net-sdk = { package = "ai2070-net-sdk", path = "../../sdk", default-features = false, optional = true }
 dashmap = { version = "6", optional = true }
 napi = { version = "3.7.0", default-features = false, features = ["napi4", "napi6", "async", "tokio_rt"] }
 napi-derive = "3.4.0"

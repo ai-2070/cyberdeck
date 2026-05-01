@@ -47,6 +47,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai2070-net"
+version = "0.8.0"
+dependencies = [
+ "arc-swap",
+ "async-nats",
+ "async-trait",
+ "base64",
+ "blake2",
+ "bytes",
+ "chacha20poly1305",
+ "criterion",
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "dashmap",
+ "ed25519-dalek",
+ "futures",
+ "getrandom 0.4.2",
+ "hex",
+ "igd-next",
+ "libc",
+ "loom",
+ "parking_lot",
+ "postcard",
+ "quanta",
+ "rand 0.10.1",
+ "redis",
+ "regex",
+ "serde",
+ "serde_json",
+ "snow",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "x25519-dalek",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "ai2070-net-sdk"
+version = "0.8.0"
+dependencies = [
+ "ai2070-net",
+ "bytes",
+ "futures",
+ "pin-project-lite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "alloca"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1370,54 +1424,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "net"
-version = "0.8.0"
-dependencies = [
- "arc-swap",
- "async-nats",
- "async-trait",
- "base64",
- "blake2",
- "bytes",
- "chacha20poly1305",
- "criterion",
- "crossbeam-queue",
- "crossbeam-utils",
- "dashmap",
- "ed25519-dalek",
- "futures",
- "getrandom 0.4.2",
- "hex",
- "igd-next",
- "libc",
- "loom",
- "parking_lot",
- "postcard",
- "quanta",
- "rand 0.10.1",
- "redis",
- "regex",
- "serde",
- "serde_json",
- "snow",
- "socket2",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tracing",
- "x25519-dalek",
- "xxhash-rust",
-]
-
-[[package]]
 name = "net-compute-ffi"
 version = "0.8.0"
 dependencies = [
+ "ai2070-net",
+ "ai2070-net-sdk",
  "bytes",
  "dashmap",
  "libc",
- "net",
- "net-sdk",
  "parking_lot",
  "tokio",
 ]
@@ -1426,6 +1440,8 @@ dependencies = [
 name = "net-node"
 version = "0.8.0"
 dependencies = [
+ "ai2070-net",
+ "ai2070-net-sdk",
  "arc-swap",
  "bytes",
  "dashmap",
@@ -1434,8 +1450,6 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
- "net",
- "net-sdk",
  "serde_json",
  "tokio",
  "xxhash-rust",
@@ -1445,29 +1459,15 @@ dependencies = [
 name = "net-python"
 version = "0.8.0"
 dependencies = [
+ "ai2070-net",
+ "ai2070-net-sdk",
  "bytes",
  "dashmap",
  "futures",
  "hex",
- "net",
- "net-sdk",
  "pyo3",
  "pyo3-build-config",
  "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "net-sdk"
-version = "0.8.0"
-dependencies = [
- "bytes",
- "futures",
- "net",
- "pin-project-lite",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
  "tokio",
 ]
 

@@ -8,7 +8,7 @@ members = [
 ]
 
 [package]
-name = "net"
+name = "ai2070-net"
 version = "0.8.0"
 edition = "2021"
 description = "High-performance, schema-agnostic, backend-agnostic event bus"
@@ -25,6 +25,11 @@ categories = ["asynchronous", "concurrency", "data-structures"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [lib]
+# Keep the crate name as `net` so internal `use net::...` paths and
+# every dependent that aliases via `net = { package = "ai2070-net", ... }`
+# resolve without code changes. The published artifact is
+# `ai2070-net` on crates.io.
+name = "net"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
