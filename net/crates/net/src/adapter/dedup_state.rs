@@ -7,7 +7,7 @@
 //! and restarts gets a fresh nonce, the post-restart retry writes
 //! new msg-ids, and JetStream's dedup window can't recognize them
 //! as duplicates of the pre-crash partial — the accepted half ends
-//! up persisted twice (BUG #56).
+//! up persisted twice.
 //!
 //! `PersistentProducerNonce` provides exactly that: a u64 sampled
 //! once and stored on disk. On startup, callers `load_or_create` it
@@ -30,21 +30,17 @@ use std::path::{Path, PathBuf};
 
 /// Wire format: `[VERSION:u8 = 1][nonce:u64 LE]` = 9 bytes.
 ///
-/// CR-28 added the version prefix so a future format change (e.g.
+/// The version prefix lets a future format change (e.g.
 /// HMAC-keyed nonce, extended to 16 bytes for `(epoch, nonce)`)
-/// can be deployed without an out-of-band file migration —
-/// loaders just match on `data[0]` and dispatch to the matching
-/// parser.
+/// deploy without an out-of-band file migration — loaders just
+/// match on `data[0]` and dispatch to the matching parser.
 ///
-/// Pre-CR-28 callers used a raw 8-byte format with no version
-/// prefix. That legacy format is **not supported**: a loader
-/// against a pre-CR-28 file will surface `InvalidData`. This is
-/// fine because (a) the feature shipped in the same release as
-/// CR-28 (no production deployments of the legacy format need
-/// to be preserved) and (b) operators that need to migrate can
+/// A raw 8-byte format with no version prefix is **not
+/// supported**: a loader against such a file will surface
+/// `InvalidData`. Operators with legacy unversioned files can
 /// simply delete the existing nonce file — the next start will
 /// create a fresh v1, with a one-time loss of cross-restart
-/// dedup that's bounded by the JetStream/Redis dedup window.
+/// dedup that's bounded by the JetStream / Redis dedup window.
 const NONCE_FILE_LEN_V1: usize = 1 + 8;
 
 /// Version byte for the current wire format.
@@ -174,7 +170,7 @@ impl PersistentProducerNonce {
         if nonce == 0 {
             nonce = 1;
         }
-        // CR-28: v1 wire format — `[VERSION:u8 = 1][nonce:u64 LE]`.
+        // v1 wire format — `[VERSION:u8 = 1][nonce:u64 LE]`.
         // Versioning lets a future format change (HMAC-keyed nonce,
         // 16-byte epoch+nonce, etc.) deploy without an out-of-band
         // migration — the loader matches on length + version byte.
@@ -185,21 +181,20 @@ impl PersistentProducerNonce {
         // Atomic write: create a per-call-unique sibling tempfile,
         // fsync it, rename over the target.
         //
-        // Cubic-ai P1: pre-fix the tempfile was always `<path>.tmp`,
-        // a fixed sibling. Concurrent first-loaders racing on the
-        // same path (two threads in one process, OR two daemons
-        // misconfigured to point at the same nonce file) both wrote
-        // to the same tempfile; the writes could interleave at the
-        // OS layer and produce a corrupted 8-byte sequence, or one
-        // rename would `ENOENT` because the other already moved the
-        // tempfile, surfacing as a load_or_create failure. Either
-        // outcome breaks startup. The fix: stamp the tempfile name
-        // with `pid + tid + nanos` so each caller writes to its own
-        // file. Last rename still wins (intended semantic — the
-        // first-loader race is rare and the cap on nonce divergence
-        // is "different per call" anyway, since each call samples
-        // fresh entropy), but each renamed file is now a complete,
-        // valid 8-byte nonce — no interleaved-write corruption.
+        // Stamp the tempfile name with `pid + tid + nanos` so each
+        // caller writes to its own file. A fixed sibling like
+        // `<path>.tmp` would let concurrent first-loaders racing on
+        // the same path (two threads in one process, OR two
+        // daemons misconfigured to point at the same nonce file)
+        // interleave their writes at the OS layer and produce a
+        // corrupted 8-byte sequence, or one rename would `ENOENT`
+        // because the other already moved the tempfile, surfacing
+        // as a load_or_create failure. Last rename still wins
+        // (intended semantic — the first-loader race is rare and
+        // the cap on nonce divergence is "different per call"
+        // anyway, since each call samples fresh entropy), but each
+        // renamed file is now a complete, valid 8-byte nonce — no
+        // interleaved-write corruption.
         let tmp_path = {
             use std::hash::{Hash, Hasher};
             let mut p = path.clone();

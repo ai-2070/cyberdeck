@@ -154,7 +154,7 @@ pub struct BatchWorker {
     /// `JoinHandle`. Used as the `sequence_start` for the
     /// stranded-ring-buffer flush so its msg-ids don't collide
     /// with the worker's own first batch under JetStream's dedup
-    /// window (BUG #153).
+    /// window.
     ///
     /// Updated on every successful `flush`. The hot path pays one
     /// release-ordered atomic store per dispatched batch — the
@@ -170,7 +170,7 @@ pub struct BatchWorker {
     /// from `event::batch_process_nonce`. Adapters that key dedup
     /// on `(producer_nonce, shard, sequence_start, i)` (today:
     /// JetStream `Nats-Msg-Id`, Redis `dedup_id` field) use this
-    /// to recognize cross-process retries (BUG #56).
+    /// to recognize cross-process retries.
     producer_nonce: u64,
     /// Time when the current batch started.
     batch_start: Option<Instant>,
@@ -184,13 +184,12 @@ impl BatchWorker {
     /// `next_sequence_published` is the bus-owned mirror of
     /// `next_sequence`. Pass `Arc::new(AtomicU64::new(0))` if the
     /// caller doesn't need to observe the post-exit sequence;
-    /// production paths share it with `bus::remove_shard_internal`
-    /// (BUG #153 fix).
+    /// production paths share it with `bus::remove_shard_internal`.
     ///
     /// `producer_nonce` is stamped on every produced `Batch` for
-    /// cross-process dedup (BUG #56). The bus passes its loaded
-    /// nonce in; tests can use any u64 (typically 0 or the
-    /// per-process default).
+    /// cross-process dedup. The bus passes its loaded nonce in;
+    /// tests can use any u64 (typically 0 or the per-process
+    /// default).
     pub fn new(
         shard_id: u16,
         config: BatchConfig,
@@ -273,7 +272,7 @@ impl BatchWorker {
         // `sequence_start` for the stranded-ring-buffer flush — that
         // guarantees the stranded msg-ids fall strictly past every
         // msg-id this worker emitted, closing the JetStream-dedup
-        // collision documented in BUG #153.
+        // collision risk.
         self.next_sequence_published
             .store(self.next_sequence, Ordering::Release);
         self.batch_start = None;

@@ -86,7 +86,7 @@ pub mod mesh;
 /// C FFI for the Redis Streams consumer-side dedup helper. Mirrors
 /// the Rust `net::adapter::RedisStreamDedup` surface for Go / C / Zig
 /// consumers. See `ffi::redis_dedup` module docs for the wire
-/// shape and the BUG #57 dedup contract.
+/// shape and the dedup contract.
 #[cfg(feature = "redis")]
 pub mod redis_dedup;
 
@@ -276,19 +276,18 @@ fn enter_ffi_op(handle: &NetHandle) -> Result<FfiOpGuard<'_>, c_int> {
 /// ```
 #[unsafe(no_mangle)]
 pub extern "C" fn net_init(config_json: *const c_char) -> *mut NetHandle {
-    // BUG #62: parse and validate the config BEFORE constructing
-    // the tokio runtime. Pre-fix the runtime was constructed first,
-    // and any subsequent early-return path (`CStr::to_str` Err,
-    // `parse_config_json` returning None, `EventBus::new`
-    // returning Err) dropped the local `Runtime` on function
-    // return. Dropping a multi-thread tokio runtime from inside
-    // ANOTHER tokio runtime's worker thread panics with "Cannot
-    // drop a runtime in a context where blocking is not allowed",
-    // unwinding across this `extern "C"` boundary into a Python /
-    // Go-cgo / NAPI / PyO3 caller — undefined behaviour. By
-    // validating inputs first, the runtime is only built once we
-    // know it will be installed into the `NetHandle` and survive
-    // the call.
+    // Parse and validate the config BEFORE constructing the tokio
+    // runtime. Building the runtime first would let any subsequent
+    // early-return path (`CStr::to_str` Err, `parse_config_json`
+    // returning None, `EventBus::new` returning Err) drop the
+    // local `Runtime` on function return. Dropping a multi-thread
+    // tokio runtime from inside ANOTHER tokio runtime's worker
+    // thread panics with "Cannot drop a runtime in a context where
+    // blocking is not allowed", unwinding across this `extern "C"`
+    // boundary into a Python / Go-cgo / NAPI / PyO3 caller —
+    // undefined behaviour. By validating inputs first, the runtime
+    // is only built once we know it will be installed into the
+    // `NetHandle` and survive the call.
     let config = if config_json.is_null() {
         EventBusConfig::default()
     } else {
@@ -479,18 +478,17 @@ fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut NetHandl
     let bus = match runtime.block_on(EventBus::new(config)) {
         Ok(bus) => bus,
         Err(_) => {
-            // BUG #62: send the runtime off to a fresh OS thread
-            // for dropping. Dropping a multi-thread tokio
-            // `Runtime` from inside another tokio runtime's worker
-            // thread panics ("Cannot drop a runtime in a context
-            // where blocking is not allowed"); a panic here would
-            // unwind across this `extern "C"` frame. The fresh
-            // thread guarantees a non-tokio context, so the drop
-            // is sound regardless of the caller's runtime
-            // environment. We don't `join()` the thread — the
-            // drop completes on its own and the caller has
-            // already been told `net_init` failed (returning
-            // null).
+            // Send the runtime off to a fresh OS thread for
+            // dropping. Dropping a multi-thread tokio `Runtime`
+            // from inside another tokio runtime's worker thread
+            // panics ("Cannot drop a runtime in a context where
+            // blocking is not allowed"); a panic here would unwind
+            // across this `extern "C"` frame. The fresh thread
+            // guarantees a non-tokio context, so the drop is sound
+            // regardless of the caller's runtime environment. We
+            // don't `join()` the thread — the drop completes on
+            // its own and the caller has already been told
+            // `net_init` failed (returning null).
             std::thread::spawn(move || drop(runtime));
             return ptr::null_mut();
         }
@@ -819,7 +817,7 @@ pub extern "C" fn net_poll(
         *out_buffer.add(response_json.len()) = 0; // Null terminate
     }
 
-    // BUG #79: data was already copied into the caller's buffer; a
+    // Data was already copied into the caller's buffer; a
     // `c_int` overflow here means the byte count exceeds c_int's
     // range, NOT that the buffer was too small. Returning
     // `BufferTooSmall` would tell the caller to "resize and retry"
@@ -885,9 +883,8 @@ pub extern "C" fn net_stats(
         *out_buffer.add(stats_json.len()) = 0;
     }
 
-    // BUG #79: see net_poll above — the data was already copied,
-    // so an overflowing length is `IntOverflow`, not
-    // `BufferTooSmall`.
+    // See net_poll above — the data was already copied, so an
+    // overflowing length is `IntOverflow`, not `BufferTooSmall`.
     match c_int::try_from(stats_json.len()) {
         Ok(n) => n,
         Err(_) => NetError::IntOverflow.into(),
@@ -947,17 +944,15 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
         return NetError::NullPointer.into();
     }
 
-    // BUG #74: scope the `&NetHandle` borrow into an inner block
-    // so it is verifiably out of scope before the
-    // `ManuallyDrop::take(&mut (*handle).bus)` calls below. Pre-fix
-    // an `&NetHandle` was held in scope for the entire function
-    // (lines 921-968) while a raw `&mut (*handle).bus` was taken
-    // at line 996; NLL likely ended the immutable borrow before
-    // the mutable take, but the pattern is fragile under
-    // stacked/tree borrow models — every future change has to
-    // re-prove the lifetime relationship. The block-scoped
-    // borrow makes the lifetime constraint explicit and obvious
-    // to both the compiler and any future maintainer.
+    // Scope the `&NetHandle` borrow into an inner block so it is
+    // verifiably out of scope before the
+    // `ManuallyDrop::take(&mut (*handle).bus)` calls below.
+    // Holding an `&NetHandle` in scope for the whole function
+    // while taking a raw `&mut (*handle).bus` later would rely on
+    // NLL ending the immutable borrow before the mutable take —
+    // a pattern fragile under stacked/tree borrow models. The
+    // block-scoped borrow makes the lifetime constraint explicit
+    // and obvious to both the compiler and any future maintainer.
     let drained_and_taken = {
         // SAFETY: The C contract guarantees `handle` is valid here and that
         // `net_shutdown` is not called concurrently with itself. Future
@@ -1036,7 +1031,7 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
     // shutdown is concurrently moving the same fields out. The
     // immutable `handle_ref` borrow above has been dropped (block
     // scope ended), so the `&mut`-via-raw-pointer below is the
-    // only live access — no stacked/tree-borrow race (BUG #74).
+    // only live access — no stacked/tree-borrow race.
     //
     // We deliberately do NOT call `Box::from_raw` here. The box's
     // `shutting_down` / `active_ops` / `bus_taken` atomics must remain

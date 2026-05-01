@@ -195,18 +195,18 @@ impl std::fmt::Debug for JetStreamAdapter {
 #[async_trait]
 impl Adapter for JetStreamAdapter {
     async fn init(&mut self) -> Result<(), AdapterError> {
-        // BUG #71: idempotency. Pre-fix a second `init` call
-        // overwrote `client`/`jetstream`, dropping the prior
-        // client and any in-flight publishes — an orchestrator
-        // calling `init` defensively after a perceived failure
-        // silently lost messages. The trait says "Called once
-        // before any other methods" but didn't enforce it. Now
-        // we no-op when already initialized and log at warn so a
-        // misbehaving caller is observable.
+        // Idempotency: no-op when already initialized and log at
+        // warn so a misbehaving caller is observable. A second
+        // `init` call would otherwise overwrite `client` /
+        // `jetstream`, dropping the prior client and any in-flight
+        // publishes — an orchestrator calling `init` defensively
+        // after a perceived failure would silently lose messages.
+        // The trait says "Called once before any other methods"
+        // but doesn't enforce it.
         if self.initialized.load(Ordering::Acquire) {
             tracing::warn!(
                 adapter = "jetstream",
-                "JetStream adapter::init called twice; ignoring (BUG #71)"
+                "JetStream adapter::init called twice; ignoring"
             );
             return Ok(());
         }
@@ -284,8 +284,8 @@ impl Adapter for JetStreamAdapter {
         //
         // The leading `{nonce}` segment is the bus's producer nonce
         // — sourced from `EventBusConfig::producer_nonce_path` when
-        // the caller wants persistence across restarts (BUG #56), or
-        // from the per-process default `event::batch_process_nonce`
+        // the caller wants persistence across restarts, or from
+        // the per-process default `event::batch_process_nonce`
         // otherwise. Without it, a producer that restarted within
         // JetStream's dedup window collided with its prior
         // incarnation's `shard:0:0…` ids and the new batches were
@@ -411,18 +411,18 @@ impl Adapter for JetStreamAdapter {
         // `usize::MAX` cannot wrap to a tiny `max_seq` and silently
         // cap the poll at zero events.
         //
-        // BUG #55: also extract `first_sequence` so the per-event
-        // walk below can skip past a long retention-rollover gap in
-        // a single jump. Pre-fix `direct_get(seq)` returned NotFound
-        // for every deleted seq and the loop incremented by one and
-        // tried again — after a MAXLEN trim of the first 10M
-        // sequences, `poll_shard(from_id=None)` resumed at
-        // `start_seq=1` and the consumer did 10M sequential network
-        // RTTs before returning a single event (hung for minutes,
-        // request timeout fires, next poll resumes from where it
-        // left off — never made progress). With `first_sequence`
-        // captured up-front, the first `NotFound` jumps `current_seq`
-        // to `first_sequence` in one step.
+        // Also extract `first_sequence` so the per-event walk below
+        // can skip past a long retention-rollover gap in a single
+        // jump. Without it, `direct_get(seq)` returns NotFound for
+        // every deleted seq and the loop would increment by one
+        // and try again — after a MAXLEN trim of the first 10M
+        // sequences, `poll_shard(from_id=None)` resumes at
+        // `start_seq=1` and the consumer would do 10M sequential
+        // network RTTs before returning a single event (hung for
+        // minutes, request timeout fires, next poll resumes from
+        // where it left off — never made progress). With
+        // `first_sequence` captured up-front, the first `NotFound`
+        // jumps `current_seq` to `first_sequence` in one step.
         let (max_seq, first_seq) = match stream.info().await {
             Ok(info) => (info.state.last_sequence, info.state.first_sequence),
             Err(_) => {
@@ -430,10 +430,10 @@ impl Adapter for JetStreamAdapter {
                 (start_seq.saturating_add(span), 0)
             }
         };
-        // Apply the BUG #55 jump up-front: if `start_seq` is below
-        // the stream's first retained sequence, advance the cursor
-        // immediately rather than walking the deleted range
-        // one-by-one.
+        // Apply the retention-rollover jump up-front: if
+        // `start_seq` is below the stream's first retained
+        // sequence, advance the cursor immediately rather than
+        // walking the deleted range one-by-one.
         if first_seq > current_seq {
             current_seq = first_seq;
         }
@@ -444,13 +444,12 @@ impl Adapter for JetStreamAdapter {
         // outcome) so the cursor can advance past corrupt entries
         // instead of stalling on them.
         //
-        // BUG #60: pre-fix the loop's `current_seq > max_seq` short-
-        // circuit fired against the `max_seq` sampled ONCE before
-        // the loop, so a producer that wrote new messages during
-        // the read was silently truncated — `has_more=false` came
-        // back even though the stream tail had more events. The
-        // consumer then slept thinking the stream was drained and
-        // only caught the new tail on the next poll cycle.
+        // The loop's `current_seq > max_seq` short-circuit re-reads
+        // `info()` once before declaring drain, to catch concurrent
+        // writes that appeared after our initial sample. Without
+        // the re-read, a producer writing new messages during the
+        // read would be silently truncated — `has_more=false` would
+        // come back even though the stream tail had more events.
         // `max_seq_re_checked` tracks whether we've already paid
         // the one bounded re-read, so a relentless producer can't
         // spin us forever in a re-info loop.
@@ -459,11 +458,11 @@ impl Adapter for JetStreamAdapter {
         let mut max_seq_re_checked = false;
         while events.len() < fetch_limit {
             if current_seq > max_seq {
-                // BUG #60: before declaring drain, re-read
-                // `info()` once to catch concurrent writes that
-                // appeared after our initial sample. One bounded
-                // re-read per poll preserves the loop's O(span)
-                // worst-case while closing the truncation hole.
+                // Before declaring drain, re-read `info()` once to
+                // catch concurrent writes that appeared after our
+                // initial sample. One bounded re-read per poll
+                // preserves the loop's O(span) worst-case while
+                // closing the truncation hole.
                 if !max_seq_re_checked {
                     max_seq_re_checked = true;
                     if let Ok(info) = stream.info().await {

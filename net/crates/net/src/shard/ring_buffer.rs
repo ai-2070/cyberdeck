@@ -86,25 +86,24 @@ pub(crate) struct RingBuffer<T> {
     mask: usize,
     /// Write position (producer).
     ///
-    /// BUG #78: `head` / `tail` are `u64` regardless of target
-    /// pointer width. Pre-fix they were `AtomicUsize`, which on
-    /// 32-bit targets (wasm32 is in the test matrix) wrapped after
-    /// 2^32 pushes — ~7 minutes per shard at 10 M events/sec, ~12
-    /// hours at 100 K. Once `head` lapped `tail` and the wrapping
-    /// distance exceeded `capacity-1`, `try_push` rejected
-    /// forever and the buffer was permanently wedged. `u64` gives
-    /// ~58 years to wrap at 10 G events/sec on every target.
+    /// `head` / `tail` are `u64` regardless of target pointer
+    /// width. `AtomicUsize` would wrap on 32-bit targets (wasm32
+    /// is in the test matrix) after 2^32 pushes — ~7 minutes per
+    /// shard at 10 M events/sec, ~12 hours at 100 K. Once `head`
+    /// lapped `tail` and the wrapping distance exceeded
+    /// `capacity-1`, `try_push` would reject forever and the
+    /// buffer would be permanently wedged. `u64` gives ~58 years
+    /// to wrap at 10 G events/sec on every target.
     head: CachePadded<AtomicU64>,
-    /// Read position (consumer). See `head` for the BUG #78
-    /// rationale on the `u64` width.
+    /// Read position (consumer). See `head` for the rationale on
+    /// the `u64` width.
     tail: CachePadded<AtomicU64>,
     /// Producer-side concurrency tripwire (debug-build SPSC enforcement —
     /// active under `debug_assertions`, not just `cfg(test)`, so dev
     /// runs of the binary catch real SPSC violations even outside of
-    /// unit tests). BUG #77: pre-fix every `#[cfg(test)]` gate below
-    /// claimed to honor the `debug_assertions` contract advertised
-    /// in this doc but actually only compiled under `cargo test`,
-    /// leaving the safety net absent from any non-test build.
+    /// unit tests). The gates below use `debug_assertions` directly
+    /// rather than `#[cfg(test)]`, so the safety net stays present
+    /// in any non-release build.
     ///
     /// Set to `true` while a producer-side method (`try_push` /
     /// `evict_oldest`) is mid-execution. A second concurrent caller
@@ -221,7 +220,7 @@ impl<T> RingBuffer<T> {
 
         // Check if buffer is full. Both head/tail are u64; the
         // wrapping subtract gives the in-flight length on every
-        // target (BUG #78).
+        // target.
         let len = head.wrapping_sub(tail);
         if len >= (self.capacity as u64) - 1 {
             return Err(BufferFullError);
@@ -323,7 +322,7 @@ impl<T> RingBuffer<T> {
         let head = self.head.load(Ordering::Acquire);
 
         // Calculate how many elements are available. `available`
-        // is u64 (BUG #78); cap to `max: usize` and convert back.
+        // is u64; cap to `max: usize` and convert back.
         let available = head.wrapping_sub(tail);
         let count = available.min(max as u64) as usize;
 
@@ -412,8 +411,8 @@ impl<T> RingBuffer<T> {
 
     /// Get the current number of elements in the buffer.
     ///
-    /// BUG #78: `head` / `tail` are `u64` regardless of target;
-    /// the in-flight count fits in `usize` because it's bounded by
+    /// `head` / `tail` are `u64` regardless of target; the
+    /// in-flight count fits in `usize` because it's bounded by
     /// `capacity - 1` which is itself a `usize`.
     #[inline]
     pub fn len(&self) -> usize {

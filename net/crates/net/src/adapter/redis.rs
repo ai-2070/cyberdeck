@@ -17,7 +17,7 @@
 //!
 //! The batch aggregation layer smooths bursts before they reach Redis.
 //!
-//! # Consumer-side dedup contract (BUG #57)
+//! # Consumer-side dedup contract
 //!
 //! Redis Streams does NOT have server-side dedup. The `MULTI/EXEC`
 //! `tokio::time::timeout` cancellation hazard at `on_batch` (the
@@ -40,7 +40,7 @@
 //! - **Stable across process restart**: when the bus is
 //!   configured with `EventBusConfig::producer_nonce_path`, the
 //!   nonce survives restart so post-crash retries still produce
-//!   the same `dedup_id` (BUG #56).
+//!   the same `dedup_id`.
 //! - **Unique per logical event**: distinct events from the same
 //!   producer never share an id.
 //!
@@ -56,8 +56,7 @@
 //! configurations: a few thousand ids, ~minutes of in-flight at
 //! moderate throughput). The reference helper
 //! [`net_sdk::RedisStreamDedup`] (Rust SDK) provides exactly this;
-//! cross-language wrappers (NAPI / PyO3) ship in the bindings as
-//! Phase 3 of BUG #57's resolution.
+//! cross-language wrappers (NAPI / PyO3) ship in the bindings.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -273,7 +272,7 @@ impl std::fmt::Debug for RedisAdapter {
 #[async_trait]
 impl Adapter for RedisAdapter {
     async fn init(&mut self) -> Result<(), AdapterError> {
-        // BUG #71: idempotency. Same hazard pattern as
+        // Idempotency. Same hazard pattern as
         // `JetStreamAdapter::init` — a second `init` would have
         // dropped the prior connection-manager (and any in-flight
         // publishes piggybacking on it) when assigning
@@ -283,7 +282,7 @@ impl Adapter for RedisAdapter {
         if self.initialized.load(Ordering::Acquire) {
             tracing::warn!(
                 adapter = "redis",
-                "Redis adapter::init called twice; ignoring (BUG #71)"
+                "Redis adapter::init called twice; ignoring"
             );
             return Ok(());
         }
@@ -366,7 +365,7 @@ impl Adapter for RedisAdapter {
             // second field. See the module docs for the
             // consumer-side dedup contract: downstream consumers
             // dedup on this field to filter duplicates introduced
-            // by the timeout-cancellation race below (BUG #57).
+            // by the timeout-cancellation race below.
             dedup_id_buf.truncate(prefix_len);
             let _ = write!(dedup_id_buf, ":{i}");
             cmd.arg("dedup_id").arg(dedup_id_buf.as_str());
@@ -384,12 +383,12 @@ impl Adapter for RedisAdapter {
         // at-least-once *with duplicates on retry* — not
         // exactly-once at the producer.
         //
-        // **Mitigation (BUG #57):** every XADD above carries a
-        // `dedup_id` field that's stable across retries (and across
-        // process restart when `producer_nonce_path` is configured;
-        // see BUG #56). Consumers filter duplicates by keying on
-        // that field — see the module docs for the contract and
-        // the [`net_sdk::RedisStreamDedup`] helper for a reference
+        // **Mitigation:** every XADD above carries a `dedup_id`
+        // field that's stable across retries (and across process
+        // restart when `producer_nonce_path` is configured).
+        // Consumers filter duplicates by keying on that field — see
+        // the module docs for the contract and the
+        // [`net_sdk::RedisStreamDedup`] helper for a reference
         // implementation. The Redis stream itself may still carry
         // duplicate entries on the wire; the dedup happens at
         // consume time.

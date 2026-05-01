@@ -28,13 +28,13 @@ use crate::event::StoredEvent;
 /// the formats both built-in adapters produce, with a lex fallback for
 /// already-lex-comparable opaque ids (ULID, UUIDv7, fixed-width hex).
 ///
-/// CR-1: pre-fix this was a raw `str::cmp` which inverts ordering on
-/// the unpadded numeric ids the JetStream adapter emits
-/// (`seq.to_string()`) and the Redis Streams server-side `{ms}-{seq}`
-/// format — `"9" > "10"` lexicographically wedges the cursor at every
-/// decade boundary. The structured comparator below handles both
-/// formats numerically. Mixed-padding comparisons across upgrades
-/// still compare correctly because parse-then-compare ignores leading
+/// A raw `str::cmp` would invert ordering on the unpadded numeric
+/// ids the JetStream adapter emits (`seq.to_string()`) and the
+/// Redis Streams server-side `{ms}-{seq}` format — `"9" > "10"`
+/// lexicographically would wedge the cursor at every decade
+/// boundary. The structured comparator below handles both formats
+/// numerically. Mixed-padding comparisons across upgrades still
+/// compare correctly because parse-then-compare ignores leading
 /// zeros.
 ///
 /// Order of attempts:
@@ -132,18 +132,15 @@ impl CompositeCursor {
 
     /// Update positions from consumed events.
     ///
-    /// BUG #66 / CR-1: pre-fix this unconditionally inserted each
-    /// event's `id` into the per-shard position map; whichever
-    /// event for a given `shard_id` appeared *last* in the slice
-    /// won, regardless of stream order. The first follow-up
-    /// (BUG #66) added a per-shard CAS using `str::cmp`, but lex
-    /// compare wedges on the unpadded numeric ids both built-in
-    /// adapters emit (`"9" > "10"` lexicographically). CR-1 now
-    /// routes the compare through `compare_stream_ids`, which
-    /// understands the Redis (`<ms>-<seq>`) and JetStream
-    /// (`<u64>`) formats numerically and falls back to lex for
-    /// opaque ids (ULID, UUIDv7, hex digests). The cursor cannot
-    /// regress and decade-rollovers no longer freeze it.
+    /// Per-shard CAS routed through `compare_stream_ids`, which
+    /// understands the Redis (`<ms>-<seq>`) and JetStream (`<u64>`)
+    /// formats numerically and falls back to lex for opaque ids
+    /// (ULID, UUIDv7, hex digests). The cursor cannot regress and
+    /// decade-rollovers cannot freeze it. Unconditional inserts
+    /// would let whichever event for a given `shard_id` appeared
+    /// *last* in the slice win regardless of stream order; a plain
+    /// `str::cmp` CAS would wedge on the unpadded numeric ids both
+    /// built-in adapters emit (`"9" > "10"` lexicographically).
     pub fn update_from_events(&mut self, events: &[StoredEvent]) {
         for event in events {
             let new_id = event.id.as_str();
@@ -418,17 +415,17 @@ impl PollMerger {
                 // identifier and is unique within a shard, so the
                 // composite is a strict total order.
                 //
-                // BUG #73 / CR-1: the id tiebreak now routes through
+                // The id tiebreak routes through
                 // `compare_stream_ids`, which understands the
                 // unpadded numeric formats both built-in adapters
                 // emit (Redis `<ms>-<seq>`, JetStream `<u64>`) and
                 // falls back to lex for opaque ids (ULID, UUIDv7,
                 // hex digests). The `(insertion_ts, shard_id)`
-                // chain still resolves the common cases first;
-                // when two events from the same shard land at the
-                // same `insertion_ts` (rare but legal at
-                // millisecond granularity), the structured id
-                // compare is now correct on every adapter format.
+                // chain resolves the common cases first; when two
+                // events from the same shard land at the same
+                // `insertion_ts` (rare but legal at millisecond
+                // granularity), the structured id compare is
+                // correct on every adapter format.
                 all_events.sort_by(|a, b| {
                     a.insertion_ts
                         .cmp(&b.insertion_ts)
@@ -478,12 +475,12 @@ impl PollMerger {
             None => cursor.clone(),
         };
 
-        // Step 1: rollback for shards with truncated matches.
-        // BUG #72 cross-reference: track which shards we rolled
-        // back here so Step 2 only overrides those shards (rather
-        // than every shard with a returned event, which would
-        // throw away the adapter's `next_id` advance for shards
-        // that returned all their matches).
+        // Step 1: rollback for shards with truncated matches. We
+        // track which shards we rolled back here so Step 2 only
+        // overrides those shards (rather than every shard with a
+        // returned event, which would throw away the adapter's
+        // `next_id` advance for shards that returned all their
+        // matches).
         let mut rolled_back: std::collections::HashSet<u16> = std::collections::HashSet::new();
         if request.filter.is_some() && had_extra {
             let mut returned_per_shard: std::collections::HashMap<u16, usize> =
@@ -516,15 +513,15 @@ impl PollMerger {
         // This reduces id clones from O(all_events.len()) to
         // O(shards.len()).
         //
-        // BUG #72: when the filter path is active, Step 1 has
-        // already populated `final_cursor` with the adapter's
-        // `next_id` (a position past the last *fetched* event for
-        // each shard). The Step 2 override below moves the cursor
-        // back to the last *matched* event id, which is BEHIND
-        // the last fetched event for any shard with non-matched
-        // events. Subsequent polls then re-fetch and re-filter
-        // those non-matches — wasted work proportional to
-        // `over_fetch_factor` on low-match-rate streams. The fix:
+        // When the filter path is active, Step 1 has already
+        // populated `final_cursor` with the adapter's `next_id`
+        // (a position past the last *fetched* event for each
+        // shard). A blanket Step 2 override here would move the
+        // cursor back to the last *matched* event id, which is
+        // BEHIND the last fetched event for any shard with
+        // non-matched events — subsequent polls would re-fetch and
+        // re-filter those non-matches, wasting work proportional
+        // to `over_fetch_factor` on low-match-rate streams. So we
         // only Step 2-override for shards that were actually
         // rolled back in Step 1 (those need a forward push past
         // the last *returned* match), OR when the filter path

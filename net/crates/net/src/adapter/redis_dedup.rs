@@ -1,7 +1,7 @@
 //! Consumer-side dedup helper for the Redis Streams adapter.
 //!
 //! See `net::adapter::redis` module docs for the producer-side
-//! contract and BUG #57 background. Briefly:
+//! contract. Briefly:
 //!
 //! - The Redis adapter writes a `dedup_id` field on every XADD
 //!   entry (`"{producer_nonce:hex}:{shard_id}:{sequence_start}:{i}"`),
@@ -45,13 +45,12 @@
 //!
 //! # Concurrency
 //!
-//! `RedisStreamDedup` is `Send + Sync` (CR-2). Wrap in `Mutex`
-//! / `RwLock` if multiple consumer threads share the same dedup
+//! `RedisStreamDedup` is `Send + Sync`. Wrap in `Mutex` /
+//! `RwLock` if multiple consumer threads share the same dedup
 //! window; or run one helper per consumer thread (each with its
 //! own LRU) if the threads consume disjoint stream partitions.
 //! Send + Sync is required by the PyO3 binding's `#[pyclass]`
-//! Send/Sync assertion — pre-CR-2 the storage was `Rc<str>` which
-//! made the type `!Send + !Sync` and broke the Python build.
+//! Send/Sync assertion.
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -64,22 +63,22 @@ use std::sync::Arc;
 /// default 4096 capacity and ~24-byte ids, that's ~100 KiB —
 /// noise for any non-embedded consumer.
 ///
-/// Cubic-ai P2: ids are stored as `Arc<str>` so the queue and the
-/// lookup index can share one underlying allocation per id. The
-/// pre-fix shape stored two `String`s (one in `order`, one in
-/// `seen`), costing two allocations + a `memcpy` on every new
-/// `is_duplicate` call. With `Arc<str>`, insert is one allocation
-/// + a refcount bump.
+/// Ids are stored as `Arc<str>` so the queue and the lookup index
+/// can share one underlying allocation per id. Storing two
+/// `String`s (one in `order`, one in `seen`) would cost two
+/// allocations + a `memcpy` on every new `is_duplicate` call;
+/// `Arc<str>` insert is one allocation + a refcount bump.
 ///
-/// CR-2: previously `Rc<str>`, which made the type `!Send + !Sync`
-/// and broke the PyO3 binding (`#[pyclass]` requires `Send + Sync`
-/// — `assert_pyclass_send_sync` would fail to compile). The C-FFI
-/// and NAPI wrappers compiled only because raw `*mut` deref bypasses
-/// auto-trait checks, but the concurrent-threads-on-one-handle
-/// test was UB in the Rust abstract machine. `Arc<str>` adds an
-/// atomic refcount-bump on insert (vs `Rc::clone`'s relaxed
-/// increment) — single-digit nanoseconds extra per new id, dwarfed
-/// by the heap allocation that already dominates insert cost.
+/// `Arc<str>` (rather than `Rc<str>`) is required for `Send +
+/// Sync`, which the PyO3 binding's `#[pyclass]` Send/Sync
+/// assertion enforces (`assert_pyclass_send_sync` would otherwise
+/// fail to compile). The C-FFI and NAPI wrappers would compile
+/// only because raw `*mut` deref bypasses auto-trait checks, but
+/// the concurrent-threads-on-one-handle test would be UB in the
+/// Rust abstract machine. `Arc<str>` adds an atomic refcount-bump
+/// on insert (vs `Rc::clone`'s relaxed increment) — single-digit
+/// nanoseconds extra per new id, dwarfed by the heap allocation
+/// that already dominates insert cost.
 pub struct RedisStreamDedup {
     /// Insertion-ordered queue, used for LRU eviction. Each entry
     /// is `Arc::clone`-shared with `seen` so we don't pay a second

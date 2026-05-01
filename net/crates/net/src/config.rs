@@ -43,7 +43,7 @@ pub struct EventBusConfig {
     /// Retries use a fixed 100ms delay between attempts.
     pub adapter_batch_retries: u32,
 
-    /// File path for the persistent producer nonce (BUG #56). When
+    /// File path for the persistent producer nonce. When
     /// `Some`, the bus loads (or creates on first run) the u64
     /// nonce at this path on startup and stamps it on every
     /// outgoing batch. Adapters that key dedup on
@@ -229,7 +229,7 @@ impl EventBusConfigBuilder {
     }
 
     /// Persist the producer nonce at `path` so it survives process
-    /// restart (BUG #56). Recommended for any deployment using
+    /// restart. Recommended for any deployment using
     /// JetStream / Redis adapters where retries-after-crash should
     /// dedup against the prior incarnation. See
     /// `EventBusConfig::producer_nonce_path` for the full doc.
@@ -623,15 +623,15 @@ impl JetStreamAdapterConfig {
                 "jetstream replicas must be >= 1".into(),
             ));
         }
-        // BUG #68: NATS rejects negative `max_messages` / `max_bytes`
-        // at stream-create time, surfacing as a runtime adapter
-        // error instead of at startup `validate()` (the documented
+        // NATS rejects negative `max_messages` / `max_bytes` at
+        // stream-create time, surfacing as a runtime adapter error
+        // instead of at startup `validate()` (the documented
         // purpose of this method). The fields are typed `i64` for
-        // wire-compat with the NATS API but only non-negative values
-        // make sense — a builder's `with_max_messages(-1)` would
-        // happily store the negative and explode minutes later.
-        // Reject at validation time so the misconfig is caught
-        // before any connection attempt.
+        // wire-compat with the NATS API but only non-negative
+        // values make sense — a builder's `with_max_messages(-1)`
+        // would happily store the negative and explode minutes
+        // later. Reject at validation time so the misconfig is
+        // caught before any connection attempt.
         if let Some(n) = self.max_messages {
             if n < 0 {
                 return Err(ConfigError::InvalidValue(format!(
@@ -781,17 +781,16 @@ impl ScalingPolicy {
 
     /// Validate the policy.
     ///
-    /// BUG #63: NaN thresholds slip past raw `<=` / `>` comparisons
-    /// (every comparison against `f64::NaN` returns `false`), so a
-    /// config deserialized from `0.0/0.0`-style arithmetic or an
-    /// unfortunate environment-templated string used to "validate"
-    /// successfully and then sit inert at runtime — `mapper.rs:560`
-    /// does `m.fill_ratio > self.policy.fill_ratio_threshold`,
-    /// which is always `false` against NaN, so the scaler never
-    /// fires (mirror hazard for scale-down). The pre-fix range
-    /// checks below were necessary but not sufficient; the new
     /// `is_finite()` guards reject NaN and ±∞ explicitly before
-    /// the range check runs.
+    /// the range check runs. NaN thresholds slip past raw `<=` /
+    /// `>` comparisons (every comparison against `f64::NaN`
+    /// returns `false`), so a config deserialized from
+    /// `0.0/0.0`-style arithmetic or an unfortunate
+    /// environment-templated string would "validate" successfully
+    /// and then sit inert at runtime — `mapper.rs:560` does
+    /// `m.fill_ratio > self.policy.fill_ratio_threshold`, which is
+    /// always `false` against NaN, so the scaler would never fire
+    /// (mirror hazard for scale-down).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !self.fill_ratio_threshold.is_finite() {
             return Err(ConfigError::InvalidValue(

@@ -589,13 +589,12 @@ impl ShardManager {
     /// (`total - success - unrouted`) is the backpressure-class drop
     /// count.
     ///
-    /// BUG #155: pre-fix this returned only `success` (a single
-    /// `usize`); the bus computed `dropped = total - success` and
-    /// added `dropped` to `events_dropped` — but `unrouted` events
-    /// had ALREADY been counted on `events_unrouted` inside this
-    /// function, so the same event ended up in both stats.
-    /// Returning the unrouted count separately lets the bus subtract
-    /// it before publishing `events_dropped`.
+    /// Returns `(success, unrouted)` rather than just `success`
+    /// so the bus can subtract `unrouted` before publishing
+    /// `events_dropped`. Returning only `success` would let the
+    /// bus's `dropped = total - success` accounting double-count
+    /// unrouted events — they're already tallied on
+    /// `events_unrouted` inside this function.
     pub fn ingest_raw_batch(&self, events: Vec<RawEvent>) -> (usize, usize) {
         if events.is_empty() {
             return (0, 0);
@@ -882,16 +881,14 @@ impl ShardManager {
                 .fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
 
-        // BUG #83: previously this method only updated the routing
-        // table and decremented `num_shards` — it never asked the
-        // mapper to drop the corresponding `MappedShard` record.
-        // The mapper's `shards: RwLock<Vec<MappedShard>>` kept
-        // growing across scale-up/down cycles (every scale-up
-        // appended a fresh entry; `Stopped` entries were only
-        // removed by an explicit `remove_stopped_shards` call that
-        // no production caller invoked). `evaluate_scaling` filters
-        // by state but still iterates the full list, so per-tick
-        // cost grew with cumulative scaling history.
+        // Ask the mapper to drop the corresponding `MappedShard`
+        // record. Without this sweep the mapper's
+        // `shards: RwLock<Vec<MappedShard>>` would keep growing
+        // across scale-up/down cycles (every scale-up appends a
+        // fresh entry; `Stopped` entries are only removed by an
+        // explicit `remove_stopped_shards` call). `evaluate_scaling`
+        // filters by state but still iterates the full list, so
+        // per-tick cost would grow with cumulative scaling history.
         //
         // The scaling monitor calls `mapper.finalize_draining()`
         // before invoking `bus.remove_shard_internal(id)` (which is

@@ -765,21 +765,20 @@ impl ShardMapper {
         match shard.state {
             ShardState::Active => return Ok(()),
             ShardState::Provisioning => {
-                // BUG #64: gate activation on
-                // `active_count < max_shards`. Pre-fix the budget
-                // gate at `check_scale_up_budget` only counted
-                // ALREADY-active shards — multiple
-                // `scale_up_provisioning(1)` calls could each pass
-                // (they don't bump `active_count`), and then each
-                // `activate` unconditionally `fetch_add(1)`'d past
-                // `max_shards`. Subsequent
+                // Gate activation on
+                // `active_count < max_shards`. The budget gate at
+                // `check_scale_up_budget` only counts ALREADY-active
+                // shards — multiple `scale_up_provisioning(1)` calls
+                // can each pass (they don't bump `active_count`),
+                // and an unconditional `fetch_add(1)` here would
+                // push past `max_shards`. Subsequent
                 // `evaluate_scaling`'s `max_shards - active_count`
-                // arithmetic underflowed u16 (debug-build panic;
-                // release wraps to ~65530). Now activate-time
+                // arithmetic would then underflow u16 (debug-build
+                // panic; release wraps to ~65530). Activate-time
                 // re-checks the budget with the lock held; the
-                // Provisioning shard stays in Provisioning state
-                // and the caller (e.g. `add_shard_internal`'s #75
-                // rollback) is responsible for tearing it down.
+                // Provisioning shard stays in Provisioning state and
+                // the caller (e.g. `add_shard_internal`'s rollback)
+                // is responsible for tearing it down.
                 let current = self.active_count.load(AtomicOrdering::Acquire);
                 if current >= self.policy.max_shards {
                     return Err(ScalingError::AtMaxShards);
@@ -927,7 +926,7 @@ impl ShardMapper {
     ///
     /// Returns IDs of shards that were stopped.
     ///
-    /// BUG #154 note: this predicate looks ONLY at the ring buffer
+    /// This predicate looks ONLY at the ring buffer
     /// (`current_len` + `pushes_since_drain_start`); it does NOT
     /// probe the per-shard mpsc channel or the BatchWorker's
     /// `current_batch`. A shard that the predicate flags as empty

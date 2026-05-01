@@ -1232,14 +1232,12 @@ impl EventBus {
             }
         }
 
-        // CR-27: surface partial success at WARN level. Pre-CR-27
-        // a deadline-elapsed partial-finalize returned `Ok(_)` with
-        // a smaller-than-target list silently — operators only
-        // saw the discrepancy if they happened to compare against
-        // the count they requested. The return shape is preserved
-        // for compat (changing to `(Vec, Vec)` would break the
-        // existing callers + test); the WARN log gives operations
-        // tooling something to alert on.
+        // Surface partial success at WARN level. The return shape
+        // is preserved for compat (changing to `(Vec, Vec)` would
+        // break the existing callers + test) so a smaller-than-
+        // target list could otherwise be silently mistaken for full
+        // success; the WARN log gives operations tooling something
+        // to alert on.
         if finalized.len() < target.len() {
             let still_draining: Vec<u16> = target.difference(&finalized).copied().collect();
             tracing::warn!(
@@ -1249,7 +1247,7 @@ impl EventBus {
                 "manual_scale_down deadline elapsed before all targeted \
                  shards finalized — events still in-flight on the listed \
                  shards. They will finalize on the next scaling-monitor \
-                 tick or on shutdown. (CR-27)"
+                 tick or on shutdown."
             );
         }
 
@@ -1305,35 +1303,33 @@ impl Drop for EventBus {
     }
 }
 
-/// Body of the scaling monitor task spawned by
-/// `EventBus::start_scaling_monitor`. Holds a `Weak<EventBus>` and
-/// CR-25: spin deadline for the second-caller path in
+/// Spin deadline for the second-caller path in
 /// `shutdown_via_ref`. 10s in production.
 #[cfg(not(test))]
 fn shutdown_via_ref_spin_deadline() -> std::time::Duration {
     std::time::Duration::from_secs(10)
 }
 
-/// CR-25 test-only override. Stored as milliseconds; `0` (the
-/// default) means "use the production 10s". Set via
-/// [`set_shutdown_via_ref_spin_deadline_for_test`] from inside
-/// a test that needs to exercise the deadline-elapsed path
-/// without wall-clock-waiting the full 10s.
+/// Test-only override. Stored as milliseconds; `0` (the default)
+/// means "use the production 10s". Set via
+/// [`set_shutdown_via_ref_spin_deadline_for_test`] from inside a
+/// test that needs to exercise the deadline-elapsed path without
+/// wall-clock-waiting the full 10s.
 ///
-/// Cubic P2: this is a global atomic shared across all tests in
-/// the `cargo test --lib` binary. If two tests touched it
-/// concurrently, one's override would leak into the other's
-/// expectations. Tests that use the override MUST take the
-/// [`SHUTDOWN_DEADLINE_OVERRIDE_GUARD`] mutex for the duration
-/// of their override-setter / read window — see
+/// This is a global atomic shared across all tests in the
+/// `cargo test --lib` binary. If two tests touched it concurrently,
+/// one's override would leak into the other's expectations. Tests
+/// that use the override MUST take the
+/// [`SHUTDOWN_DEADLINE_OVERRIDE_GUARD`] mutex for the duration of
+/// their override-setter / read window — see
 /// [`set_shutdown_via_ref_spin_deadline_for_test`].
 #[cfg(test)]
 static SHUTDOWN_VIA_REF_DEADLINE_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Cubic P2: serializes access to the deadline override so
-/// concurrent tests can't observe each other's transient values.
-/// Tests that override the deadline take this mutex via
+/// Serializes access to the deadline override so concurrent tests
+/// can't observe each other's transient values. Tests that override
+/// the deadline take this mutex via
 /// [`shutdown_deadline_override_lock`] and hold the guard until
 /// they reset the override to 0.
 ///
@@ -1394,12 +1390,12 @@ async fn run_scaling_monitor_via_weak(weak: std::sync::Weak<EventBus>) {
             None => break,
         };
 
-        // BUG #69: SeqCst to match the writer side
-        // (`EventBus::shutdown` / `Drop`). The Acquire/Release
-        // handshake on `drain_finalize_ready` already provides the
-        // load-bearing happens-before today — but a future code
-        // change that piggybacks on `shutdown`'s ordering (e.g. a
-        // producer that observes shutdown without going through
+        // SeqCst to match the writer side (`EventBus::shutdown` /
+        // `Drop`). The Acquire/Release handshake on
+        // `drain_finalize_ready` already provides the load-bearing
+        // happens-before today — but a future code change that
+        // piggybacks on `shutdown`'s ordering (e.g. a producer that
+        // observes shutdown without going through
         // `try_enter_ingest`) would silently break under Relaxed.
         // Aligning the read-side ordering with the writer-side
         // SeqCst is a one-instruction tax for the safety.
@@ -1524,20 +1520,19 @@ struct BatchWorkerParams {
     /// Bus-owned mirror of `BatchWorker::next_sequence`. The worker
     /// stores its post-flush sequence here on every dispatch so the
     /// bus can read it after the worker exits — see
-    /// `ShardWorkers::next_sequence` for the consumer side and
-    /// BUG #153 for the rationale.
+    /// `ShardWorkers::next_sequence` for the consumer side.
     next_sequence: Arc<AtomicU64>,
     /// Bus-level stats. The worker increments
     /// `batches_dispatched` and `events_dispatched` after every
-    /// successful `dispatch_batch`. Pre-fix `batches_dispatched`
-    /// was declared on `EventBusStats` but never incremented, so
-    /// `flush()`'s Phase 2 progress probe always observed zero
-    /// progress and early-broke after a single `max_delay` window
-    /// — racing the BatchWorker's first `recv_timeout` and
-    /// flaking on Windows-class timer resolution.
+    /// successful `dispatch_batch`. Both must actually be
+    /// incremented here, otherwise `flush()`'s Phase 2 progress
+    /// probe would always observe zero progress and early-break
+    /// after a single `max_delay` window — racing the
+    /// BatchWorker's first `recv_timeout` and flaking on
+    /// Windows-class timer resolution.
     stats: Arc<EventBusStats>,
-    /// Producer nonce stamped on every batch the worker emits
-    /// (BUG #56). Bus-loaded from the persistent path when
+    /// Producer nonce stamped on every batch the worker emits.
+    /// Bus-loaded from the persistent path when
     /// `producer_nonce_path` is configured, otherwise from the
     /// per-process default.
     producer_nonce: u64,
@@ -1679,15 +1674,14 @@ fn spawn_drain_worker_for_shard(
         let mut scratch: Vec<crate::event::InternalEvent> = Vec::with_capacity(STEADY_BATCH);
 
         loop {
-            // BUG #69: SeqCst to match the writer side
-            // (`EventBus::shutdown` / `Drop`). Pre-fix this used
-            // `Relaxed` with a misleading "same rationale as ingest"
-            // comment — `try_enter_ingest` itself uses SeqCst, and
-            // the Acquire/Release handshake on `drain_finalize_ready`
-            // (below) is what actually makes the producer-push
-            // happen-before visible. Aligning to SeqCst here makes
-            // the contract robust to future producer-side changes
-            // that might piggyback on `shutdown`'s ordering.
+            // SeqCst to match the writer side (`EventBus::shutdown` /
+            // `Drop`). `try_enter_ingest` itself uses SeqCst, and
+            // the Acquire/Release handshake on
+            // `drain_finalize_ready` (below) is what actually makes
+            // the producer-push happen-before visible. Aligning to
+            // SeqCst here makes the contract robust to future
+            // producer-side changes that might piggyback on
+            // `shutdown`'s ordering.
             if shutdown.load(AtomicOrdering::SeqCst) {
                 // Before doing the final sweep, wait for `shutdown()`
                 // to release the finalize gate. The gate is set only

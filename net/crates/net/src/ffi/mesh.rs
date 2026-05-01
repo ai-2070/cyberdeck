@@ -135,10 +135,10 @@ fn token_err_to_code(e: &CoreTokenError) -> c_int {
         CoreTokenError::DelegationExhausted => NET_ERR_TOKEN_DELEGATION_EXHAUSTED,
         CoreTokenError::DelegationNotAllowed => NET_ERR_TOKEN_DELEGATION_NOT_ALLOWED,
         CoreTokenError::NotAuthorized => NET_ERR_TOKEN_NOT_AUTHORIZED,
-        // BUG #121: maps to `NET_ERR_IDENTITY` since a public-only
-        // keypair is fundamentally an identity-availability issue,
-        // not a token-content issue. The error message in
-        // `Display` makes the cause clear to the caller.
+        // Maps to `NET_ERR_IDENTITY` since a public-only keypair
+        // is fundamentally an identity-availability issue, not a
+        // token-content issue. The error message in `Display`
+        // makes the cause clear to the caller.
         CoreTokenError::ReadOnly => NET_ERR_IDENTITY,
     }
 }
@@ -149,15 +149,15 @@ fn token_err_to_code(e: &CoreTokenError) -> c_int {
 
 /// Shared tokio runtime. One per process, lazy-initialized.
 ///
-/// BUG #61: pre-fix the inner `.expect("mesh ffi tokio runtime")`
-/// panicked when `tokio::Builder::build()` failed (worker-thread
-/// `pthread_create` failure under `RLIMIT_NPROC` / container limits
-/// / memory pressure). The panic unwound across the surrounding
-/// `extern "C"` FFI frame into C/Go-cgo/NAPI/PyO3 callers —
-/// undefined behaviour. Now we `eprintln! + std::process::abort()`
-/// instead: `abort` is `extern "C"`-safe (terminates rather than
-/// unwinds), and a daemon that can't construct its async runtime
-/// is dead in the water — termination is the appropriate response.
+/// On `tokio::Builder::build()` failure (worker-thread
+/// `pthread_create` failure under `RLIMIT_NPROC` / container
+/// limits / memory pressure) we `eprintln! + std::process::abort()`
+/// rather than panic. `abort` is `extern "C"`-safe (terminates
+/// rather than unwinds), so the failure cannot escape across the
+/// surrounding `extern "C"` FFI frame into C / Go-cgo / NAPI /
+/// PyO3 callers — that would be undefined behaviour. A daemon
+/// that can't construct its async runtime is dead in the water,
+/// so termination is the appropriate response.
 fn runtime() -> &'static Arc<Runtime> {
     use std::sync::OnceLock;
     static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
@@ -1716,21 +1716,21 @@ fn alloc_bytes(src: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> c_int 
         }
         return 0;
     }
-    // BUG #67: `Layout::array::<u8>(len)` rejects `len > isize::MAX`
-    // (the documented bound — NOT `usize::MAX` as the previous
-    // comment claimed). The current call sites stay well under that
-    // limit because `to_bytes()` produces token-sized payloads, so
-    // the failure mode is unreachable today; defending against it
-    // here also keeps the helper safe to reuse from non-token code
-    // paths in the future. Same hazard shape as BUG #58 — a panic
-    // here would unwind across the surrounding `extern "C"` boundary.
+    // `Layout::array::<u8>(len)` rejects `len > isize::MAX` (the
+    // documented bound — NOT `usize::MAX`). The current call
+    // sites stay well under that limit because `to_bytes()`
+    // produces token-sized payloads, so the failure mode is
+    // unreachable today; defending against it here also keeps the
+    // helper safe to reuse from non-token code paths in the
+    // future. A panic here would unwind across the surrounding
+    // `extern "C"` boundary.
     let layout = match std::alloc::Layout::array::<u8>(len) {
         Ok(l) => l,
         // Reuse the closest sentinel we have — `NET_ERR_IDENTITY`
         // covers the only call sites today (token/identity helpers
         // that delegate to `alloc_bytes`). The negative integer is
         // an FFI-safe error code; the alternative `panic!` would
-        // unwind across `extern "C"` (BUG #67).
+        // unwind across `extern "C"`.
         Err(_) => return NET_ERR_IDENTITY,
     };
     let ptr = unsafe { std::alloc::alloc(layout) };
@@ -1750,20 +1750,15 @@ fn alloc_bytes(src: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> c_int 
 /// length returned by the allocating call — the buffer was allocated
 /// with `Layout::array::<u8>(len)` and is freed with the same layout.
 ///
-/// BUG #58: pre-fix this used
-/// `Layout::array::<u8>(len).expect("byte layout")`, which panics
-/// when `len > isize::MAX` (the `Layout::array` documented bound).
-/// `net_free_bytes` is `extern "C"` with no `catch_unwind` shim, so
-/// a panic would unwind across the FFI boundary into a C / Go-cgo /
-/// NAPI / PyO3 caller — undefined behaviour. A non-Rust caller that
-/// derived `len` from outside-controlled storage (or had a memory
-/// corruption past the original allocation length) could trigger
-/// the panic. Now we silently no-op on `len > isize::MAX`: the
-/// allocation that produced `ptr` could not have come from this
-/// process under that layout (the allocator would have rejected the
-/// matching `alloc`), so any such call is already
-/// memory-corruption territory and the safest response is to
-/// abandon the free rather than unwind.
+/// We silently no-op on `len > isize::MAX`: the allocation that
+/// produced `ptr` could not have come from this process under that
+/// layout (the allocator would have rejected the matching
+/// `alloc`), so any such call is already memory-corruption
+/// territory and the safest response is to abandon the free rather
+/// than unwind. `net_free_bytes` is `extern "C"` with no
+/// `catch_unwind` shim, so a panic would unwind across the FFI
+/// boundary into a C / Go-cgo / NAPI / PyO3 caller — undefined
+/// behaviour.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_free_bytes(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
@@ -1994,8 +1989,8 @@ pub extern "C" fn net_identity_issue_token(
         return NET_ERR_IDENTITY;
     };
     let h = unsafe { &*signer };
-    // BUG #121: route through `try_issue` so a public-only signer
-    // keypair (post-migration zeroize, etc.) surfaces as
+    // Route through `try_issue` so a public-only signer keypair
+    // (post-migration zeroize, etc.) surfaces as
     // `TokenError::ReadOnly` → `NET_ERR_IDENTITY` instead of
     // panic-unwinding across this `extern "C"` frame into the
     // caller's binding.
@@ -2763,7 +2758,7 @@ fn scope_filter_from_json(f: ScopeFilterJson) -> ScopeFilterOwned {
             // empty announcements, so a query containing `[""]`
             // would never match a real tenant and would only pin
             // to Global candidates. Fall back to Any when cleaned
-            // list is empty (Cubic P2).
+            // list is empty.
             Some(ts) => {
                 let cleaned: Vec<String> = ts.into_iter().filter(|t| !t.is_empty()).collect();
                 if cleaned.is_empty() {
@@ -2779,7 +2774,7 @@ fn scope_filter_from_json(f: ScopeFilterJson) -> ScopeFilterOwned {
             _ => ScopeFilterOwned::Any,
         },
         "regions" => match f.regions {
-            // Same reasoning as `tenants` above (Cubic P2).
+            // Same reasoning as `tenants` above.
             Some(rs) => {
                 let cleaned: Vec<String> = rs.into_iter().filter(|r| !r.is_empty()).collect();
                 if cleaned.is_empty() {
