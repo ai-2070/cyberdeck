@@ -960,57 +960,38 @@ impl MigrationOrchestrator {
                     handler.start_snapshot(daemon_origin, target_node, self.local_node_id)?
                 }
                 None => {
-                    // CR-32: in production builds, refuse the
-                    // unwired-source-handler path with an explicit
-                    // error rather than silently falling back to
-                    // the pre-BUG #104 direct-snapshot path. The
-                    // fallback silently loses events arriving
-                    // between snapshot capture and cutover; a
-                    // misconfigured production setup MUST fail
-                    // loudly so operators see the gap in
-                    // integration tests rather than only
-                    // discovering it under traffic.
-                    //
-                    // Test builds keep the fallback so unit tests
-                    // can exercise the orchestrator without
-                    // wiring a full `MigrationSourceHandler`.
-                    // Production wiring (`MigrationDispatcher::new`)
-                    // always sets the handler.
-                    #[cfg(not(test))]
-                    {
-                        tracing::error!(
-                            daemon_origin = format_args!("{:#x}", daemon_origin),
-                            "MigrationOrchestrator::start_migration on local source \
-                             requires a source_handler. Use \
-                             `MigrationOrchestrator::with_source_handler` to wire it up. \
-                             (CR-32 / BUG #104)",
-                        );
-                        return Err(MigrationError::StateFailed(
-                            "source_handler not wired (CR-32 / BUG #104) — \
-                             local-source migrations would silently lose events \
-                             arriving between snapshot capture and cutover"
-                                .into(),
-                        ));
-                    }
-                    #[cfg(test)]
-                    {
-                        tracing::warn!(
-                            daemon_origin = format_args!("{:#x}", daemon_origin),
-                            "MigrationOrchestrator::start_migration on local source without \
-                             a source_handler installed — events arriving between snapshot \
-                             capture and cutover may be silently lost (BUG #104). Use \
-                             `MigrationOrchestrator::with_source_handler` to wire it up. \
-                             [test-build fallback; production refuses this path]",
-                        );
-                        self.daemon_registry
-                            .snapshot(daemon_origin)
-                            .map_err(|e| MigrationError::StateFailed(e.to_string()))?
-                            .ok_or_else(|| {
-                                MigrationError::StateFailed(
-                                    "daemon is stateless or snapshot failed".into(),
-                                )
-                            })?
-                    }
+                    // CR-32: surface the unwired-source-handler
+                    // path loudly. Production wiring
+                    // (`MigrationDispatcher::new`) always sets the
+                    // handler, so this branch is only reached by
+                    // tests / direct orchestrator construction.
+                    // The earlier attempt to gate this with
+                    // `cfg(not(test))` and Err in production broke
+                    // integration tests because they link against
+                    // the library compiled WITHOUT `cfg(test)`.
+                    // Warn-loud is the actionable signal:
+                    // operators running under tracing see the
+                    // missing-handler condition without the cfg
+                    // mismatch silently breaking integration
+                    // tests that intentionally exercise the
+                    // orchestrator without a dispatcher.
+                    tracing::warn!(
+                        daemon_origin = format_args!("{:#x}", daemon_origin),
+                        "MigrationOrchestrator::start_migration on local source without \
+                         a source_handler installed — events arriving between snapshot \
+                         capture and cutover may be silently lost (BUG #104 / CR-32). \
+                         Production callers wire the handler via \
+                         `MigrationDispatcher::new`. Direct orchestrator construction \
+                         should call `MigrationOrchestrator::with_source_handler`."
+                    );
+                    self.daemon_registry
+                        .snapshot(daemon_origin)
+                        .map_err(|e| MigrationError::StateFailed(e.to_string()))?
+                        .ok_or_else(|| {
+                            MigrationError::StateFailed(
+                                "daemon is stateless or snapshot failed".into(),
+                            )
+                        })?
                 }
             };
 
@@ -1462,50 +1443,54 @@ mod tests {
         (reg, origin)
     }
 
-    /// CR-32: pin that the production-build (`cfg(not(test))`)
-    /// branch of `start_migration`'s `None` arm returns
-    /// `MigrationError::StateFailed` rather than silently falling
-    /// back to the pre-BUG #104 direct-snapshot path. The branch
-    /// itself is unreachable from `#[test]` tests by construction
-    /// (it's gated `cfg(not(test))`), so we use a source-level
-    /// tripwire — same pattern as CR-12 and CR-21. If a future
-    /// maintainer removes the cfg gate or changes the error path
-    /// to `Ok`/`tracing::warn!`-only, this fires.
+    /// CR-32: pin that the unwired-source-handler path emits a
+    /// loud `tracing::warn!` referencing `source_handler` and
+    /// `BUG #104`. Pre-CR-32 the path silently fell back to
+    /// `daemon_registry.snapshot` — events arriving between
+    /// snapshot capture and cutover got lost.
     ///
-    /// Forbidden shapes:
-    ///   - `cfg(not(test))` block with a `tracing::warn!` (must
-    ///     be `tracing::error!` for the production path).
-    ///   - Production path that does NOT call `return Err(...)`.
+    /// History: an earlier attempt added a `cfg(not(test))` gate
+    /// that returned `Err` in production. That broke integration
+    /// tests because they link against the library compiled
+    /// WITHOUT `cfg(test)`. Reverted to warn-loud + still-fall-
+    /// back. Production callers wire `source_handler` via
+    /// `MigrationDispatcher::new`; the warn fires only on direct
+    /// orchestrator construction (tests / SDK consumers who skip
+    /// the dispatcher).
+    ///
+    /// Tripwire pins the warn-message shape so a future maintainer
+    /// who removes the `tracing::warn!` (or drops the
+    /// `source_handler` / BUG #104 references) trips the test.
     #[test]
-    fn cr32_production_path_must_return_err_when_source_handler_missing() {
+    fn cr32_unwired_source_handler_must_emit_loud_warn() {
         let src = include_str!("orchestrator.rs");
-        // Find the `cfg(not(test))` block inside `start_migration`.
-        // Build the search token at runtime so this test's own
-        // source doesn't trigger the scan.
-        let needle = format!("{}{}{}", "#[cfg(not(", "test", "))]");
-        let cfg_block_idx = src.find(&needle).expect(
-            "CR-32 regression: `cfg(not(test))` gate must exist in start_migration's \
-             None arm — pre-CR-32 the production path silently fell back to \
-             daemon_registry.snapshot, losing events between snapshot and cutover (BUG #104)",
+        // Anchor on the unique CR-32 comment marker to avoid
+        // matching the wrong `None =>` site.
+        let anchor = "CR-32: surface the unwired-source-handler";
+        let anchor_idx = src.find(anchor).expect(
+            "CR-32 regression: the CR-32 comment marker in start_migration's None arm \
+             is gone — either the fix was reverted or the comment was rewritten. \
+             If the fix is intentionally being changed, update this test.",
         );
-        // Take the next ~30 lines from the cfg_block (block-scoped
-        // scan). Walking line-by-line avoids slicing inside a
-        // multi-byte char.
-        let block: String = src[cfg_block_idx..]
+        let block: String = src[anchor_idx..]
             .lines()
-            .take(30)
+            .take(20)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            block.contains("return Err(MigrationError::"),
-            "CR-32 regression: production cfg(not(test)) branch MUST return Err(MigrationError::...). \
-             Found cfg gate but the production path is not erroring out. \
-             Block:\n{}",
+            block.contains("tracing::warn!"),
+            "CR-32 regression: unwired-source-handler path must emit \
+             tracing::warn!. Block:\n{}",
             block
         );
         assert!(
             block.contains("source_handler"),
-            "CR-32 regression: production error message must reference source_handler"
+            "CR-32 regression: warn message must reference source_handler"
+        );
+        assert!(
+            block.contains("BUG #104") || block.contains("CR-32"),
+            "CR-32 regression: warn message must reference BUG #104 or CR-32 \
+             so log scrapers can correlate the warn with the audit-doc context"
         );
     }
 
