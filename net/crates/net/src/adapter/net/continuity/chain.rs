@@ -307,7 +307,14 @@ pub fn assess_continuity(log: &EntityLog, snapshot: Option<&StateSnapshot>) -> C
             &[],
         ))
     } else if let Some(s) = snapshot {
-        if s.through_seq.saturating_add(1) == first_seq {
+        // Cubic-ai P2: `checked_add` so a snapshot at `u64::MAX`
+        // (impossible in practice — would require 2^64 events
+        // under one origin — but cheap to be safe) doesn't
+        // saturate to `u64::MAX` and falsely anchor an event
+        // claiming `first_seq == u64::MAX`. `None` from
+        // `checked_add` propagates as "not anchored," surfacing
+        // as `Unverifiable` below.
+        if s.through_seq.checked_add(1) == Some(first_seq) {
             Some(compute_parent_hash(&s.chain_link, &s.head_payload))
         } else {
             None
