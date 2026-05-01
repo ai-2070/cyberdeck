@@ -347,17 +347,49 @@ impl IdentityEnvelope {
         // tag binds the chain_link to the ciphertext. A tampered
         // link will fail the signature check above AND the AEAD
         // tag here.
-        let aad_bytes = chain_link.to_bytes();
+        //
+        // CR-5: rolling-upgrade compatibility. Pre-#127 envelopes
+        // were sealed with `aad = &[]`; post-#127 envelopes seal
+        // with `aad = chain_link.to_bytes()`. The on-the-wire shape
+        // is byte-identical (AAD is a hashed input to the AEAD tag,
+        // not stored in the ciphertext), so we cannot distinguish
+        // v0 from v1 by inspection. We try v1 first, and on AEAD
+        // failure fall back to v0 — the legacy envelope opens
+        // cleanly during a rolling upgrade. The signature check
+        // above already rebound the chain_link, so authenticity
+        // doesn't degrade: an attacker still cannot forge an
+        // envelope; they can at most spend one extra AEAD attempt
+        // per attack. New envelopes always seal with v1 AAD.
+        let aad_v1 = chain_link.to_bytes();
         let aead = XChaCha20Poly1305::new((&key).into());
-        let mut seed_vec = aead
-            .decrypt(
-                (&nonce).into(),
-                Payload {
-                    msg: ct,
-                    aad: &aad_bytes,
-                },
-            )
-            .map_err(|_| EnvelopeError::SealOpenFailed)?;
+        let decrypt_result = aead.decrypt(
+            (&nonce).into(),
+            Payload {
+                msg: ct,
+                aad: &aad_v1,
+            },
+        );
+        let mut seed_vec = match decrypt_result {
+            Ok(v) => v,
+            Err(_) => {
+                // v0 fallback: legacy seal used empty AAD. The
+                // signature was already verified against the v1
+                // transcript above, so trying v0 here is safe —
+                // we're only retrying the AEAD with a DIFFERENT
+                // associated data binding. Any envelope that
+                // succeeds under v0 AAD also passed the v1
+                // attestation, so it's a legitimate pre-#127
+                // envelope from a rolling-upgrade peer.
+                aead.decrypt(
+                    (&nonce).into(),
+                    Payload {
+                        msg: ct,
+                        aad: &[],
+                    },
+                )
+                .map_err(|_| EnvelopeError::SealOpenFailed)?
+            }
+        };
         if seed_vec.len() != SEED_LEN {
             // Even on a length-mismatch error, scrub the buffer
             // before dropping — it holds (partial) decrypted secret
@@ -738,6 +770,120 @@ mod tests {
 
         let err = IdentityEnvelope::new(&source, target_pk, &link).expect_err("must refuse");
         assert_eq!(err, EnvelopeError::SourceReadOnly);
+    }
+
+    /// CR-5: rolling-upgrade compatibility. A "v0" envelope —
+    /// produced by a peer running master (pre-#127), where the
+    /// AEAD AAD was `&[]` rather than `chain_link.to_bytes()` —
+    /// must open cleanly under the new HEAD verifier. We construct
+    /// the v0 wire form by hand here (re-implementing the seal
+    /// path with empty AAD) since master is not in this tree.
+    ///
+    /// Pre-CR-5 the AEAD verify call used only the v1 AAD, so
+    /// every legitimate v0 envelope landing on a HEAD peer failed
+    /// with `SealOpenFailed`. Post-CR-5 the verifier tries v1
+    /// first, then falls back to v0 — so the v0 envelope opens.
+    /// The signature is independent of the AEAD AAD, so attestation
+    /// continues to bind the chain_link properly under both forms.
+    #[test]
+    fn open_accepts_v0_envelope_for_rolling_upgrade_compat() {
+        let source = EntityKeypair::generate();
+        let (target_sk, target_pk) = fresh_x25519();
+        let link = chain_link_at(7);
+
+        // Build a v0-style envelope by replicating `seal` minus the
+        // chain_link AAD binding.
+        let mut rng_bytes = [0u8; 32];
+        getrandom::fill(&mut rng_bytes).unwrap();
+        let eph_sk = X25519Secret::from(rng_bytes);
+        let eph_pk = X25519Pub::from(&eph_sk);
+        let target_pk_obj = X25519Pub::from(target_pk);
+        let shared = eph_sk.diffie_hellman(&target_pk_obj);
+        let key = derive_key(shared.as_bytes(), KDF_DOMAIN_KEY);
+        let nonce = derive_nonce(eph_pk.as_bytes(), &target_pk);
+
+        let aead = XChaCha20Poly1305::new((&key).into());
+        let seed: &[u8; 32] = source.secret_bytes();
+        // Pre-#127: empty AAD. This is the master shape we need
+        // to be backward-compatible with.
+        let ciphertext = aead
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: seed.as_slice(),
+                    aad: &[],
+                },
+            )
+            .unwrap();
+
+        let mut sealed_seed = [0u8; 80];
+        sealed_seed[..EPH_PK_LEN].copy_from_slice(eph_pk.as_bytes());
+        sealed_seed[EPH_PK_LEN..].copy_from_slice(&ciphertext);
+
+        // Attestation transcript is unchanged across v0/v1 — both
+        // sign over `target_static_pub || chain_link.to_bytes()`.
+        let transcript = attestation_transcript(&target_pk, &link);
+        let sig = source.try_sign(&transcript).unwrap();
+
+        let v0_env = IdentityEnvelope {
+            target_static_pub: target_pk,
+            sealed_seed,
+            signer_pub: *source.entity_id().as_bytes(),
+            signature: sig.to_bytes(),
+        };
+
+        // Open under the HEAD verifier. v1 AEAD attempt fails (the
+        // AAD differs); v0 fallback succeeds. The opened keypair
+        // is the original.
+        let opened = v0_env
+            .open(&target_sk, &link, None)
+            .expect("v0 envelope must open under v1 verifier (rolling-upgrade compat)");
+        assert_eq!(opened.entity_id(), source.entity_id());
+    }
+
+    /// CR-5: pin that v1 envelopes still open without exercising
+    /// the fallback path. This is the post-#127 happy-path; the
+    /// v0 fallback must NOT change the cost or behavior here.
+    #[test]
+    fn open_accepts_v1_envelope_on_first_try() {
+        let source = EntityKeypair::generate();
+        let (target_sk, target_pk) = fresh_x25519();
+        let link = chain_link_at(7);
+
+        let env = IdentityEnvelope::new(&source, target_pk, &link).expect("seal v1");
+        let opened = env
+            .open(&target_sk, &link, None)
+            .expect("v1 envelope must open without fallback");
+        assert_eq!(opened.entity_id(), source.entity_id());
+    }
+
+    /// CR-5: tampering with the chain_link MUST still be caught,
+    /// even with the v0 fallback in place. Pre-CR-5 the v1 AAD
+    /// binding was the only AEAD-level chain_link defense; post-fix
+    /// the v0 fallback could in principle let an attacker who
+    /// forces v0 semantics smuggle a chain_link change past the
+    /// AEAD. This is fine because the SIGNATURE check (which
+    /// happens BEFORE the AEAD attempt) ALSO binds the chain_link
+    /// — a tampered link breaks the signature regardless of which
+    /// AEAD path runs. This test pins that defense.
+    #[test]
+    fn open_rejects_tampered_chain_link_under_v0_fallback() {
+        let source = EntityKeypair::generate();
+        let (target_sk, target_pk) = fresh_x25519();
+        let link = chain_link_at(7);
+        let tampered_link = chain_link_at(8);
+
+        // Build a real v1 envelope.
+        let env = IdentityEnvelope::new(&source, target_pk, &link).expect("seal");
+
+        // Caller passes a different chain_link than the source
+        // signed over. Signature verification fires FIRST and
+        // rejects with InvalidAttestation — the v0 fallback never
+        // runs because we don't reach AEAD.
+        let err = env
+            .open(&target_sk, &tampered_link, None)
+            .expect_err("tampered chain_link must reject regardless of AEAD path");
+        assert_eq!(err, EnvelopeError::InvalidAttestation);
     }
 
     #[test]

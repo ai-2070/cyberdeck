@@ -6,9 +6,15 @@
 //! helper filters duplicates by maintaining an LRU-bounded set of
 //! seen ids.
 //!
-//! Wire shape from the JS side:
+//! Wire shape from the JS side. CR-3: post-fix users can import
+//! either from `@ai2070/net` (the NAPI module directly) or from
+//! `@ai2070/net-sdk` (which re-exports the same class via
+//! `sdk-ts/src/redis-dedup.ts`):
 //!
 //! ```js
+//! // From the NAPI module directly:
+//! const { RedisStreamDedup } = require('@ai2070/net');
+//! // Or via the TS SDK package:
 //! const { RedisStreamDedup } = require('@ai2070/net-sdk');
 //!
 //! // Default capacity (4096).
@@ -26,11 +32,13 @@
 //! }
 //! ```
 //!
-//! `RedisStreamDedup` is NOT thread-safe across NAPI worker
-//! threads. JS users typically read a stream from a single async
-//! context; if you need cross-worker dedup, instantiate one
-//! helper per worker (each has its own LRU) or share state via
-//! a Redis-side data structure.
+//! `RedisStreamDedup` is now `Send + Sync` (CR-2 — switched the
+//! internal storage from `Rc<str>` to `Arc<str>`); concurrent
+//! `isDuplicate` calls from multiple NAPI worker threads serialize
+//! safely on the underlying mutex. Production-shape is still one
+//! helper per consumer thread (each consuming a disjoint partition)
+//! to avoid the contention; sharing one handle is supported but
+//! costs lock time on the hot path.
 
 #![allow(dead_code)]
 

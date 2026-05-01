@@ -45,14 +45,17 @@
 //!
 //! # Concurrency
 //!
-//! `RedisStreamDedup` is `Send` + `!Sync`. Wrap in `Mutex`
+//! `RedisStreamDedup` is `Send + Sync` (CR-2). Wrap in `Mutex`
 //! / `RwLock` if multiple consumer threads share the same dedup
 //! window; or run one helper per consumer thread (each with its
 //! own LRU) if the threads consume disjoint stream partitions.
+//! Send + Sync is required by the PyO3 binding's `#[pyclass]`
+//! Send/Sync assertion — pre-CR-2 the storage was `Rc<str>` which
+//! made the type `!Send + !Sync` and broke the Python build.
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// LRU-bounded set of recently-seen `dedup_id` strings.
 ///
@@ -61,26 +64,30 @@ use std::rc::Rc;
 /// default 4096 capacity and ~24-byte ids, that's ~100 KiB —
 /// noise for any non-embedded consumer.
 ///
-/// Cubic-ai P2: ids are stored as `Rc<str>` so the queue and the
+/// Cubic-ai P2: ids are stored as `Arc<str>` so the queue and the
 /// lookup index can share one underlying allocation per id. The
 /// pre-fix shape stored two `String`s (one in `order`, one in
 /// `seen`), costing two allocations + a `memcpy` on every new
-/// `is_duplicate` call. With `Rc<str>`, insert is one allocation
+/// `is_duplicate` call. With `Arc<str>`, insert is one allocation
 /// + a refcount bump.
 ///
-/// `RedisStreamDedup` is `!Sync` (the `Rc` is shared internally),
-/// matching the documented "wrap in `Mutex` if multiple consumer
-/// threads share the same window" contract — switching the storage
-/// to `Arc<str>` would gain nothing (each helper instance is
-/// single-threaded by construction).
+/// CR-2: previously `Rc<str>`, which made the type `!Send + !Sync`
+/// and broke the PyO3 binding (`#[pyclass]` requires `Send + Sync`
+/// — `assert_pyclass_send_sync` would fail to compile). The C-FFI
+/// and NAPI wrappers compiled only because raw `*mut` deref bypasses
+/// auto-trait checks, but the concurrent-threads-on-one-handle
+/// test was UB in the Rust abstract machine. `Arc<str>` adds an
+/// atomic refcount-bump on insert (vs `Rc::clone`'s relaxed
+/// increment) — single-digit nanoseconds extra per new id, dwarfed
+/// by the heap allocation that already dominates insert cost.
 pub struct RedisStreamDedup {
     /// Insertion-ordered queue, used for LRU eviction. Each entry
-    /// is `Rc::clone`-shared with `seen` so we don't pay a second
+    /// is `Arc::clone`-shared with `seen` so we don't pay a second
     /// allocation per insert.
-    order: VecDeque<Rc<str>>,
-    /// Lookup index. Shares its `Rc<str>` entries with `order` —
+    order: VecDeque<Arc<str>>,
+    /// Lookup index. Shares its `Arc<str>` entries with `order` —
     /// every id lives in exactly one heap allocation, refcounted.
-    seen: HashSet<Rc<str>>,
+    seen: HashSet<Arc<str>>,
     /// Maximum number of distinct ids tracked. Older ids are
     /// evicted on insert when the set is at capacity.
     capacity: usize,
@@ -148,7 +155,7 @@ impl RedisStreamDedup {
     /// }
     /// ```
     pub fn is_duplicate(&mut self, dedup_id: &str) -> bool {
-        // Lookup uses the `Borrow<str>` impl on `Rc<str>`, so we
+        // Lookup uses the `Borrow<str>` impl on `Arc<str>`, so we
         // can probe the set with the borrowed `&str` — no
         // allocation on the duplicate (hot) path.
         if self.seen.contains(dedup_id) {
@@ -158,7 +165,7 @@ impl RedisStreamDedup {
         // Evict the oldest id if we're at capacity. The eviction
         // is amortized O(1) — `pop_front` on `VecDeque` and
         // `remove` on the `HashSet`. Both containers hold the
-        // SAME `Rc<str>`; popping the queue drops one strong
+        // SAME `Arc<str>`; popping the queue drops one strong
         // count, and the set's `remove` drops the other, freeing
         // the underlying allocation.
         if self.seen.len() >= self.capacity {
@@ -167,14 +174,14 @@ impl RedisStreamDedup {
             }
         }
 
-        // Insert. ONE heap allocation per new id (`Rc::from(&str)`
+        // Insert. ONE heap allocation per new id (`Arc::from(&str)`
         // copies the bytes once into a refcounted slice). The
-        // `Rc::clone` on the next line is a refcount bump, not
-        // an allocation. Pre-fix this path did two allocations:
+        // `Arc::clone` on the next line is an atomic refcount bump,
+        // not an allocation. Pre-fix this path did two allocations:
         // `to_owned()` for the lookup-set entry plus a separate
         // `.clone()` (= alloc + memcpy) for the queue entry.
-        let id: Rc<str> = Rc::from(dedup_id);
-        self.order.push_back(Rc::clone(&id));
+        let id: Arc<str> = Arc::from(dedup_id);
+        self.order.push_back(Arc::clone(&id));
         self.seen.insert(id);
         false
     }
@@ -327,6 +334,54 @@ mod tests {
         assert_eq!(d.len(), 0);
         assert!(d.is_empty());
         assert!(!d.is_duplicate("a")); // post-clear, looks new
+    }
+
+    /// CR-2: pin `Send + Sync`. The PyO3 `#[pyclass]` Send/Sync
+    /// assertion compiled this in via the binding, but having a
+    /// crate-local guard keeps the guarantee from silently
+    /// regressing if a future refactor reintroduces an `Rc` or
+    /// `Cell`. Static asserts are the cheapest pinning.
+    #[test]
+    fn redis_stream_dedup_is_send_and_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<RedisStreamDedup>();
+        assert_sync::<RedisStreamDedup>();
+    }
+
+    /// CR-2: pin actual cross-thread shared use. With `Rc<str>` this
+    /// would not compile (`Mutex<Rc<...>>` is `!Sync`). With
+    /// `Arc<str>` it builds and runs cleanly under TSan / Miri.
+    #[test]
+    fn redis_stream_dedup_works_under_mutex_across_threads() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::thread;
+
+        let dedup = Arc::new(Mutex::new(RedisStreamDedup::with_capacity(128)));
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let d = Arc::clone(&dedup);
+                thread::spawn(move || {
+                    for i in 0..16 {
+                        let id = format!("t{}:{}", t, i);
+                        let mut g = d.lock().unwrap();
+                        // First time should be NOT-duplicate.
+                        let was_dup = g.is_duplicate(&id);
+                        assert!(
+                            !was_dup,
+                            "thread {} id {} should be new on first insert",
+                            t, i
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let g = dedup.lock().unwrap();
+        assert_eq!(g.len(), 4 * 16);
     }
 
     /// Pin the canonical use case: BUG #57 producer-side dup

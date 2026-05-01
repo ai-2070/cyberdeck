@@ -160,6 +160,12 @@ export type {
   StandbyGroupConfig,
 } from './groups';
 
+// Redis Streams consumer-side dedup helper.
+// CR-3: NAPI re-export so users can `import { RedisStreamDedup } from
+// '@ai2070/net-sdk'` instead of reaching into the underlying NAPI
+// module directly.
+export { RedisStreamDedup } from './redis-dedup';
+
 // Types.
 export type {
   NetNodeConfig,

@@ -53,6 +53,20 @@ __all__ = [
     "Stats",
 ]
 
+# Redis Streams consumer-side dedup helper. Present iff the native
+# module was built with the `redis` feature. CR-3: pre-fix the class
+# was registered in the native module but never re-exported through
+# the public Python API, so `from net import RedisStreamDedup` raised
+# ImportError.
+try:
+    from ._net import RedisStreamDedup
+except ImportError:
+    # `redis` feature not compiled in; symbol stays undefined.
+    pass
+else:
+    __all__.append("RedisStreamDedup")
+
+
 # CortEX + NetDB surface. Present iff the native module was built with
 # the `cortex` feature (maturin's default picks it up).
 try:
