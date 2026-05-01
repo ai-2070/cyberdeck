@@ -31,7 +31,7 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 
 ## Status (running tally)
 
-**Outstanding (deferred — broader-than-audit-pass changes):** #56, #57 (cross-process retry duplicates — JetStream/Redis at-least-once semantics, require persistent nonce / server-side dedup state), #104 (local-source migration state mutation across cutover — rearchitecture).
+**Outstanding (deferred — broader-than-audit-pass changes):** #56, #57 (cross-process retry duplicates — JetStream/Redis at-least-once semantics, require persistent nonce / server-side dedup state).
 
 **Fixed on 2026-04-30 (with regression tests where reasonable):**
 - **#80** — `Net::shutdown` now routes through `EventBus::shutdown_via_ref(&self)`, an idempotent reference-based shutdown that runs regardless of outstanding `Arc<EventBus>` clones. Tests: `sdk/tests/shutdown_regression.rs::{shutdown_runs_even_with_outstanding_event_stream, shutdown_via_ref_is_idempotent}`.
@@ -345,8 +345,19 @@ A pingwave's `addr` field is taken from the forwarder's `from` socket address an
 
 The function applies `mark_unhealthy(old_active)` and sets `members[old_active].role = Standby` *before* searching for `best_standby`. If the search returns `NoHealthyMember`, the function exits with `Err` but leaves `self.active_index` still pointing at `old_active` — whose role is now `Standby` and whose health is now `Unhealthy`. **Failure scenario:** a node fails such that the active and the only viable standby both go down (split-network). `on_node_failure` calls `promote()`, promotion errors out, and the group is now in a state where `active_origin()` returns a `Standby`/unhealthy member. A subsequent `on_node_recovery` for the old active doesn't re-promote — it only marks healthy, leaving `role = Standby`. The group is silently demoted forever. Move the role/health mutations after the standby search succeeds, or roll them back in the `Err` arm.
 
-### 104. Local-source migration silently mutates source daemon state after snapshot is sent
+### 104. Local-source migration silently mutates source daemon state after snapshot is sent — **[FIXED 2026-05-01]**
 **File:** `adapter/net/compute/orchestrator.rs:911-946`
+
+**Fix:** `MigrationOrchestrator` gains an optional `source_handler: Option<Arc<MigrationSourceHandler>>` field plus a `with_source_handler` builder. When `start_migration` runs the local-source branch and the field is `Some`, it routes through `source_handler.start_snapshot(daemon_origin, target_node, local_node_id)` — mirroring the dispatcher's remote-source path at `migration_handler.rs:310-312`. The SDK's `DaemonRuntime::new` (`sdk/src/compute.rs:296`) wires the source handler in at construction time. With the migration registered in the source handler, `is_migrating(origin)` returns true, `buffer_event` becomes invokable for the daemon (callers who funnel post-snapshot events through it now get them buffered), and the cutover path's `on_cutover` finds a real record to drain instead of falling back to its `DaemonNotFound` tolerance.
+
+Tests:
+- `local_source_migration_registers_in_source_handler` — pin the post-condition: `source_handler.is_migrating(origin)` returns `true` after `start_migration` on a local source. Pre-fix it returned `false`.
+- `local_source_migration_enables_source_handler_buffering` — pin the fix-enabled functionality: `source_handler.buffer_event(origin, event)` returns `Ok(true)` (buffered) and the events are drainable via `take_buffered_events`. Pre-fix this returned `Ok(false)` because no migration was registered.
+- The existing `test_start_migration_local_source` continues to pass against the post-fix path.
+
+Scope note: this fix is the audit's explicit prescription ("mirror the dispatcher's path"). The wider semantic of automatically routing every incoming `DaemonRegistry::deliver` through `buffer_event` is NOT part of this fix — no production caller of `is_migrating` exists in either the pre-fix or post-fix code; routing the SDK's `DaemonRuntime::deliver` based on migration state is a separate concern that would deserve its own audit entry. What this fix does deliver: callers that consult the source-handler get correct answers for local-source migrations now, where before they silently saw "no migration in progress."
+
+(Original audit text:)
 
 When `source_node == self.local_node_id`, `start_migration` calls `daemon_registry.snapshot()` directly and never invokes `MigrationSourceHandler::start_snapshot`. As a result, `source_handler.is_migrating(origin)` returns `false`, no events are buffered on the source side, and the source daemon stays registered — continuing to accept `deliver()` calls and mutating its in-memory state *after* the snapshot has been sent to the target. **Failure scenario:** daemon at origin O is migrating from local node. Caller invokes `start_migration(O, local, target)`; orchestrator captures snapshot at `seq=100`. While the target restores, more events arrive at the source via `DaemonRegistry::deliver()` and advance the daemon to `seq=120`. Nothing buffers them (orchestrator's own `buffer_event` is a separate code path the caller may not invoke). At cutover, source is unregistered with seq=120 of unsaved state; target activates at seq=100. Events 101-120 are lost. Compare to the dispatcher's `TakeSnapshot` path (`migration_handler.rs:310-312`) which DOES call `source_handler.start_snapshot` and then routes events through `buffer_event`. Mirror that path for local migrations.
 

@@ -293,8 +293,17 @@ impl DaemonRuntime {
         let local_node_id = mesh.inner().node_id();
         let registry = Arc::new(DaemonRegistry::new());
         let factory_registry = Arc::new(DaemonFactoryRegistry::new());
-        let orchestrator = Arc::new(MigrationOrchestrator::new(registry.clone(), local_node_id));
         let source_handler = Arc::new(MigrationSourceHandler::new(registry.clone()));
+        // BUG #104: wire `source_handler` into the orchestrator so
+        // local-source migrations register the migration in the
+        // source-side handler — without this, post-snapshot events
+        // are silently mutated into the source daemon's state and
+        // lost at cutover. See
+        // `MigrationOrchestrator::with_source_handler`.
+        let orchestrator = Arc::new(
+            MigrationOrchestrator::new(registry.clone(), local_node_id)
+                .with_source_handler(source_handler.clone()),
+        );
         let target_handler = Arc::new(MigrationTargetHandler::new_with_factories(
             registry.clone(),
             factory_registry.clone(),
