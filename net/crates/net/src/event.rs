@@ -368,14 +368,36 @@ pub fn batch_process_nonce() -> u64 {
 }
 
 impl Batch {
-    /// Create a new batch.
+    /// Create a new batch using the per-process nonce
+    /// ([`batch_process_nonce`]). Convenience for tests and for
+    /// callers that don't thread a custom producer nonce through.
+    /// Production paths constructed via the bus go through
+    /// [`Self::with_nonce`] with the bus's loaded
+    /// `producer_nonce_path` value (BUG #56) so retries dedup
+    /// across process restart.
     #[inline]
     pub fn new(shard_id: u16, events: Vec<InternalEvent>, sequence_start: u64) -> Self {
+        Self::with_nonce(shard_id, events, sequence_start, batch_process_nonce())
+    }
+
+    /// Create a new batch with an explicit producer nonce. Used by
+    /// the bus's `BatchWorker` and `remove_shard_internal`'s
+    /// stranded-flush so adapters keying dedup on
+    /// `(producer_nonce, shard, sequence_start, i)` see the same
+    /// nonce across process restart when the bus is configured
+    /// with a `producer_nonce_path` (BUG #56).
+    #[inline]
+    pub fn with_nonce(
+        shard_id: u16,
+        events: Vec<InternalEvent>,
+        sequence_start: u64,
+        producer_nonce: u64,
+    ) -> Self {
         Self {
             shard_id,
             events,
             sequence_start,
-            process_nonce: batch_process_nonce(),
+            process_nonce: producer_nonce,
         }
     }
 

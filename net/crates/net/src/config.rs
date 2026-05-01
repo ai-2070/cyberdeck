@@ -1,5 +1,6 @@
 //! Configuration types for the Net event bus.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Top-level configuration for the event bus.
@@ -41,6 +42,22 @@ pub struct EventBusConfig {
     /// 0 = no retries (drop immediately on failure, default).
     /// Retries use a fixed 100ms delay between attempts.
     pub adapter_batch_retries: u32,
+
+    /// File path for the persistent producer nonce (BUG #56). When
+    /// `Some`, the bus loads (or creates on first run) the u64
+    /// nonce at this path on startup and stamps it on every
+    /// outgoing batch. Adapters that key dedup on
+    /// `(producer_nonce, shard, sequence_start, i)` then dedup
+    /// retransmits across process restart — JetStream's
+    /// `Nats-Msg-Id` is the canonical example.
+    ///
+    /// When `None` (default), the bus uses a per-process nonce
+    /// sampled fresh at every startup (today's behavior). That's
+    /// fine for in-memory adapters and for any deployment where
+    /// "at-most-once across process restart" is acceptable;
+    /// production JetStream / Redis deployments should set this
+    /// to a stable path on local persistent storage.
+    pub producer_nonce_path: Option<PathBuf>,
 }
 
 impl Default for EventBusConfig {
@@ -55,6 +72,7 @@ impl Default for EventBusConfig {
             scaling: Some(ScalingPolicy::default_for_cpus(cpus)),
             adapter_timeout: Duration::from_secs(30),
             adapter_batch_retries: 0,
+            producer_nonce_path: None,
         }
     }
 }
@@ -144,6 +162,7 @@ pub struct EventBusConfigBuilder {
     scaling: Option<ScalingConfig>,
     adapter_timeout: Option<Duration>,
     adapter_batch_retries: Option<u32>,
+    producer_nonce_path: Option<PathBuf>,
 }
 
 impl EventBusConfigBuilder {
@@ -209,6 +228,16 @@ impl EventBusConfigBuilder {
         self
     }
 
+    /// Persist the producer nonce at `path` so it survives process
+    /// restart (BUG #56). Recommended for any deployment using
+    /// JetStream / Redis adapters where retries-after-crash should
+    /// dedup against the prior incarnation. See
+    /// `EventBusConfig::producer_nonce_path` for the full doc.
+    pub fn producer_nonce_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.producer_nonce_path = Some(path.into());
+        self
+    }
+
     /// Build the configuration, validating all settings.
     pub fn build(self) -> Result<EventBusConfig, ConfigError> {
         let num_shards = self.num_shards.unwrap_or_else(num_cpus);
@@ -230,6 +259,7 @@ impl EventBusConfigBuilder {
             scaling,
             adapter_timeout: self.adapter_timeout.unwrap_or(Duration::from_secs(30)),
             adapter_batch_retries: self.adapter_batch_retries.unwrap_or(0),
+            producer_nonce_path: self.producer_nonce_path,
         };
         config.validate()?;
         Ok(config)

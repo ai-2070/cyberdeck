@@ -282,13 +282,18 @@ impl Adapter for JetStreamAdapter {
         // render it once and only rewrite the trailing `:{i}` per
         // event, eliminating the per-event `format!` allocation.
         //
-        // The leading `{nonce}` segment is the per-process nonce
-        // sampled at construction; without it, a producer that
-        // restarted within JetStream's dedup window collided with its
-        // prior incarnation's `shard:0:0…` ids and the new batches
-        // were silently discarded.
-        // Use the batch's process_nonce — globally consistent
-        // across all adapters in this process.
+        // The leading `{nonce}` segment is the bus's producer nonce
+        // — sourced from `EventBusConfig::producer_nonce_path` when
+        // the caller wants persistence across restarts (BUG #56), or
+        // from the per-process default `event::batch_process_nonce`
+        // otherwise. Without it, a producer that restarted within
+        // JetStream's dedup window collided with its prior
+        // incarnation's `shard:0:0…` ids and the new batches were
+        // silently discarded; with it, the dedup window correctly
+        // recognizes mid-batch retries from a crashed-and-restarted
+        // producer when the persistent path is configured.
+        // Use the batch's process_nonce field — bus-loaded once
+        // and consistent across every batch from this bus instance.
         let mut acks = Vec::with_capacity(serialized.len());
         let mut msg_id_buf = String::new();
         let _ = write!(
