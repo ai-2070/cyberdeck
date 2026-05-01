@@ -7350,7 +7350,21 @@ mod heartbeat_aead_tests {
     use super::*;
     use crate::adapter::net::crypto::{NoiseHandshake, StaticKeypair};
     use crate::adapter::net::pool::PacketBuilder;
-    use crate::adapter::net::protocol::NetHeader;
+    use crate::adapter::net::protocol::{NetHeader, PacketFlags};
+
+    /// Extract the TX counter (bytes 16..24, little-endian u64) from
+    /// a serialized packet's header. Both data packets and
+    /// heartbeats patch the counter into the same wire-format
+    /// position; see `pool.rs::PacketBuilder::build` lines
+    /// `header_bytes[16..24].copy_from_slice(&counter.to_le_bytes())`
+    /// and the matching line in `build_heartbeat`.
+    fn counter_of(packet: &[u8]) -> u64 {
+        u64::from_le_bytes(
+            packet[16..24]
+                .try_into()
+                .expect("packet header is at least 24 bytes"),
+        )
+    }
 
     fn make_session_keys() -> (
         crate::adapter::net::crypto::SessionKeys,
@@ -7681,5 +7695,80 @@ mod heartbeat_aead_tests {
             !resp_session.verify_and_touch_heartbeat(&parsed),
             "replay of an already-accepted heartbeat must fail"
         );
+    }
+
+    /// BUG #106 invariant: heartbeats and data-path packets share a
+    /// single TX counter via `thread_local_pool`. Pre-#106-fix,
+    /// `NetSession` exposed two pools (`packet_pool` and
+    /// `thread_local_pool`) with the same key but independent
+    /// counters; a caller that mixed `session.packet_pool().get()`
+    /// for some packets and `session.thread_local_pool().get()` for
+    /// others would produce ChaCha20-Poly1305 nonce reuse against
+    /// the same key, leaking plaintext via XOR.
+    ///
+    /// The fix removed `packet_pool` and routes all TX through
+    /// `thread_local_pool`. Today `Session::build_heartbeat` calls
+    /// `self.thread_local_pool.get().build_heartbeat()` and the
+    /// data path builds via `self.thread_local_pool.get().build(...)`.
+    /// This test pins the resulting wire-level invariant: the
+    /// counters on heartbeat and data packets interleave strictly
+    /// monotonically (no two packets ever share a counter, no
+    /// matter the order they're built in). A future contributor who
+    /// re-introduced a separate pool/counter for heartbeats would
+    /// see this test fail because both sequences would restart at
+    /// 0.
+    #[test]
+    fn heartbeat_and_data_share_tx_counter_strictly_monotonic() {
+        let (init_keys, _resp_keys) = make_session_keys();
+        let init_session = NetSession::new(
+            init_keys.clone(),
+            "127.0.0.1:5001".parse().unwrap(),
+            4,
+            false,
+        );
+
+        // Build sequence: heartbeat, data, heartbeat, data,
+        // heartbeat. All five must have strictly-increasing
+        // counters.
+        let h1 = init_session.build_heartbeat();
+        let d1 = {
+            let mut pooled = init_session.thread_local_pool().get();
+            pooled.build(
+                0xCAFE_F00D,
+                0,
+                &[bytes::Bytes::from_static(b"event-a")],
+                PacketFlags::NONE,
+            )
+        };
+        let h2 = init_session.build_heartbeat();
+        let d2 = {
+            let mut pooled = init_session.thread_local_pool().get();
+            pooled.build(
+                0xCAFE_F00D,
+                1,
+                &[bytes::Bytes::from_static(b"event-b")],
+                PacketFlags::NONE,
+            )
+        };
+        let h3 = init_session.build_heartbeat();
+
+        let counters = [
+            counter_of(&h1),
+            counter_of(&d1),
+            counter_of(&h2),
+            counter_of(&d2),
+            counter_of(&h3),
+        ];
+
+        // Strict monotonicity: each counter > the previous one.
+        for window in counters.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "tx counters must be strictly increasing across heartbeat/data \
+                 interleave; got {:?} (BUG #106 regression: heartbeats and data \
+                 are drawing from independent counters)",
+                counters
+            );
+        }
     }
 }
