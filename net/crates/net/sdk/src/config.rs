@@ -142,6 +142,12 @@ impl NetBuilder {
 
     /// Build the configuration, consuming the builder.
     pub(crate) fn build_config(mut self) -> crate::error::Result<EventBusConfig> {
+        // The `mut adapter` binding is mutated only inside the
+        // `#[cfg(feature = "net")]` block below; when the `net`
+        // feature is off it's unused-mut. Suppress the warning
+        // narrowly so `-D warnings` builds without `net` stay
+        // clean.
+        #[cfg_attr(not(feature = "net"), allow(unused_mut))]
         if let Some(mut adapter) = self.adapter {
             // Plumb the caller-supplied identity into the adapter if
             // it consumes keypairs. Today only the `net` adapter
