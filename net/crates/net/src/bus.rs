@@ -1014,12 +1014,19 @@ impl EventBus {
             // "another thread is working on it, retry the
             // is_shutdown_completed() poll if you need a hard
             // barrier."
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            // 10s in production builds; overridable via the
+            // `_TEST_OVERRIDE_SHUTDOWN_VIA_REF_DEADLINE` thread-local
+            // in test builds so the slow-first-caller test doesn't
+            // need to wall-clock-wait for the full deadline. The
+            // override is `#[cfg(test)]`-only; production cargo
+            // builds compile out the override entirely.
+            let deadline_dur = shutdown_via_ref_spin_deadline();
+            let deadline = std::time::Instant::now() + deadline_dur;
             while !self.shutdown_completed.load(AtomicOrdering::Acquire) {
                 if std::time::Instant::now() >= deadline {
                     return Err(AdapterError::Transient(
                         "shutdown_via_ref: another caller is mid-shutdown; \
-                         deadline (10s) elapsed before shutdown_completed \
+                         deadline elapsed before shutdown_completed \
                          flipped. The bus IS shutting down; poll \
                          is_shutdown_completed() if you need a hard \
                          barrier."
@@ -1308,10 +1315,37 @@ impl Drop for EventBus {
 
 /// Body of the scaling monitor task spawned by
 /// `EventBus::start_scaling_monitor`. Holds a `Weak<EventBus>` and
-/// upgrades it once per tick so the spawned task does not keep the
-/// bus alive past the caller's last `Arc` reference. Without this,
-/// `Arc::try_unwrap` (which the consuming `shutdown(self)` API
-/// requires) would fail forever.
+/// CR-25: spin deadline for the second-caller path in
+/// `shutdown_via_ref`. 10s in production.
+#[cfg(not(test))]
+fn shutdown_via_ref_spin_deadline() -> std::time::Duration {
+    std::time::Duration::from_secs(10)
+}
+
+/// CR-25 test-only override. Stored as milliseconds; `0` (the
+/// default) means "use the production 10s". Set via
+/// [`set_shutdown_via_ref_spin_deadline_for_test`] from inside
+/// a test that needs to exercise the deadline-elapsed path
+/// without wall-clock-waiting the full 10s.
+#[cfg(test)]
+static SHUTDOWN_VIA_REF_DEADLINE_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn shutdown_via_ref_spin_deadline() -> std::time::Duration {
+    let ms = SHUTDOWN_VIA_REF_DEADLINE_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if ms == 0 {
+        std::time::Duration::from_secs(10)
+    } else {
+        std::time::Duration::from_millis(ms)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_shutdown_via_ref_spin_deadline_for_test(ms: u64) {
+    SHUTDOWN_VIA_REF_DEADLINE_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
 async fn run_scaling_monitor_via_weak(weak: std::sync::Weak<EventBus>) {
     // Refresh `interval` from the policy on every tick. The previous
     // version cached it once at task start, so any future runtime
@@ -2194,6 +2228,136 @@ mod tests {
             1,
             "CR-23 regression: shutdown MUST call adapter.shutdown() exactly once"
         );
+    }
+
+    /// CR-25: pin that a SECOND caller of `shutdown_via_ref` whose
+    /// CAS loses (because a first caller already flipped the
+    /// `shutdown` flag) and whose deadline elapses BEFORE the
+    /// first caller sets `shutdown_completed=true` returns
+    /// `AdapterError::Transient(_)` — NOT a silent `Ok(())`.
+    ///
+    /// Pre-CR-25 both branches returned `Ok`. A caller that lost
+    /// the CAS race had no way to distinguish "first caller
+    /// finished shutdown" from "deadline timed out mid-shutdown."
+    /// Under a slow adapter (`adapter_timeout` default 30s >
+    /// the 10s spin deadline), the second caller silently saw
+    /// `Ok` while the bus was still mid-shutdown — letting
+    /// subsequent code observe a partially-shut-down bus.
+    ///
+    /// We use a slow first caller (sleeps inside `flush()`)
+    /// and override the spin deadline to a few ms so the test
+    /// runs fast.
+    #[tokio::test]
+    async fn cr25_second_caller_returns_transient_when_deadline_elapses() {
+        struct SlowFlushAdapter {
+            // Block flush() for this long. The first caller
+            // gets stuck here while the second caller's spin
+            // deadline elapses.
+            flush_delay: std::time::Duration,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::adapter::Adapter for SlowFlushAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                tokio::time::sleep(self.flush_delay).await;
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _shard_id: u16,
+                _from_id: Option<&str>,
+                _limit: usize,
+            ) -> Result<crate::adapter::ShardPollResult, AdapterError> {
+                Ok(crate::adapter::ShardPollResult::empty())
+            }
+            fn name(&self) -> &'static str {
+                "cr25-slow-flush"
+            }
+            async fn is_healthy(&self) -> bool {
+                true
+            }
+        }
+
+        // Override the second-caller spin deadline to a short
+        // value so the test doesn't wall-clock-wait 10s. Production
+        // builds use the 10s default (the cfg(test) override is
+        // compiled out).
+        super::set_shutdown_via_ref_spin_deadline_for_test(50);
+
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .adapter_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        // First caller's flush() sleeps 500ms — far longer than
+        // the 50ms spin deadline.
+        let adapter: Box<dyn crate::adapter::Adapter> = Box::new(SlowFlushAdapter {
+            flush_delay: std::time::Duration::from_millis(500),
+        });
+        let bus = Arc::new(EventBus::new_with_adapter(config, adapter).await.unwrap());
+
+        // Spawn the FIRST caller — it wins the CAS and proceeds
+        // into the slow flush. We don't await it; we want it
+        // running in parallel.
+        let bus_first = Arc::clone(&bus);
+        let first_caller = tokio::spawn(async move { bus_first.shutdown_via_ref().await });
+
+        // Give the first caller a moment to win the CAS and enter
+        // the slow flush. Without this yield, both callers might
+        // race for the CAS and the test's outcome depends on
+        // scheduling order.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // The second caller's CAS will fail; it enters the spin
+        // and times out at 50ms.
+        let start = std::time::Instant::now();
+        let second_result = bus.shutdown_via_ref().await;
+        let elapsed = start.elapsed();
+
+        // Reset the override for other tests.
+        super::set_shutdown_via_ref_spin_deadline_for_test(0);
+
+        // CR-25 contract: the second caller MUST get a Transient
+        // error, not a silent Ok.
+        let err = second_result.expect_err(
+            "CR-25 regression: second caller MUST surface AdapterError::Transient \
+             when its deadline elapses, NOT a silent Ok",
+        );
+        match err {
+            AdapterError::Transient(msg) => {
+                assert!(
+                    msg.contains("deadline elapsed") || msg.contains("mid-shutdown"),
+                    "error message must reference the deadline path; got: {msg}"
+                );
+            }
+            other => panic!("expected Transient, got {:?}", other),
+        }
+
+        // Sanity: the second caller's elapsed time is bounded by
+        // the override (50ms) + scheduler slop. If this is
+        // anywhere near the production 10s, the cfg(test)
+        // override path broke.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "second caller took {elapsed:?}; the cfg(test) deadline override \
+             broke if this is near the 10s production default"
+        );
+
+        // Wait for the first caller to finish. Even though it
+        // took the slow path, the bus IS shutting down and will
+        // eventually complete.
+        let _ = first_caller.await.unwrap();
+        assert!(bus.is_shutdown_completed());
     }
 
     /// Regression: BUG_REPORT.md #6 — `shutdown()` must deliver every

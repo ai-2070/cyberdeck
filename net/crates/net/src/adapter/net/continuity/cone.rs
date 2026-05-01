@@ -393,4 +393,63 @@ mod tests {
              primitive (CR-16 sanity)"
         );
     }
+
+    /// CR-16 asymmetric: when only ONE cone carries the full
+    /// horizon, `is_concurrent_with` MUST fall back to the bloom
+    /// path (not silently use the exact path with one-sided data).
+    /// A future caller that thinks "I populated my own horizon, so
+    /// I'll get exact concurrency" needs to know that the OTHER
+    /// side's representation matters too. This pins the
+    /// `(Some, None)` and `(None, Some)` arms route through the
+    /// bloom fallback.
+    #[test]
+    fn cr16_asymmetric_horizon_falls_back_to_bloom() {
+        let mut h = ObservedHorizon::new();
+        h.observe(0xAAAA, 10);
+        h.observe(0xBBBB, 5); // Note: A's horizon contains B.
+
+        let link_a = make_link(0xAAAA, 10, h.encode());
+        let link_b = make_link(0xBBBB, 6, 0); // Empty horizon
+
+        // (Some, None): only A carries the full horizon.
+        let cone_a_exact = CausalCone::from_link_with_horizon(&link_a, &h);
+        let cone_b_bloom = CausalCone::from_causal_link(&link_b);
+
+        // The bloom fallback uses A's encoded horizon (which DOES
+        // contain B's origin via Bloom) AND B's encoded horizon
+        // (which is 0, so doesn't contain A). Bloom path:
+        //   !A.contains(B) && !B.contains(A)
+        //   = !true && !false
+        //   = false
+        // So the bloom path returns `false` (not concurrent).
+        let asym_result = cone_a_exact.is_concurrent_with(&cone_b_bloom);
+
+        // Direct bloom-primitive query, for sanity:
+        let raw_bloom = HorizonEncoder::potentially_concurrent(
+            link_a.horizon_encoded,
+            0xBBBB,
+            link_b.horizon_encoded,
+            0xAAAA,
+        );
+        assert_eq!(
+            asym_result, raw_bloom,
+            "CR-16: asymmetric (Some, None) MUST route through the bloom \
+             fallback — pre-fix a future caller that started populating \
+             one cone's full horizon while leaving the other on the \
+             wire-format-only path would get UNDEFINED behavior \
+             (some hybrid of exact + bloom). The test pins the \
+             defined behavior: bloom on either-missing."
+        );
+
+        // Symmetric reverse: (None, Some). Same outcome — bloom
+        // fallback, since `is_concurrent_with`'s match arms only
+        // take the exact path when BOTH are Some.
+        let cone_a_bloom = CausalCone::from_causal_link(&link_a);
+        let cone_b_exact = CausalCone::from_link_with_horizon(&link_b, &ObservedHorizon::new());
+        let asym_reverse = cone_a_bloom.is_concurrent_with(&cone_b_exact);
+        assert_eq!(
+            asym_reverse, raw_bloom,
+            "CR-16: asymmetric (None, Some) must also fall back to bloom"
+        );
+    }
 }
