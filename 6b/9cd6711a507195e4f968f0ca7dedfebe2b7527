@@ -1,0 +1,51 @@
+net/crates/net/src/ffi/mod.rs
+  64958cb6fb55fe73 89,279-290,481-491,820,886-887,947-955,1034
+net/crates/net/src/adapter/redis_dedup.rs
+  64958cb6fb55fe73 4,48-49,53,66-70,72-81
+net/crates/net/src/event.rs
+  64958cb6fb55fe73 376-377,388,390-391,396-406
+net/crates/net/src/ffi/redis_dedup.rs
+  64958cb6fb55fe73 4,34
+net/crates/net/src/shard/batch.rs
+  64958cb6fb55fe73 157,173,187,190-192,275
+net/crates/net/src/consumer/merge.rs
+  64958cb6fb55fe73 31-37,135-143,418,424-428,478-483,516-524
+net/crates/net/src/adapter/dedup_state.rs
+  64958cb6fb55fe73 10,33,35-36,38-40,43,173,184-197
+net/crates/net/src/config.rs
+  64958cb6fb55fe73 46,232,626-628,630-634,785-793
+net/crates/net/src/adapter/redis.rs
+  64958cb6fb55fe73 20,43,59,275,285,368,386-391
+net/crates/net/src/ffi/mesh.rs
+  64958cb6fb55fe73 138-141,152-160,1719-1726,1733,1753-1761,1992-1993,2761,2777
+net/crates/net/src/shard/mapper.rs
+  64958cb6fb55fe73 768-774,776-777,779-781,929
+net/crates/net/src/shard/ring_buffer.rs
+  64958cb6fb55fe73 89-96,98-99,104-106,223,325,414-415
+net/crates/net/src/bus.rs
+  64958cb6fb55fe73 1306,1313-1317,1319-1324,1330-1332,1393-1398,1523,1527-1532,1534-1535,1677-1684
+net/crates/net/src/adapter/jetstream.rs
+  64958cb6fb55fe73 198-205,209,287-288,414-425,433-436,447-452,461-465
+net/crates/net/src/shard/mod.rs
+  64958cb6fb55fe73 592-597,884-891
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "6b9cd6711a507195e4f968f0ca7dedfebe2b7527",
+  "prompts": {
+    "64958cb6fb55fe73": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81cf66b-69b3-455c-bab9-06a87305bb12",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 336,
+      "total_deletions": 374,
+      "accepted_lines": 1537,
+      "overriden_lines": 0
+    }
+  }
+}
