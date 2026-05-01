@@ -960,27 +960,57 @@ impl MigrationOrchestrator {
                     handler.start_snapshot(daemon_origin, target_node, self.local_node_id)?
                 }
                 None => {
-                    // Fallback path — pre-fix behavior, used only by
-                    // tests that haven't wired up the source handler.
-                    // Production callers go through
-                    // `MigrationDispatcher::new`, which always sets
-                    // the handler. Surface the gap so a misconfigured
-                    // production setup doesn't fail silently.
-                    tracing::warn!(
-                        daemon_origin = format_args!("{:#x}", daemon_origin),
-                        "MigrationOrchestrator::start_migration on local source without \
-                         a source_handler installed — events arriving between snapshot \
-                         capture and cutover may be silently lost (BUG #104). Use \
-                         `MigrationOrchestrator::with_source_handler` to wire it up.",
-                    );
-                    self.daemon_registry
-                        .snapshot(daemon_origin)
-                        .map_err(|e| MigrationError::StateFailed(e.to_string()))?
-                        .ok_or_else(|| {
-                            MigrationError::StateFailed(
-                                "daemon is stateless or snapshot failed".into(),
-                            )
-                        })?
+                    // CR-32: in production builds, refuse the
+                    // unwired-source-handler path with an explicit
+                    // error rather than silently falling back to
+                    // the pre-BUG #104 direct-snapshot path. The
+                    // fallback silently loses events arriving
+                    // between snapshot capture and cutover; a
+                    // misconfigured production setup MUST fail
+                    // loudly so operators see the gap in
+                    // integration tests rather than only
+                    // discovering it under traffic.
+                    //
+                    // Test builds keep the fallback so unit tests
+                    // can exercise the orchestrator without
+                    // wiring a full `MigrationSourceHandler`.
+                    // Production wiring (`MigrationDispatcher::new`)
+                    // always sets the handler.
+                    #[cfg(not(test))]
+                    {
+                        tracing::error!(
+                            daemon_origin = format_args!("{:#x}", daemon_origin),
+                            "MigrationOrchestrator::start_migration on local source \
+                             requires a source_handler. Use \
+                             `MigrationOrchestrator::with_source_handler` to wire it up. \
+                             (CR-32 / BUG #104)",
+                        );
+                        return Err(MigrationError::StateFailed(
+                            "source_handler not wired (CR-32 / BUG #104) — \
+                             local-source migrations would silently lose events \
+                             arriving between snapshot capture and cutover"
+                                .into(),
+                        ));
+                    }
+                    #[cfg(test)]
+                    {
+                        tracing::warn!(
+                            daemon_origin = format_args!("{:#x}", daemon_origin),
+                            "MigrationOrchestrator::start_migration on local source without \
+                             a source_handler installed — events arriving between snapshot \
+                             capture and cutover may be silently lost (BUG #104). Use \
+                             `MigrationOrchestrator::with_source_handler` to wire it up. \
+                             [test-build fallback; production refuses this path]",
+                        );
+                        self.daemon_registry
+                            .snapshot(daemon_origin)
+                            .map_err(|e| MigrationError::StateFailed(e.to_string()))?
+                            .ok_or_else(|| {
+                                MigrationError::StateFailed(
+                                    "daemon is stateless or snapshot failed".into(),
+                                )
+                            })?
+                    }
                 }
             };
 
@@ -1430,6 +1460,53 @@ mod tests {
         );
         reg.register(host).unwrap();
         (reg, origin)
+    }
+
+    /// CR-32: pin that the production-build (`cfg(not(test))`)
+    /// branch of `start_migration`'s `None` arm returns
+    /// `MigrationError::StateFailed` rather than silently falling
+    /// back to the pre-BUG #104 direct-snapshot path. The branch
+    /// itself is unreachable from `#[test]` tests by construction
+    /// (it's gated `cfg(not(test))`), so we use a source-level
+    /// tripwire — same pattern as CR-12 and CR-21. If a future
+    /// maintainer removes the cfg gate or changes the error path
+    /// to `Ok`/`tracing::warn!`-only, this fires.
+    ///
+    /// Forbidden shapes:
+    ///   - `cfg(not(test))` block with a `tracing::warn!` (must
+    ///     be `tracing::error!` for the production path).
+    ///   - Production path that does NOT call `return Err(...)`.
+    #[test]
+    fn cr32_production_path_must_return_err_when_source_handler_missing() {
+        let src = include_str!("orchestrator.rs");
+        // Find the `cfg(not(test))` block inside `start_migration`.
+        // Build the search token at runtime so this test's own
+        // source doesn't trigger the scan.
+        let needle = format!("{}{}{}", "#[cfg(not(", "test", "))]");
+        let cfg_block_idx = src.find(&needle).expect(
+            "CR-32 regression: `cfg(not(test))` gate must exist in start_migration's \
+             None arm — pre-CR-32 the production path silently fell back to \
+             daemon_registry.snapshot, losing events between snapshot and cutover (BUG #104)",
+        );
+        // Take the next ~30 lines from the cfg_block (block-scoped
+        // scan). Walking line-by-line avoids slicing inside a
+        // multi-byte char.
+        let block: String = src[cfg_block_idx..]
+            .lines()
+            .take(30)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            block.contains("return Err(MigrationError::"),
+            "CR-32 regression: production cfg(not(test)) branch MUST return Err(MigrationError::...). \
+             Found cfg gate but the production path is not erroring out. \
+             Block:\n{}",
+            block
+        );
+        assert!(
+            block.contains("source_handler"),
+            "CR-32 regression: production error message must reference source_handler"
+        );
     }
 
     #[test]

@@ -69,12 +69,24 @@ impl PyRedisStreamDedup {
     /// first time we've seen this `dedup_id`.
     ///
     /// Maps to the Rust `is_duplicate(&mut self, &str) -> bool`.
-    fn is_duplicate(&self, dedup_id: &str) -> bool {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.is_duplicate(dedup_id)
+    ///
+    /// CR-35: releases the GIL via `Python::allow_threads` while
+    /// the inner mutex is held. Pre-CR-35 the GIL was held across
+    /// the entire mutex-acquire + lookup + insert sequence; under
+    /// contention (multiple Python threads sharing one handle,
+    /// which is supported but discouraged) this serialized the
+    /// asyncio event loop unnecessarily even when the underlying
+    /// work was bounded by the Rust mutex. The closure body is
+    /// pure Rust + a borrowed `&str`, so no Python state is
+    /// touched while the GIL is released.
+    fn is_duplicate(&self, py: Python<'_>, dedup_id: &str) -> bool {
+        py.detach(|| {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.is_duplicate(dedup_id)
+        })
     }
 
     /// Number of distinct ids currently tracked.
@@ -110,12 +122,20 @@ impl PyRedisStreamDedup {
     /// Clear all tracked ids. Use after a consumer-group
     /// rebalance to reset the dedup window without losing the
     /// helper instance.
-    fn clear(&self) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.clear();
+    ///
+    /// CR-35: releases the GIL — clear() can drop up to
+    /// `capacity` heap allocations (the `Arc<str>` ids), which
+    /// for a 600K-capacity helper means ~600K `Drop`s on the
+    /// caller's thread. No reason to hold the GIL during that
+    /// work.
+    fn clear(&self, py: Python<'_>) {
+        py.detach(|| {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.clear();
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -137,28 +157,35 @@ mod tests {
 
     /// Smoke test: PyO3 surface answers the same way as the Rust
     /// helper for the canonical BUG #57 producer-retry scenario.
+    ///
+    /// CR-35 wraps the calls in `Python::attach` because
+    /// `is_duplicate` and `clear` now take a `Python<'_>` token
+    /// (used to release the GIL via `py.detach(|| ...)` while the
+    /// inner mutex is held).
     #[test]
     fn pyo3_helper_filters_duplicates() {
-        let dedup = PyRedisStreamDedup::new(Some(64));
+        Python::attach(|py| {
+            let dedup = PyRedisStreamDedup::new(Some(64));
 
-        // First pass: every id is new.
-        for i in 0..3 {
-            let id = format!("deadbeef:0:0:{i}");
-            assert!(!dedup.is_duplicate(&id));
-        }
-        assert_eq!(dedup.len(), 3);
-        assert!(!dedup.is_empty());
+            // First pass: every id is new.
+            for i in 0..3 {
+                let id = format!("deadbeef:0:0:{i}");
+                assert!(!dedup.is_duplicate(py, &id));
+            }
+            assert_eq!(dedup.len(), 3);
+            assert!(!dedup.is_empty());
 
-        // Retry path: every id reappears with the same dedup_id.
-        for i in 0..3 {
-            let id = format!("deadbeef:0:0:{i}");
-            assert!(dedup.is_duplicate(&id));
-        }
-        assert_eq!(dedup.len(), 3); // length unchanged on duplicate hits
+            // Retry path: every id reappears with the same dedup_id.
+            for i in 0..3 {
+                let id = format!("deadbeef:0:0:{i}");
+                assert!(dedup.is_duplicate(py, &id));
+            }
+            assert_eq!(dedup.len(), 3); // length unchanged on duplicate hits
 
-        dedup.clear();
-        assert_eq!(dedup.len(), 0);
-        assert!(dedup.is_empty());
+            dedup.clear(py);
+            assert_eq!(dedup.len(), 0);
+            assert!(dedup.is_empty());
+        })
     }
 
     #[test]
@@ -177,5 +204,50 @@ mod tests {
     fn pyo3_helper_capacity_zero_is_clamped() {
         let dedup = PyRedisStreamDedup::new(Some(0));
         assert_eq!(dedup.capacity(), 1);
+    }
+
+    /// CR-35: pin that the hot paths (`is_duplicate`, `clear`)
+    /// release the GIL via `py.detach(|| ...)`. Pre-CR-35 these
+    /// methods held the GIL across the inner mutex acquire +
+    /// hash work, serializing the asyncio event loop on every
+    /// dedup query under multi-thread contention. The fix wraps
+    /// the mutex work in `py.detach` so other Python threads can
+    /// run concurrently.
+    ///
+    /// We can't directly assert "the GIL is released" without
+    /// instrumenting Python's threading state, so we use a
+    /// source-level tripwire — same pattern as CR-12, CR-21,
+    /// CR-32. The fixed forbidden shape is "fn is_duplicate / fn
+    /// clear without `py.detach`."
+    #[test]
+    fn cr35_hot_paths_release_gil_via_py_detach() {
+        let src = include_str!("redis_dedup.rs");
+
+        // Find each hot-path method definition and assert the
+        // body contains `py.detach(`. Built at runtime so the
+        // test's source doesn't trigger the scan.
+        let detach_token = format!("py{}{}(", ".", "detach");
+
+        for method in &["is_duplicate", "clear"] {
+            let needle = format!("fn {}(&self, py: Python", method);
+            let idx = src.find(&needle).unwrap_or_else(|| {
+                panic!(
+                    "CR-35 regression: `{}` no longer takes `py: Python<'_>` — \
+                     the GIL-release pattern requires this signature so the \
+                     #[pymethods] macro injects the GIL token at the call site",
+                    method
+                )
+            });
+            // Look ahead in the body for the detach invocation.
+            let body: String = src[idx..].lines().take(15).collect::<Vec<_>>().join("\n");
+            assert!(
+                body.contains(&detach_token),
+                "CR-35 regression: `{}` does not call `py.detach(...)`. \
+                 The hot path must release the GIL while holding the inner \
+                 mutex. Method body:\n{}",
+                method,
+                body
+            );
+        }
     }
 }
