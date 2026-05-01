@@ -107,7 +107,12 @@ pub use identity::{
 pub use mesh::{MeshNode, MeshNodeConfig, PartitionFilter};
 #[cfg(feature = "netdb")]
 pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};
-pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, SharedPacketPool, ThreadLocalPool};
+// `SharedPacketPool` is intentionally not re-exported — see
+// `pool.rs` for the cross-pool nonce-reuse rationale.
+// `PacketPool` itself stays exposed because tests reference it;
+// only the `Arc<PacketPool>` wrapper alias and its constructor
+// are absent.
+pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, ThreadLocalPool};
 pub use protocol::{
     EventFrame, NackPayload, NetHeader, PacketFlags, HEADER_SIZE, NONCE_SIZE, TAG_SIZE,
 };
@@ -143,7 +148,8 @@ pub use subprotocol::{
     SUBPROTOCOL_NEGOTIATION,
 };
 pub use swarm::{
-    Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave, PINGWAVE_SIZE,
+    Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave,
+    MAX_GRAPH_NODES, MAX_SEEN_PINGWAVES, PINGWAVE_SIZE,
 };
 pub use transport::{NetSocket, PacketReceiver, PacketSender, ParsedPacket, SocketBufferConfig};
 
@@ -172,12 +178,23 @@ pub use routing::{route_to_shard, stream_id_from_bytes, stream_id_from_key};
 ///
 /// Shared utility — avoids duplicating this across `causal.rs`, `snapshot.rs`,
 /// `observation.rs`, `migration.rs`, `session.rs`, and `token.rs`.
+///
+/// Saturates via `try_from` so future-dated clocks land at
+/// `u64::MAX` instead of wrapping near 0. A bare `as u64` would
+/// silently truncate the `u128` returned by
+/// `Duration::as_nanos()`. Practical wraparound from monotonic
+/// flow doesn't happen until ~year 2554, but a system whose clock
+/// was misconfigured to a far-future date would produce a tiny
+/// truncated timestamp — immediately tripping `is_timed_out`
+/// everywhere. `unwrap_or_default()` returning `Duration::ZERO`
+/// for a pre-epoch clock would also produce identical timestamps
+/// that break ordering.
 #[inline]
 pub(crate) fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
+    let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+        .unwrap_or_default();
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Fast xxh3-based routing utilities for Net streams.
@@ -639,27 +656,15 @@ impl NetAdapter {
         // We still require `source == peer_addr` as a cheap
         // first-line filter so an unauthenticated flood doesn't
         // get to do the AEAD verify.
+        //
+        // The verify+touch sequence lives inside
+        // `NetSession::verify_and_touch_heartbeat` so callers can't
+        // touch a session whose heartbeat failed verify, and can't
+        // forget to touch on success.
         if parsed.header.flags.is_heartbeat() {
-            if source != session.peer_addr() {
-                return;
+            if source == session.peer_addr() {
+                session.verify_and_touch_heartbeat(&parsed);
             }
-            let aad = parsed.header.aad();
-            let counter =
-                u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
-            let rx_cipher = session.rx_cipher();
-            if !rx_cipher.is_valid_rx_counter(counter) {
-                return;
-            }
-            // The "payload" of a heartbeat is just the 16-byte
-            // AEAD tag. Decrypting an empty plaintext over the
-            // tag is the verification step.
-            if rx_cipher.decrypt(counter, &aad, &parsed.payload).is_err() {
-                return;
-            }
-            if !rx_cipher.update_rx_counter(counter) {
-                return;
-            }
-            session.touch();
             return;
         }
 
@@ -837,9 +842,20 @@ impl NetAdapter {
                             break;
                         }
 
-                        // Build and send heartbeat
-                        let mut builder = PacketBuilder::new(&[0u8; 32], session.session_id());
-                        let packet = builder.build_heartbeat();
+                        // `Session::build_heartbeat` routes through
+                        // `thread_local_pool` (same pool the data
+                        // path uses) so heartbeats share a single
+                        // TX counter with data and interleave
+                        // correctly on the wire. Constructing a
+                        // bespoke `PacketBuilder::new(&[0u8; 32],
+                        // session.session_id())` per tick would
+                        // (a) use the wrong key so the receiver's
+                        // AEAD verify would reject every heartbeat,
+                        // and (b) reuse counter=0 across successive
+                        // heartbeats so the receiver's replay
+                        // window would reject every heartbeat
+                        // after the first.
+                        let packet = session.build_heartbeat();
 
                         if let Err(e) = socket.send_to(&packet, peer_addr).await {
                             tracing::warn!(error = %e, "heartbeat send failed");

@@ -103,11 +103,34 @@ impl EventMeta {
     }
 }
 
-/// Compute the xxh3 checksum of a payload tail, truncated to the low
-/// 32 bits. This is the value callers stamp into
-/// [`EventMeta::checksum`]. Disk-recovery / external inspection tools
-/// can reproduce the value by hashing the bytes after the 20-byte
-/// prefix — it is not currently verified on fold.
+/// Compute the corruption-detection checksum of a payload tail —
+/// the xxh3 hash truncated to the low 32 bits. Stamped into
+/// [`EventMeta::checksum`].
+///
+/// **Scope:** this is an *accidental-corruption* detector, NOT a
+/// tamper detector. Two specific limits make it unsuitable for
+/// tamper-resistance:
+///
+/// 1. **32-bit truncation.** A 32-bit unkeyed hash has roughly
+///    1-in-2³² collision probability per pair of distinct
+///    payloads — fine against random bit-flips on disk, but only
+///    ~1-in-2¹⁶ across a long-running file under the birthday
+///    bound. Adequate for "did the on-disk record decode
+///    correctly?" not "did an attacker craft a payload that
+///    matches?".
+/// 2. **Unkeyed.** An attacker who can write to the on-disk
+///    redex file can recompute the matching checksum trivially
+///    by hashing whatever payload they substitute. There is no
+///    secret bound to this value.
+///
+/// Callers that need tamper detection (rather than corruption
+/// detection) must layer a keyed MAC at a higher level — e.g.
+/// the AEAD-protected mesh packet envelope. The cortex fold
+/// paths use this value only to surface obviously-broken on-disk
+/// records as `RedexError::Decode`, not as a security boundary.
+///
+/// Disk-recovery / external inspection tools can reproduce the
+/// value by hashing the bytes after the 20-byte prefix.
 #[inline]
 pub fn compute_checksum(tail: &[u8]) -> u32 {
     xxhash_rust::xxh3::xxh3_64(tail) as u32

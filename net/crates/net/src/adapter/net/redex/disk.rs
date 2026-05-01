@@ -161,6 +161,17 @@ pub(super) struct DiskSegment {
     /// AND a worker is listening (spawned by
     /// `RedexFile::open_persistent`).
     pub(super) fsync_signal: Arc<Notify>,
+    /// Segment poisoning. Set to `true` when `compact_to`'s
+    /// post-rename re-open phase fails after the renames committed
+    /// AND the cached file handles are pointing at temp-dir
+    /// placeholders rather than the channel files. Once poisoned,
+    /// every append / sync / compact path returns
+    /// `RedexError::Io` immediately — preventing acknowledged
+    /// writes from landing in `/tmp` instead of the channel
+    /// directory. Operators recover by closing and re-opening the
+    /// channel (which constructs a fresh `DiskSegment` with valid
+    /// handles).
+    poisoned: std::sync::atomic::AtomicBool,
     /// Test-only injection: when set, the next `append_entry` /
     /// `append_entries` call returns `RedexError::Io` before touching
     /// either file. Exercises the caller's rollback paths without
@@ -180,6 +191,28 @@ pub(super) struct DiskSegment {
     /// terminating on a sync error.
     #[cfg(test)]
     fail_next_sync: AtomicBool,
+    /// Test-only injection: when set, the next `compact_to` returns
+    /// `RedexError::Io` before touching any file. Used to exercise
+    /// the `sweep_retention` rollback path (BUG #95) — verifies
+    /// that a failed disk compaction leaves in-memory state
+    /// untouched so reopen replays a consistent picture.
+    #[cfg(test)]
+    fail_next_compact: AtomicBool,
+    /// Test-only injection: when set, the next `idx.metadata()`
+    /// call inside an append path returns `RedexError::Io`. Used
+    /// to exercise the BUG #94 rollback path — that an idx
+    /// metadata failure after a successful dat write rolls the
+    /// dat back rather than leaving orphan bytes on disk. The
+    /// flag is consumed on the next idx-metadata call (success
+    /// or failure clears it).
+    #[cfg(test)]
+    fail_next_idx_metadata: AtomicBool,
+    /// Test-only injection: when set, the next `ts.metadata()`
+    /// call inside an append path returns `RedexError::Io`. Used
+    /// to exercise the BUG #94 rollback path — that a ts metadata
+    /// failure after successful dat + idx writes rolls both back.
+    #[cfg(test)]
+    fail_next_ts_metadata: AtomicBool,
     /// Test-only counter: cumulative successful `sync()` calls —
     /// close-time, append-driven (EveryN), or external
     /// (Interval / explicit). Lets policy tests assert the observed
@@ -441,12 +474,19 @@ impl DiskSegment {
                 appends_since_sync: AtomicU64::new(0),
                 bytes_since_sync: AtomicU64::new(0),
                 fsync_signal: Arc::new(Notify::new()),
+                poisoned: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 fail_next_append: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_after_dat_write: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_next_sync: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_compact: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_idx_metadata: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_ts_metadata: AtomicBool::new(false),
                 #[cfg(test)]
                 sync_count: AtomicU64::new(0),
             },
@@ -587,6 +627,18 @@ impl DiskSegment {
         payload: &[u8],
         timestamp_ns: u64,
     ) -> Result<(), RedexError> {
+        // Refuse writes against a poisoned segment. `compact_to`
+        // sets this flag when its post-rename re-open phase fails
+        // — the cached file handles are pointing at temp-dir
+        // placeholders and any append would land in `/tmp`
+        // instead of the channel directory.
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RedexError::Io(
+                "redex segment is poisoned (compact_to post-rename reopen failure); \
+                 close and re-open the channel to recover"
+                    .into(),
+            ));
+        }
         #[cfg(test)]
         if self.fail_next_append.swap(false, Ordering::AcqRel) {
             return Err(RedexError::Io("test-injected append failure".into()));
@@ -635,7 +687,35 @@ impl DiskSegment {
             ));
         }
         let mut idx = self.idx_file.lock();
-        let pre_idx_len = idx.metadata().map_err(RedexError::io)?.len();
+        // `idx.metadata()?` can fail (file handle invalidated
+        // after compact_to placeholder swap, fs error, etc.) AFTER
+        // the dat write at line 607 has already committed bytes
+        // to disk. A `?` early-return would skip the rollback
+        // block below, leaving orphan dat bytes on disk while the
+        // caller is told the append failed. Wrap explicitly so
+        // the dat rollback runs on this path too.
+        #[cfg(test)]
+        let idx_metadata = if self.fail_next_idx_metadata.swap(false, Ordering::AcqRel) {
+            Err(std::io::Error::other("test-injected idx.metadata failure"))
+        } else {
+            idx.metadata()
+        };
+        #[cfg(not(test))]
+        let idx_metadata = idx.metadata();
+        let pre_idx_len = match idx_metadata {
+            Ok(m) => m.len(),
+            Err(e) => {
+                drop(idx);
+                if !entry.is_inline() {
+                    let dat_path = self.dir.join("dat");
+                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
+                        let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
+                        let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
+                    }
+                }
+                return Err(RedexError::io(e));
+            }
+        };
         if let Err(e) = idx.write_all(&entry.to_bytes()) {
             drop(idx);
             let idx_path = self.dir.join("idx");
@@ -660,7 +740,41 @@ impl DiskSegment {
         // roll back idx (and dat) so the on-disk index never
         // reaches an entry without a matching timestamp.
         let mut ts = self.ts_file.lock();
-        let pre_ts_len = ts.metadata().map_err(RedexError::io)?.len();
+        // `ts.metadata()?` can fail AFTER both dat AND idx have
+        // committed bytes to disk. A `?` early-return would skip
+        // the rollback block below, leaving the on-disk idx with
+        // a record whose ts entry never landed (so on reopen
+        // `read_timestamps` returns None for the length mismatch
+        // and every recovered entry gets `now()` as its
+        // timestamp, breaking age-based retention). Wrap
+        // explicitly so the idx + dat rollback runs on this path
+        // too.
+        #[cfg(test)]
+        let ts_metadata = if self.fail_next_ts_metadata.swap(false, Ordering::AcqRel) {
+            Err(std::io::Error::other("test-injected ts.metadata failure"))
+        } else {
+            ts.metadata()
+        };
+        #[cfg(not(test))]
+        let ts_metadata = ts.metadata();
+        let pre_ts_len = match ts_metadata {
+            Ok(m) => m.len(),
+            Err(e) => {
+                drop(ts);
+                let idx_path = self.dir.join("idx");
+                if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
+                    let _ = f.set_len(pre_idx_len);
+                }
+                if !entry.is_inline() {
+                    let dat_path = self.dir.join("dat");
+                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
+                        let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
+                        let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
+                    }
+                }
+                return Err(RedexError::io(e));
+            }
+        };
         if let Err(e) = ts.write_all(&timestamp_ns.to_le_bytes()) {
             drop(ts);
             let ts_path = self.dir.join("ts");
@@ -749,6 +863,15 @@ impl DiskSegment {
         entries_and_payloads: &[(RedexEntry, &[u8])],
         timestamps: &[u64],
     ) -> Result<(), RedexError> {
+        // Refuse writes against a poisoned segment. See
+        // `append_entry_inner` for the full rationale.
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RedexError::Io(
+                "redex segment is poisoned (compact_to post-rename reopen failure); \
+                 close and re-open the channel to recover"
+                    .into(),
+            ));
+        }
         #[cfg(test)]
         if self.fail_next_append.swap(false, Ordering::AcqRel) {
             return Err(RedexError::Io("test-injected append failure".into()));
@@ -799,7 +922,30 @@ impl DiskSegment {
         };
 
         let mut idx = self.idx_file.lock();
-        let idx_pre_len = idx.metadata().map_err(RedexError::io)?.len();
+        // Same hazard as `append_entry_inner` — `metadata()?` can
+        // fail after the dat write at line 787 has committed
+        // bytes. Wrap explicitly so the dat rollback runs.
+        #[cfg(test)]
+        let idx_metadata = if self.fail_next_idx_metadata.swap(false, Ordering::AcqRel) {
+            Err(std::io::Error::other("test-injected idx.metadata failure"))
+        } else {
+            idx.metadata()
+        };
+        #[cfg(not(test))]
+        let idx_metadata = idx.metadata();
+        let idx_pre_len = match idx_metadata {
+            Ok(m) => m.len(),
+            Err(e) => {
+                drop(idx);
+                if let Some(pre_len) = dat_pre_len {
+                    let dat_path = self.dir.join("dat");
+                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
+                        let _ = f.set_len(pre_len);
+                    }
+                }
+                return Err(RedexError::io(e));
+            }
+        };
         if let Err(e) = idx.write_all(&idx_buf) {
             drop(idx);
             let idx_path = self.dir.join("idx");
@@ -817,7 +963,37 @@ impl DiskSegment {
         drop(idx);
 
         let mut ts = self.ts_file.lock();
-        let ts_pre_len = ts.metadata().map_err(RedexError::io)?.len();
+        // `metadata()?` can fail after dat AND idx have both
+        // committed bytes. Wrap explicitly so the full rollback
+        // runs on this path too — without it the on-disk idx
+        // would end up with records whose ts never landed,
+        // breaking `read_timestamps` alignment and age-based
+        // retention.
+        #[cfg(test)]
+        let ts_metadata = if self.fail_next_ts_metadata.swap(false, Ordering::AcqRel) {
+            Err(std::io::Error::other("test-injected ts.metadata failure"))
+        } else {
+            ts.metadata()
+        };
+        #[cfg(not(test))]
+        let ts_metadata = ts.metadata();
+        let ts_pre_len = match ts_metadata {
+            Ok(m) => m.len(),
+            Err(e) => {
+                drop(ts);
+                let idx_path = self.dir.join("idx");
+                if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
+                    let _ = f.set_len(idx_pre_len);
+                }
+                if let Some(pre_len) = dat_pre_len {
+                    let dat_path = self.dir.join("dat");
+                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
+                        let _ = f.set_len(pre_len);
+                    }
+                }
+                return Err(RedexError::io(e));
+            }
+        };
         if let Err(e) = ts.write_all(&ts_buf) {
             drop(ts);
             let ts_path = self.dir.join("ts");
@@ -903,6 +1079,35 @@ impl DiskSegment {
         self.fail_next_sync.store(true, Ordering::Release);
     }
 
+    /// Test-only: arm a one-shot failure on the next `compact_to`
+    /// call. Used to verify the `sweep_retention` rollback path
+    /// (BUG #95) — that a failed disk compaction leaves in-memory
+    /// state untouched. The flag is consumed on the next
+    /// `compact_to` (success or failure clears it).
+    #[cfg(test)]
+    pub(super) fn arm_next_compact_failure(&self) {
+        self.fail_next_compact.store(true, Ordering::Release);
+    }
+
+    /// Test-only: arm a one-shot failure on the next idx
+    /// `metadata()` call inside an append path. Used to exercise
+    /// the BUG #94 rollback path — verifies that a metadata error
+    /// after a successful dat write rolls the dat back instead of
+    /// leaving orphan bytes on disk.
+    #[cfg(test)]
+    pub(super) fn arm_next_idx_metadata_failure(&self) {
+        self.fail_next_idx_metadata.store(true, Ordering::Release);
+    }
+
+    /// Test-only: arm a one-shot failure on the next ts
+    /// `metadata()` call inside an append path. Used to exercise
+    /// the BUG #94 rollback path — verifies that a metadata error
+    /// after successful dat + idx writes rolls both back.
+    #[cfg(test)]
+    pub(super) fn arm_next_ts_metadata_failure(&self) {
+        self.fail_next_ts_metadata.store(true, Ordering::Release);
+    }
+
     /// Compact the on-disk segment to the surviving in-memory
     /// state. Called by `sweep_retention` so age / size eviction
     /// reflects on disk too — without this, the idx + dat files
@@ -920,6 +1125,19 @@ impl DiskSegment {
         surviving_timestamps: &[u64],
         dat_base: u64,
     ) -> Result<(), RedexError> {
+        // Refuse compact against a poisoned segment. A poisoned
+        // segment's cached handles point at temp-dir placeholders;
+        // running another compact would compound the
+        // off-channel-directory hazard.
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RedexError::Io(
+                "redex segment is poisoned; refusing compact_to".into(),
+            ));
+        }
+        #[cfg(test)]
+        if self.fail_next_compact.swap(false, Ordering::AcqRel) {
+            return Err(RedexError::Io("test-injected compact_to failure".into()));
+        }
         if surviving_index.len() != surviving_timestamps.len() {
             return Err(RedexError::Io(format!(
                 "compact_to: index/timestamp length mismatch ({} vs {})",
@@ -1084,34 +1302,108 @@ impl DiskSegment {
         *worker_ts_guard = null_ts_worker;
 
         // Atomic renames.
+        //
+        // This is a *three-rename* sequence rather than one
+        // atomic flip — a crash between renames N and N+1 leaves
+        // a mixed-version on-disk state that recovery cannot
+        // distinguish from a clean half-finished compact. A full
+        // fix is a manifest-pointer scheme (write versioned
+        // filenames, atomically swap a single "manifest" pointer),
+        // which is a format change deferred. The interim
+        // mitigation is the parent-dir fsync below: on POSIX,
+        // individual renames are not durable until the dirent is
+        // fsynced, so without that fsync a power loss could leave
+        // the directory pointing at the OLD inodes even after all
+        // three rename calls returned successfully. The fsync
+        // narrows but does not close the cross-file gap.
         std::fs::rename(&idx_tmp, &idx_path).map_err(RedexError::io)?;
         std::fs::rename(&dat_tmp, &dat_path).map_err(RedexError::io)?;
         std::fs::rename(&ts_tmp, &ts_path).map_err(RedexError::io)?;
+        fsync_dir(&self.dir).map_err(RedexError::io)?;
 
-        // Re-open the cached append handles on the new files, then
-        // re-clone for the worker slots. Both kinds again share the
-        // same OS file post-compaction.
-        *idx_guard = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&idx_path)
-            .map_err(RedexError::io)?;
-        *dat_guard = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&dat_path)
-            .map_err(RedexError::io)?;
-        *ts_guard = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&ts_path)
-            .map_err(RedexError::io)?;
-        *worker_idx_guard = idx_guard.try_clone().map_err(RedexError::io)?;
-        *worker_dat_guard = dat_guard.try_clone().map_err(RedexError::io)?;
-        *worker_ts_guard = ts_guard.try_clone().map_err(RedexError::io)?;
+        // Open all six new handles (3 base + 3 worker clones) into
+        // local variables first, with bounded retry on transient
+        // failures (ENFILE / EMFILE / antivirus interference /
+        // brief permission flap). If ANY of them fails after
+        // retries, set `poisoned = true` so the segment refuses
+        // all further write paths until the channel is re-opened.
+        //
+        // A `?` early-return here would leave the cached guards
+        // pointing at the temp-dir placeholders even though the
+        // disk state is already post-compact (the renames have
+        // committed) — any subsequent `append_entry_inner` call
+        // would then write into `/tmp` rather than the channel
+        // dir. The in-memory state preservation contract still
+        // holds, but the next append would still hit the
+        // placeholders, so the `poisoned` flag gates that: append
+        // paths consult it and refuse to write rather than
+        // dropping events into temp-dir placeholders. This trades
+        // a noisy hard-error for silent write-to-`/tmp`.
+        let open_or_poison = |path: &Path| -> Result<File, RedexError> {
+            reopen_with_retries(path).map_err(|e| {
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::error!(
+                    error = %e,
+                    path = %path.display(),
+                    "redex compact_to: post-rename reopen FAILED — segment \
+                     poisoned to prevent writes from landing in temp-dir \
+                     placeholders. Channel must be re-opened to recover."
+                );
+                RedexError::io(e)
+            })
+        };
+        let new_idx = open_or_poison(&idx_path)?;
+        let new_dat = open_or_poison(&dat_path)?;
+        let new_ts = open_or_poison(&ts_path)?;
+
+        // Per-file durability flush. On POSIX `fsync_dir`
+        // above already covered the dir-level rename durability;
+        // on Windows it's a no-op (stdlib doesn't expose the
+        // dir-flush API). Calling `sync_all` on each renamed
+        // file's freshly-opened handle here ensures FILE CONTENT
+        // is durable on every target, even when dir-level
+        // atomicity is best-effort. Best-effort on the sync_all
+        // itself: a failure here does NOT roll back the rename
+        // (already committed), so we log and continue rather than
+        // surfacing a fail-the-compact error after the disk state
+        // has flipped.
+        if let Err(e) = new_idx.sync_all() {
+            tracing::warn!(error = %e, "post-compact sync_all on idx failed (best-effort)");
+        }
+        if let Err(e) = new_dat.sync_all() {
+            tracing::warn!(error = %e, "post-compact sync_all on dat failed (best-effort)");
+        }
+        if let Err(e) = new_ts.sync_all() {
+            tracing::warn!(error = %e, "post-compact sync_all on ts failed (best-effort)");
+        }
+
+        // Clone failures also poison (same hazard — the cached
+        // guard slots aren't yet swapped, but a `?` early-return
+        // here would leave the slots at temp-dir placeholders).
+        let clone_or_poison = |f: &File, kind: &str| -> Result<File, RedexError> {
+            f.try_clone().map_err(|e| {
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::error!(
+                    error = %e,
+                    kind = kind,
+                    "redex compact_to: post-rename try_clone FAILED — segment poisoned"
+                );
+                RedexError::io(e)
+            })
+        };
+        let new_idx_worker = clone_or_poison(&new_idx, "idx")?;
+        let new_dat_worker = clone_or_poison(&new_dat, "dat")?;
+        let new_ts_worker = clone_or_poison(&new_ts, "ts")?;
+
+        // All six handles open successfully — atomically slot them.
+        *idx_guard = new_idx;
+        *dat_guard = new_dat;
+        *ts_guard = new_ts;
+        *worker_idx_guard = new_idx_worker;
+        *worker_dat_guard = new_dat_worker;
+        *worker_ts_guard = new_ts_worker;
 
         // Clean up placeholders. Best-effort; if the rename
         // succeeded we can tolerate a stray file in the OS temp
@@ -1122,6 +1414,40 @@ impl DiskSegment {
 
         Ok(())
     }
+}
+
+/// Reopen a redex file with bounded retry on transient
+/// failures (ENFILE, EMFILE, brief antivirus locking, sharing
+/// violations). All redex files are opened with the same flag
+/// shape — `create+read+append` — so this helper is the single
+/// canonical re-open primitive for the post-compact path.
+///
+/// Retry schedule: 5 attempts at 0ms, 25ms, 50ms, 100ms, 200ms
+/// (total <= 375ms). This window covers all the realistic
+/// transient causes without blocking the sweep path for
+/// noticeably long. If all five attempts fail, the most recent
+/// error is surfaced — the caller (only `compact_to` today) wraps
+/// it in `RedexError::io`.
+fn reopen_with_retries(path: &Path) -> std::io::Result<File> {
+    const ATTEMPTS: u32 = 5;
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            // 25ms, 50ms, 100ms, 200ms.
+            let delay = std::time::Duration::from_millis(25u64 << (attempt - 1));
+            std::thread::sleep(delay);
+        }
+        match OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(f) => return Ok(f),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("at least one attempt must have run"))
 }
 
 #[inline]
@@ -1144,6 +1470,60 @@ fn channel_dir(base_dir: &Path, name: &ChannelName) -> PathBuf {
         p.push(seg);
     }
     p
+}
+
+/// Fsync a directory inode so any prior `rename()` calls into
+/// it become durable.
+///
+/// On POSIX, `rename` only updates the dirent in memory — the
+/// directory's on-disk metadata isn't flushed until the dir
+/// itself is fsynced. Without this, a power-loss between a
+/// successful `rename` syscall return and a subsequent fsync
+/// can leave the directory pointing at the OLD inodes, making
+/// the rename's apparent atomicity a lie. Closes part of BUG
+/// #93 — the `compact_to` rename sequence now fsyncs the
+/// containing directory after the renames complete.
+///
+/// On Windows, rename durability is governed by separate APIs
+/// (`MoveFileEx` with `MOVEFILE_WRITE_THROUGH`) and the
+/// stdlib's `std::fs::rename` does not expose them.
+/// Opening a directory as a `File` and calling `sync_all` is
+/// not a defined operation on Windows; we no-op here. Power-
+/// loss durability of `compact_to` on Windows is therefore
+/// best-effort under the current implementation.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// On non-Unix targets the `fsync_dir` helper is a no-op. Stdlib
+/// does not expose the Windows equivalent (`MoveFileExW` with
+/// `MOVEFILE_WRITE_THROUGH`, or `FlushFileBuffers` on a directory
+/// handle), so a power-loss between successful renames can leave
+/// the directory pointing at the OLD inodes even after every
+/// individual file has been flushed.
+///
+/// We log loudly ONCE per process so operators see the durability
+/// gap rather than silently relying on an empty-Ok return that
+/// looks indistinguishable from a successful POSIX fsync. The
+/// `compact_to` caller still benefits from per-file `sync_all`
+/// calls earlier in the sequence, so file CONTENT is durable —
+/// only the directory-level atomicity of the three-rename
+/// sequence is best-effort.
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::AcqRel) {
+        tracing::warn!(
+            os = std::env::consts::OS,
+            "redex fsync_dir is a NO-OP on this platform — directory-level \
+             rename atomicity is best-effort. Per-file content remains durable \
+             via the explicit sync_all calls in compact_to, but the cross-file \
+             rename sequence is not transactional."
+        );
+    }
+    Ok(())
 }
 
 /// Read the full idx file into a `Vec<RedexEntry>`.
@@ -2006,6 +2386,296 @@ mod tests {
             vec![3_000, 4_000],
             "timestamps must pair with the right index records after \
              compaction + post-compact append"
+        );
+
+        cleanup(&base);
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #93: the
+    /// `fsync_dir` helper added to make `compact_to`'s rename
+    /// sequence durable on POSIX must complete cleanly on a
+    /// normal directory and on a directory with `O_RDONLY`
+    /// access (the open mode `File::open` uses).
+    ///
+    /// On Windows the helper is a no-op and returns `Ok(())`
+    /// regardless of input — see `fsync_dir_no_op_on_non_unix`
+    /// for that branch's regression. This test pins POSIX-only
+    /// success.
+    #[test]
+    fn fsync_dir_helper_succeeds_on_a_normal_directory() {
+        let tmp = std::env::temp_dir().join(format!(
+            "redex-fsync-dir-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).expect("create tempdir");
+
+        super::fsync_dir(&tmp).expect("fsync_dir must succeed on a normal dir");
+
+        // Cleanup. Best-effort; not load-bearing for the test.
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    /// CR-11: on non-Unix targets, `fsync_dir` is a no-op that
+    /// returns `Ok(())` on ANY input — even a path that does not
+    /// exist, even a path that is not a directory. This pins the
+    /// no-op contract so a future "let's fail closed on Windows"
+    /// change has to also update this test (and consider whether
+    /// the change actually closes the BUG #93 hazard or just
+    /// trades durability gap for crash-on-bad-path).
+    ///
+    /// The compact_to caller covers the per-file durability via
+    /// the `sync_all` calls added in CR-11 — that's where the
+    /// real durability work happens on Windows.
+    #[cfg(not(unix))]
+    #[test]
+    fn fsync_dir_no_op_on_non_unix_returns_ok_even_for_nonexistent_paths() {
+        // Path that demonstrably does not exist: no-op should
+        // STILL return Ok. This is the documented contract.
+        let bogus = std::path::PathBuf::from(format!(
+            "{}/redex-no-such-dir-{}",
+            std::env::temp_dir().display(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(!bogus.exists(), "test fixture: bogus path must not exist");
+        super::fsync_dir(&bogus).expect("non-Unix fsync_dir must be a no-op Ok");
+    }
+
+    /// CR-4: `reopen_with_retries` must succeed on the first
+    /// attempt for a normally-openable redex file path. This pins
+    /// the happy path — if the helper accidentally always took a
+    /// retry delay, the post-compact path would acquire 25ms of
+    /// wall-clock latency per call.
+    #[test]
+    fn reopen_with_retries_succeeds_immediately_on_normal_path() {
+        let dir = tmpdir();
+        let path = dir.join("idx_existing");
+        // Create the file with the same options redex uses so the
+        // open flags match the production path.
+        {
+            let _ = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&path)
+                .expect("seed file");
+        }
+        let start = std::time::Instant::now();
+        let f = super::reopen_with_retries(&path).expect("reopen normal file");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(20),
+            "happy-path reopen must NOT incur a retry delay; took {:?}",
+            elapsed
+        );
+        // Confirm the handle is usable (write-then-flush via the
+        // append handle returned).
+        drop(f);
+        cleanup(&dir);
+    }
+
+    /// CR-4: `reopen_with_retries` must surface the LAST io::Error
+    /// when all attempts fail. We fake a permanent failure with a
+    /// path whose parent directory does not exist (so every open
+    /// attempt returns NotFound). Returning a meaningful error
+    /// from the final attempt is what lets the caller wrap it in
+    /// `RedexError::io` with a real diagnosis.
+    #[test]
+    fn reopen_with_retries_returns_last_error_after_exhaustion() {
+        let dir = tmpdir();
+        // Path INSIDE a directory that doesn't exist — every
+        // `OpenOptions::open` call will fail with NotFound. The
+        // `create(true)` flag won't auto-create parent dirs, so
+        // this is a permanent failure.
+        let bogus = dir.join("does_not_exist_subdir").join("idx");
+        let start = std::time::Instant::now();
+        let err =
+            super::reopen_with_retries(&bogus).expect_err("nonexistent parent dir must fail open");
+        let elapsed = start.elapsed();
+        // We attempt 5 times with 0+25+50+100+200 = 375ms of
+        // total sleep across the retries. Allow generous slack
+        // for slow CI but pin the order-of-magnitude.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(300),
+            "must have done full retry budget before giving up; took {:?}",
+            elapsed
+        );
+        // The error MUST be a real io::Error (NotFound on most
+        // platforms when the parent doesn't exist), not a
+        // synthesized placeholder. This is what makes the
+        // surfaced `RedexError::io(err)` debuggable.
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ),
+            "expected NotFound or PermissionDenied; got {:?}: {}",
+            err.kind(),
+            err
+        );
+        cleanup(&dir);
+    }
+
+    /// CR-4: pin the post-rename atomic-swap invariant directly.
+    /// If `reopen_with_retries` returned `Err` for any of the six
+    /// post-rename opens, the cached slots in `DiskSegment` MUST
+    /// still hold the placeholder files (NOT mid-swap mixed
+    /// state) — pre-CR-4 the `?` early-return would leave some
+    /// slots updated and others not, depending on which call
+    /// failed.
+    ///
+    /// The current production design opens all six handles into
+    /// LOCAL VARIABLES first and only swaps after all six
+    /// succeed. We don't have a clean fault-injection seam for
+    /// the post-rename open phase (a real test would need an
+    /// fs-level hook), but we CAN exercise the success path's
+    /// post-conditions under a real `compact_to`: all worker
+    /// handles must come out of the call pointing at the new
+    /// channel files (sizes match the on-disk metadata), with
+    /// zero placeholder contamination.
+    #[test]
+    fn compact_to_post_rename_swap_is_atomic_on_success_path() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/cr4_atomic").unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+
+        // Three heap appends; compact down to the third.
+        let payloads: [&[u8]; 3] = [b"alpha_aaaa", b"beta_bbbbb", b"gamma_cccc"];
+        let mut offset = 0u32;
+        for (i, p) in payloads.iter().enumerate() {
+            let e = RedexEntry::new_heap(i as u64, offset, p.len() as u32, 0, payload_checksum(p));
+            recovered
+                .disk
+                .append_entry_at(&e, p, 1_000 * (i as u64 + 1))
+                .unwrap();
+            offset += p.len() as u32;
+        }
+        recovered.disk.sync().unwrap();
+
+        let third_dat_base = (payloads[0].len() + payloads[1].len()) as u64;
+        let surviving = vec![RedexEntry::new_heap(
+            2,
+            third_dat_base as u32,
+            payloads[2].len() as u32,
+            0,
+            payload_checksum(payloads[2]),
+        )];
+        let surviving_ts = vec![3_000u64];
+        recovered
+            .disk
+            .compact_to(&surviving, &surviving_ts, third_dat_base)
+            .expect("happy path compact must succeed");
+
+        // After successful compact, every cached file slot must
+        // point at the channel directory's idx/dat/ts — NOT at a
+        // placeholder in the OS temp dir. We probe via worker
+        // handle sizes (the worker handles are `try_clone`d from
+        // the appender slots, so if EITHER kind ended up holding
+        // a placeholder, the size would be 0 / wrong).
+        let dat_path = channel_dir(&base, &name).join("dat");
+        let idx_path = channel_dir(&base, &name).join("idx");
+        let ts_path = channel_dir(&base, &name).join("ts");
+        let on_disk_dat = std::fs::metadata(&dat_path).unwrap().len();
+        let on_disk_idx = std::fs::metadata(&idx_path).unwrap().len();
+        let on_disk_ts = std::fs::metadata(&ts_path).unwrap().len();
+        let (dat_w, idx_w, ts_w) = recovered.disk.worker_file_lens();
+        assert_eq!(dat_w, on_disk_dat, "worker dat must NOT hold a placeholder");
+        assert_eq!(idx_w, on_disk_idx, "worker idx must NOT hold a placeholder");
+        assert_eq!(ts_w, on_disk_ts, "worker ts must NOT hold a placeholder");
+
+        // Also exercise that the appender slots are usable: a new
+        // append must reach the on-disk dat file (placeholder dat
+        // was 0 bytes — placeholder writes wouldn't survive
+        // reopen).
+        let new_payload = b"after_compact";
+        let new_entry = RedexEntry::new_heap(
+            99,
+            on_disk_dat as u32,
+            new_payload.len() as u32,
+            0,
+            payload_checksum(new_payload),
+        );
+        recovered
+            .disk
+            .append_entry_at(&new_entry, new_payload, 4_000)
+            .unwrap();
+        recovered.disk.sync().unwrap();
+        drop(recovered);
+
+        // Reopen — the post-compact append MUST be present.
+        let recovered2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let seqs: Vec<u64> = recovered2.index.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![2, 99],
+            "post-compact append must be on the channel dat, not a tmp placeholder"
+        );
+
+        cleanup(&base);
+    }
+
+    /// Cubic P1: pin the segment-poisoning recovery contract.
+    /// When `compact_to`'s post-rename re-open fails, the cached
+    /// file handles point at temp-dir placeholders. Subsequent
+    /// appends MUST refuse rather than silently writing into
+    /// `/tmp`. We test the post-condition (poison flag → all
+    /// write paths refuse) by manually flipping the flag,
+    /// independent of the fs-fault-injection seam.
+    #[test]
+    fn cubic_p1_poisoned_segment_refuses_writes() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/poison").unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+
+        // Sanity: a fresh segment accepts appends.
+        let payload: &[u8] = b"first";
+        let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, payload_checksum(payload));
+        recovered
+            .disk
+            .append_entry_at(&entry, payload, 1_000)
+            .expect("fresh segment must accept appends");
+
+        // Poison the segment as if `compact_to`'s re-open phase
+        // had failed.
+        recovered
+            .disk
+            .poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Every write path must refuse.
+        let entry2 = RedexEntry::new_heap(1, 5, payload.len() as u32, 0, payload_checksum(payload));
+        let err = recovered
+            .disk
+            .append_entry_at(&entry2, payload, 2_000)
+            .expect_err("poisoned segment must refuse append_entry_at");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("poisoned"),
+            "error message must reference poisoning; got: {msg}"
+        );
+
+        let err = recovered
+            .disk
+            .append_entries_at(&[(entry2, payload)], &[3_000])
+            .expect_err("poisoned segment must refuse append_entries_at");
+        assert!(
+            format!("{}", err).contains("poisoned"),
+            "append_entries_at error must reference poisoning"
+        );
+
+        let err = recovered
+            .disk
+            .compact_to(&[], &[], 0)
+            .expect_err("poisoned segment must refuse compact_to");
+        assert!(
+            format!("{}", err).contains("poisoned"),
+            "compact_to error must reference poisoning"
         );
 
         cleanup(&base);

@@ -31,8 +31,19 @@ pub struct PacketBuilder {
 }
 
 impl PacketBuilder {
-    /// Create a new packet builder
-    pub fn new(key: &[u8; 32], session_id: u64) -> Self {
+    /// Create a new packet builder.
+    ///
+    /// `pub(crate)` not `pub`: every legitimate caller is inside
+    /// `adapter/net/`. Demoted as part of the heartbeat-unification
+    /// pass — see [`HEARTBEAT_UNIFICATION_PLAN.md`] — to prevent a
+    /// caller from substituting `&[0u8; 32]` for the session's real
+    /// TX key, which would produce AEAD-tagged heartbeats whose tag
+    /// the receiver could never verify against the session's actual
+    /// key. Heartbeats now go through
+    /// [`NetSession::build_heartbeat`]; data-path packets go
+    /// through the pool. No external caller should be constructing
+    /// raw-key builders.
+    pub(crate) fn new(key: &[u8; 32], session_id: u64) -> Self {
         Self {
             payload: BytesMut::with_capacity(MAX_PAYLOAD_SIZE),
             cipher: PacketCipher::new(key, session_id),
@@ -502,13 +513,12 @@ impl std::fmt::Debug for PooledBuilder<'_> {
     }
 }
 
-/// Shared fast packet pool (thread-safe)
-pub type SharedPacketPool = Arc<PacketPool>;
-
-/// Create a shared fast packet pool
-pub fn shared_pool(size: usize, key: &[u8; 32], session_id: u64) -> SharedPacketPool {
-    Arc::new(PacketPool::new(size, key, session_id))
-}
+// `SharedPacketPool` and `shared_pool` are intentionally absent:
+// they were the wrappers around `PacketPool`, and dropping the
+// unused `NetSession::packet_pool` getter removed their only
+// consumer. `PacketPool` itself is still the underlying type used
+// by the thread-local pool internally. Keeping those wrappers with
+// no caller would re-invite a cross-pool nonce-reuse hazard.
 
 // ============================================================================
 // Thread-Local Pool (Zero-Contention Hot Path)

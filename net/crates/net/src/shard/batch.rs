@@ -10,6 +10,8 @@
 //! - Low velocity → smaller batches → lower latency → faster flush
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::BatchConfig;
@@ -146,6 +148,30 @@ pub struct BatchWorker {
     current_batch: Vec<InternalEvent>,
     /// Sequence number for the next batch.
     next_sequence: u64,
+    /// Mirror of `next_sequence` published to the bus, so
+    /// `EventBus::remove_shard_internal` can read the worker's
+    /// final post-flush sequence after awaiting the worker's
+    /// `JoinHandle`. Used as the `sequence_start` for the
+    /// stranded-ring-buffer flush so its msg-ids don't collide
+    /// with the worker's own first batch under JetStream's dedup
+    /// window.
+    ///
+    /// Updated on every successful `flush`. The hot path pays one
+    /// release-ordered atomic store per dispatched batch — the
+    /// per-batch dispatch already crosses an `await` so the
+    /// extra store is amortized away.
+    next_sequence_published: Arc<AtomicU64>,
+    /// Producer nonce stamped on every produced `Batch`.
+    ///
+    /// When the bus is configured with `producer_nonce_path`, this
+    /// is the persisted u64 from
+    /// `adapter::PersistentProducerNonce::load_or_create`. When
+    /// not configured, it falls back to the per-process nonce
+    /// from `event::batch_process_nonce`. Adapters that key dedup
+    /// on `(producer_nonce, shard, sequence_start, i)` (today:
+    /// JetStream `Nats-Msg-Id`, Redis `dedup_id` field) use this
+    /// to recognize cross-process retries.
+    producer_nonce: u64,
     /// Time when the current batch started.
     batch_start: Option<Instant>,
     /// Configuration.
@@ -154,13 +180,30 @@ pub struct BatchWorker {
 
 impl BatchWorker {
     /// Create a new batch worker.
-    pub fn new(shard_id: u16, config: BatchConfig) -> Self {
+    ///
+    /// `next_sequence_published` is the bus-owned mirror of
+    /// `next_sequence`. Pass `Arc::new(AtomicU64::new(0))` if the
+    /// caller doesn't need to observe the post-exit sequence;
+    /// production paths share it with `bus::remove_shard_internal`.
+    ///
+    /// `producer_nonce` is stamped on every produced `Batch` for
+    /// cross-process dedup. The bus passes its loaded nonce in;
+    /// tests can use any u64 (typically 0 or the per-process
+    /// default).
+    pub fn new(
+        shard_id: u16,
+        config: BatchConfig,
+        next_sequence_published: Arc<AtomicU64>,
+        producer_nonce: u64,
+    ) -> Self {
         let capacity = config.max_size;
         Self {
             shard_id,
             batcher: AdaptiveBatcher::new(config.clone()),
             current_batch: Vec::with_capacity(capacity),
             next_sequence: 0,
+            next_sequence_published,
+            producer_nonce,
             batch_start: None,
             config,
         }
@@ -223,9 +266,18 @@ impl BatchWorker {
         // pins the counter at u64::MAX so downstream consumers see a
         // monotonic, observable terminal state instead.
         self.next_sequence = self.next_sequence.saturating_add(events.len() as u64);
+        // Publish the post-flush counter to the bus-owned mirror.
+        // `bus::remove_shard_internal` reads this after awaiting the
+        // worker's `JoinHandle` and uses it as the
+        // `sequence_start` for the stranded-ring-buffer flush — that
+        // guarantees the stranded msg-ids fall strictly past every
+        // msg-id this worker emitted, closing the JetStream-dedup
+        // collision risk.
+        self.next_sequence_published
+            .store(self.next_sequence, Ordering::Release);
         self.batch_start = None;
 
-        Batch::new(self.shard_id, events, sequence_start)
+        Batch::with_nonce(self.shard_id, events, sequence_start, self.producer_nonce)
     }
 
     /// Check if there are pending events.
@@ -263,6 +315,12 @@ mod tests {
             .collect()
     }
 
+    /// Test helper — most tests don't observe the published sequence,
+    /// they just need the third arg.
+    fn fresh_published() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(0))
+    }
+
     #[test]
     fn test_batch_size_threshold() {
         let config = BatchConfig {
@@ -273,7 +331,7 @@ mod tests {
             velocity_window: Duration::from_millis(100),
         };
 
-        let mut worker = BatchWorker::new(0, config);
+        let mut worker = BatchWorker::new(0, config, fresh_published(), 0);
 
         // Add 50 events - should not trigger flush (target is 100 when adaptive=false)
         let batch = worker.add_events(make_events(50, 0));
@@ -298,7 +356,7 @@ mod tests {
             velocity_window: Duration::from_millis(100),
         };
 
-        let mut worker = BatchWorker::new(0, config);
+        let mut worker = BatchWorker::new(0, config, fresh_published(), 0);
 
         // Add some events
         let batch = worker.add_events(make_events(5, 0));
@@ -348,7 +406,7 @@ mod tests {
             velocity_window: Duration::from_millis(100),
         };
 
-        let mut worker = BatchWorker::new(0, config);
+        let mut worker = BatchWorker::new(0, config, fresh_published(), 0);
 
         // Add some events (below threshold)
         worker.add_events(make_events(50, 0));
@@ -363,7 +421,7 @@ mod tests {
     #[test]
     fn test_sequence_numbers() {
         let config = BatchConfig::default();
-        let mut worker = BatchWorker::new(0, config.clone());
+        let mut worker = BatchWorker::new(0, config.clone(), fresh_published(), 0);
 
         // Create batches and verify sequence numbers
         worker.add_events(make_events(100, 0));
@@ -379,6 +437,79 @@ mod tests {
         assert_eq!(batch3.sequence_start, 150);
     }
 
+    /// Regression for BUG #153 — every `flush` must publish the
+    /// post-flush `next_sequence` to the shared atomic so
+    /// `bus::remove_shard_internal` can read it after awaiting the
+    /// worker and use it as the stranded-flush `sequence_start`.
+    /// Pre-fix the stranded batch hardcoded 0, colliding with the
+    /// worker's first batch under JetStream's dedup window.
+    #[test]
+    fn flush_publishes_post_flush_next_sequence_to_shared_atomic() {
+        let config = BatchConfig::default();
+        let published = Arc::new(AtomicU64::new(0));
+        let mut worker = BatchWorker::new(0, config, published.clone(), 0);
+
+        // Pre-flush: atomic is at its initial value.
+        assert_eq!(published.load(Ordering::Acquire), 0);
+
+        worker.add_events(make_events(50, 0));
+        let _ = worker.flush();
+
+        assert_eq!(
+            published.load(Ordering::Acquire),
+            50,
+            "post-flush atomic must mirror BatchWorker::next_sequence",
+        );
+    }
+
+    /// Consecutive flushes keep the published atomic in lock-step
+    /// with the internal counter — pin the addition (not just the
+    /// initial set) so a future refactor that updates only on
+    /// alternate flushes (or only when `events.is_empty()`) gets
+    /// caught.
+    #[test]
+    fn flush_publishes_advance_consecutive_flushes() {
+        let config = BatchConfig::default();
+        let published = Arc::new(AtomicU64::new(0));
+        let mut worker = BatchWorker::new(0, config, published.clone(), 0);
+
+        worker.add_events(make_events(10, 0));
+        let _ = worker.flush();
+        assert_eq!(published.load(Ordering::Acquire), 10);
+
+        worker.add_events(make_events(7, 0));
+        let _ = worker.flush();
+        assert_eq!(published.load(Ordering::Acquire), 17);
+
+        worker.add_events(make_events(33, 0));
+        let _ = worker.flush();
+        assert_eq!(published.load(Ordering::Acquire), 50);
+    }
+
+    /// Mirror the saturating-add overflow behavior on the published
+    /// atomic. `bus::remove_shard_internal` uses this value as a
+    /// `sequence_start`; if it ever overflowed back to 0 the
+    /// stranded batch's msg-ids would collide with the worker's
+    /// first batch — the exact JetStream-dedup hazard BUG #153
+    /// names.
+    #[test]
+    fn flush_publishes_saturating_max_on_overflow() {
+        let config = BatchConfig::default();
+        let published = Arc::new(AtomicU64::new(0));
+        let mut worker = BatchWorker::new(0, config, published.clone(), 0);
+
+        worker.next_sequence = u64::MAX - 3;
+        worker.add_events(make_events(10, 0));
+        let _ = worker.flush();
+
+        assert_eq!(worker.next_sequence, u64::MAX);
+        assert_eq!(
+            published.load(Ordering::Acquire),
+            u64::MAX,
+            "published atomic must saturate at u64::MAX, not wrap to 6",
+        );
+    }
+
     /// Regression: BUG_REPORT.md #19 — `next_sequence` previously used
     /// unchecked `+=`, which would silently wrap on overflow. Saturating
     /// pins it at `u64::MAX` so downstream consumers see a stable
@@ -386,7 +517,7 @@ mod tests {
     #[test]
     fn test_sequence_saturates_on_overflow() {
         let config = BatchConfig::default();
-        let mut worker = BatchWorker::new(0, config);
+        let mut worker = BatchWorker::new(0, config, fresh_published(), 0);
 
         // Force the counter near overflow.
         worker.next_sequence = u64::MAX - 3;

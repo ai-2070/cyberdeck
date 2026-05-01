@@ -11,8 +11,8 @@ use net::timestamp::TimestampGenerator;
 /// Benchmark shard ingest/drain through the public API.
 ///
 /// Replaces a previous bench against the raw `RingBuffer` type. That
-/// type is now `pub(crate)` (BUG_REPORT.md #5), so the next-cleanest
-/// proxy is `ShardManager`, which is what real ingestion paths use.
+/// type is now `pub(crate)`, so the next-cleanest proxy is
+/// `ShardManager`, which is what real ingestion paths use.
 /// The numbers therefore include the per-shard atomic counter
 /// updates and the `Mutex<Shard>` acquire/release — i.e. the actual
 /// hot-path overhead, not just the lock-free ring atomics.

@@ -23,4 +23,19 @@ pub enum CortexAdapterError {
         /// The RedEX sequence of the event whose fold returned an error.
         seq: u64,
     },
+
+    /// `open` was called with a `StartPosition` that requires
+    /// externally-rehydrated state — `FromSeq(n)` for `n > 0` or
+    /// `LiveOnly`. Callers using these positions must construct
+    /// the adapter via [`super::CortexAdapter::open_from_snapshot`]
+    /// instead so the watermark and `state` are properly anchored
+    /// to the prior events the adapter is going to skip.
+    ///
+    /// Accepting these positions in `open` would set
+    /// `initial_watermark = start_seq - 1`, making
+    /// `wait_for_seq(k)` for `k <= start_seq-1` return immediately
+    /// — the adapter would claim those seqs were "applied" while
+    /// `state` had never seen them.
+    #[error("StartPosition::{0} requires open_from_snapshot, not open")]
+    InvalidStartPosition(&'static str),
 }

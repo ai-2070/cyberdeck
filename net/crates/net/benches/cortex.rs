@@ -45,7 +45,9 @@ fn bench_ingest(c: &mut Criterion) {
     group.bench_function("tasks_create", |b| {
         let _enter = runtime.enter();
         let redex = Redex::new();
-        let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+        let tasks = runtime
+            .block_on(TasksAdapter::open(&redex, ORIGIN))
+            .unwrap();
         let mut id: u64 = 0;
         b.iter(|| {
             id = id.wrapping_add(1);
@@ -56,7 +58,9 @@ fn bench_ingest(c: &mut Criterion) {
     group.bench_function("memories_store", |b| {
         let _enter = runtime.enter();
         let redex = Redex::new();
-        let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+        let memories = runtime
+            .block_on(MemoriesAdapter::open(&redex, ORIGIN))
+            .unwrap();
         // Pre-build the tags vec once and `clone()` outside the timed
         // block so the per-iteration cost we measure is the store path,
         // not the Vec<String> allocation. The `store` signature takes
@@ -93,7 +97,11 @@ fn bench_fold_barrier(c: &mut Criterion) {
     group.bench_function("tasks_create_and_wait", |b| {
         let _enter = runtime.enter();
         let redex = Redex::new();
-        let tasks = Arc::new(TasksAdapter::open(&redex, ORIGIN).unwrap());
+        let tasks = Arc::new(
+            runtime
+                .block_on(TasksAdapter::open(&redex, ORIGIN))
+                .unwrap(),
+        );
         let mut id: u64 = 0;
         b.iter(|| {
             id = id.wrapping_add(1);
@@ -105,7 +113,11 @@ fn bench_fold_barrier(c: &mut Criterion) {
     group.bench_function("memories_store_and_wait", |b| {
         let _enter = runtime.enter();
         let redex = Redex::new();
-        let memories = Arc::new(MemoriesAdapter::open(&redex, ORIGIN).unwrap());
+        let memories = Arc::new(
+            runtime
+                .block_on(MemoriesAdapter::open(&redex, ORIGIN))
+                .unwrap(),
+        );
         let tags = vec!["bench".to_string()];
         let mut id: u64 = 0;
         b.iter(|| {
@@ -128,7 +140,9 @@ fn bench_fold_barrier(c: &mut Criterion) {
 fn populated_tasks(runtime: &Runtime, n: usize) -> TasksAdapter {
     let _enter = runtime.enter();
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = runtime
+        .block_on(TasksAdapter::open(&redex, ORIGIN))
+        .unwrap();
     let mut last_seq = 0;
     for i in 0..n {
         let id = (i + 1) as u64;
@@ -144,7 +158,9 @@ fn populated_tasks(runtime: &Runtime, n: usize) -> TasksAdapter {
 fn populated_memories(runtime: &Runtime, n: usize) -> MemoriesAdapter {
     let _enter = runtime.enter();
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = runtime
+        .block_on(MemoriesAdapter::open(&redex, ORIGIN))
+        .unwrap();
     let tags_a = vec!["alpha".to_string()];
     let tags_b = vec!["beta".to_string()];
     let mut last_seq = 0;
@@ -306,11 +322,14 @@ fn bench_netdb_build(c: &mut Criterion) {
         let _enter = runtime.enter();
         b.iter(|| {
             let redex = Redex::new();
-            NetDb::builder(redex)
-                .origin(ORIGIN)
-                .with_tasks()
-                .with_memories()
-                .build()
+            runtime
+                .block_on(
+                    NetDb::builder(redex)
+                        .origin(ORIGIN)
+                        .with_tasks()
+                        .with_memories()
+                        .build(),
+                )
                 .unwrap()
         });
     });

@@ -368,14 +368,58 @@ pub fn batch_process_nonce() -> u64 {
 }
 
 impl Batch {
-    /// Create a new batch.
+    /// Create a new batch using the per-process nonce
+    /// ([`batch_process_nonce`]). Convenience for tests and for
+    /// callers that don't thread a custom producer nonce through.
+    /// Production paths constructed via the bus go through
+    /// [`Self::with_nonce`] with the bus's loaded
+    /// `producer_nonce_path` value so retries dedup across
+    /// process restart.
     #[inline]
     pub fn new(shard_id: u16, events: Vec<InternalEvent>, sequence_start: u64) -> Self {
+        Self::with_nonce(shard_id, events, sequence_start, batch_process_nonce())
+    }
+
+    /// Create a new batch with an explicit producer nonce. Used by
+    /// the bus's `BatchWorker` and `remove_shard_internal`'s
+    /// stranded-flush so adapters keying dedup on
+    /// `(producer_nonce, shard, sequence_start, i)` see the same
+    /// nonce across process restart when the bus is configured
+    /// with a `producer_nonce_path`.
+    ///
+    /// A `producer_nonce == 0` is coerced to `1` to preserve the
+    /// non-zero invariant that `batch_process_nonce` and
+    /// `dedup_state::PersistentProducerNonce::create_new` already
+    /// uphold (each generates non-zero u64s and re-rolls on the
+    /// astronomical 1-in-2^64 zero draw).
+    ///
+    /// The zero coercion is **defense-in-depth against future
+    /// codecs**: a downstream caller that constructs a
+    /// `Batch::with_nonce(..., 0)` directly (e.g. tests, hand-built
+    /// fixtures) would otherwise emit `dedup_id` keys starting
+    /// `0:` — collision-prone with any future codec that reserves
+    /// `0` as "no nonce, use the legacy path." Today's
+    /// `adapter/jetstream.rs::on_batch` just formats
+    /// `process_nonce` as `{:x}` with no special-casing, so the
+    /// hazard is latent rather than active. Coercing to 1 keeps
+    /// the invariant that every shipped batch has a non-zero
+    /// producer nonce regardless of caller hygiene.
+    #[inline]
+    pub fn with_nonce(
+        shard_id: u16,
+        events: Vec<InternalEvent>,
+        sequence_start: u64,
+        producer_nonce: u64,
+    ) -> Self {
         Self {
             shard_id,
             events,
             sequence_start,
-            process_nonce: batch_process_nonce(),
+            process_nonce: if producer_nonce == 0 {
+                1
+            } else {
+                producer_nonce
+            },
         }
     }
 
@@ -699,7 +743,28 @@ mod tests {
         );
     }
 
-    /// Regression: every `Batch` constructed in this process must
+    /// Pin that `Batch::with_nonce` writes the passed value into the
+    /// `process_nonce` field. The bus relies on this to stamp the
+    /// loaded persistent nonce on every emitted batch (BUG #56);
+    /// a future refactor that ignored the parameter would silently
+    /// regress JetStream cross-restart dedup.
+    #[test]
+    fn batch_with_nonce_round_trips_the_passed_value() {
+        let events: Vec<InternalEvent> = (0..3)
+            .map(|i| InternalEvent::from_value(serde_json::json!({"i": i}), i, 0))
+            .collect();
+        let nonce: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        let batch = Batch::with_nonce(7, events, 42, nonce);
+        assert_eq!(batch.shard_id, 7);
+        assert_eq!(batch.sequence_start, 42);
+        assert_eq!(
+            batch.process_nonce, nonce,
+            "Batch::with_nonce must write the passed nonce verbatim",
+        );
+    }
+
+    /// Regression: every `Batch` constructed in this process via
+    /// `Batch::new` (the per-process-fallback constructor) must
     /// carry the same `process_nonce`. Adapters that persist
     /// `(shard_id, sequence_start)` for dedup compose it with this
     /// nonce so two processes that both happen to start sequencing
@@ -707,12 +772,12 @@ mod tests {
     /// on `(shard, 0, 0…)` in the backend's dedup window.
     ///
     /// We pin two contracts:
-    ///   1. The nonce is non-zero (a process started at exactly
-    ///      `UNIX_EPOCH` with pid 0 would defeat the XOR — defend
-    ///      against trivially predictable values).
-    ///   2. Multiple `Batch::new` calls in the same process yield
-    ///      the same nonce (so retries within a process land on
-    ///      the same dedup key).
+    /// 1. The nonce is non-zero (a process started at exactly
+    ///    `UNIX_EPOCH` with pid 0 would defeat the XOR — defend
+    ///    against trivially predictable values).
+    /// 2. Multiple `Batch::new` calls in the same process yield
+    ///    the same nonce (so retries within a process land on the
+    ///    same dedup key).
     #[test]
     fn batch_process_nonce_is_stable_within_process() {
         let nonce_a = batch_process_nonce();
@@ -732,5 +797,37 @@ mod tests {
         // XOR at zero; vanishingly unlikely on any real host but a
         // cheap sanity check.
         assert_ne!(nonce_a, 0, "process nonce should be non-zero");
+    }
+
+    /// Cubic-ai P2: `Batch::with_nonce` must enforce the non-zero
+    /// invariant `batch_process_nonce` already upholds. A caller
+    /// that hands in `0` (e.g., uninitialized field, default-init
+    /// of a `u64`, or a misconfigured fallback path) MUST NOT have
+    /// `0` propagate into `process_nonce` — JetStream and other
+    /// consumers treat `0` as a sentinel for "no nonce / legacy
+    /// path", which silently disables cross-restart dedup.
+    ///
+    /// The post-fix behavior coerces `0 → 1`, mirroring the
+    /// `PersistentProducerNonce::create_new` and
+    /// `batch_process_nonce` policy.
+    #[test]
+    fn with_nonce_coerces_zero_to_one_to_preserve_dedup_sentinel() {
+        // Zero in → one out (the canonical replacement, not
+        // `batch_process_nonce` — we don't want the function to
+        // silently route around an explicit caller error).
+        let b = Batch::with_nonce(0, vec![], 0, 0);
+        assert_eq!(
+            b.process_nonce, 1,
+            "with_nonce(producer_nonce=0) must coerce to 1 — \
+             letting 0 through would silently disable JetStream \
+             cross-restart dedup (consumers treat 0 as sentinel)",
+        );
+
+        // Non-zero passes through verbatim.
+        let b = Batch::with_nonce(0, vec![], 0, 0xDEAD_BEEF);
+        assert_eq!(
+            b.process_nonce, 0xDEAD_BEEF,
+            "non-zero producer_nonce must pass through unchanged",
+        );
     }
 }

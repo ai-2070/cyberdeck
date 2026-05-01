@@ -27,7 +27,7 @@ fn now_ns() -> u64 {
 #[tokio::test]
 async fn test_full_task_lifecycle() {
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let t0 = now_ns();
     let _ = tasks.create(1, "write docs", t0).unwrap();
@@ -58,7 +58,7 @@ async fn test_full_task_lifecycle() {
 #[tokio::test]
 async fn test_delete_removes_task() {
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     tasks.create(1, "temp", 100).unwrap();
     let seq = tasks.delete(1).unwrap();
@@ -73,7 +73,7 @@ async fn test_delete_removes_task() {
 #[tokio::test]
 async fn test_rename_on_unknown_id_is_noop() {
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     // Rename before create — fold silently drops (log is the truth).
     let seq = tasks.rename(42, "ghost", 100).unwrap();
@@ -87,7 +87,7 @@ async fn test_rename_on_unknown_id_is_noop() {
 #[tokio::test]
 async fn test_complete_on_unknown_id_is_noop() {
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let seq = tasks.complete(99, 100).unwrap();
     tasks.wait_for_seq(seq).await;
@@ -103,7 +103,7 @@ async fn test_replay_after_close_reconstructs_state() {
     let redex = Redex::new();
 
     {
-        let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+        let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
         tasks.create(1, "a", 100).unwrap();
         tasks.create(2, "b", 101).unwrap();
         tasks.complete(1, 102).unwrap();
@@ -114,7 +114,7 @@ async fn test_replay_after_close_reconstructs_state() {
 
     // Fresh handle; the Redex manager still owns the file (close on
     // the adapter doesn't drop the file), so reopen replays.
-    let tasks2 = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks2 = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
     // 4 events were appended → wait for fold to catch up.
     tasks2.wait_for_seq(3).await;
 
@@ -133,8 +133,8 @@ async fn test_multi_producer_same_file_different_origins() {
     // materialized state because they share the underlying file.
     let redex = Redex::new();
 
-    let a = TasksAdapter::open(&redex, 0x0000_0001).unwrap();
-    let b = TasksAdapter::open(&redex, 0x0000_0002).unwrap();
+    let a = TasksAdapter::open(&redex, 0x0000_0001).await.unwrap();
+    let b = TasksAdapter::open(&redex, 0x0000_0002).await.unwrap();
 
     a.create(1, "from-a", 100).unwrap();
     let seq = b.create(2, "from-b", 101).unwrap();
@@ -152,7 +152,7 @@ async fn test_multi_producer_same_file_different_origins() {
 #[tokio::test]
 async fn test_pending_and_completed_queries() {
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     for i in 1..=10u64 {
         tasks.create(i, format!("task-{}", i), 100 + i).unwrap();
@@ -180,7 +180,7 @@ async fn test_pending_and_completed_queries() {
 #[tokio::test]
 async fn test_query_through_live_adapter() {
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     // Build a mixed corpus.
     for (id, title, now) in [
@@ -247,12 +247,71 @@ async fn test_query_through_live_adapter() {
     assert!(guard.query().where_status(TaskStatus::Pending).exists());
 }
 
+/// Regression for BUG_AUDIT_2026_04_30_CORE.md #142: pre-fix
+/// `created_after`/`created_before` were strict (`>` / `<`), so
+/// an event with `created_ns == cutoff` was dropped by both
+/// `created_after(cutoff)` AND `created_before(cutoff)`. A
+/// caller paginating using "last sync ns" as cutoff would
+/// silently lose events at the boundary. Two events written in
+/// the same nanosecond (achievable on Windows with ~15ms wall-
+/// clock granularity) would have one elided in any window
+/// using either bound.
+///
+/// Post-fix the comparators are inclusive (`>=` / `<=`).
+#[tokio::test]
+async fn time_filter_cutoff_is_inclusive() {
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
+
+    // Three tasks at distinct timestamps; cutoff = exactly one
+    // of them.
+    tasks.create(1, "before", 1000).unwrap();
+    tasks.create(2, "at-cutoff", 2000).unwrap();
+    let last = tasks.create(3, "after", 3000).unwrap();
+    tasks.wait_for_seq(last).await;
+
+    let state = tasks.state();
+    let guard = state.read();
+
+    // created_after(2000) MUST include id 2 post-fix (pre-fix
+    // dropped it because 2000 was not strictly > 2000).
+    let mut after_2000: Vec<u64> = guard
+        .query()
+        .created_after(2000)
+        .collect()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    after_2000.sort();
+    assert_eq!(
+        after_2000,
+        vec![2, 3],
+        "created_after must include the cutoff itself (inclusive)"
+    );
+
+    // created_before(2000) MUST include id 2 too — the cutoff
+    // is in BOTH directions because both bounds are inclusive.
+    let mut before_2000: Vec<u64> = guard
+        .query()
+        .created_before(2000)
+        .collect()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    before_2000.sort();
+    assert_eq!(
+        before_2000,
+        vec![1, 2],
+        "created_before must include the cutoff itself (inclusive)"
+    );
+}
+
 #[tokio::test]
 async fn test_watch_initial_emission() {
     // A watcher opened against a non-empty state should yield the
     // current filter result on the first .next().await.
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     // Pre-populate.
     tasks.create(1, "a", 100).unwrap();
@@ -278,7 +337,7 @@ async fn test_watch_emits_on_relevant_change() {
     // After the initial emission, the stream should yield again when
     // a new event changes the filter result.
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let mut stream = Box::pin(
         tasks
@@ -317,7 +376,7 @@ async fn test_watch_dedupes_unchanged_results() {
     // Events that advance the log but don't change the filter result
     // must NOT cause a duplicate emission.
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     // Seed one pending + one completed.
     tasks.create(1, "p", 100).unwrap();
@@ -349,7 +408,7 @@ async fn test_watch_dedupes_unchanged_results() {
 #[tokio::test]
 async fn test_watch_multiple_subscribers_independent() {
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let mut pending_stream = Box::pin(tasks.watch().where_status(TaskStatus::Pending).stream());
     let mut completed_stream = Box::pin(tasks.watch().where_status(TaskStatus::Completed).stream());
@@ -375,7 +434,7 @@ async fn test_watch_multiple_subscribers_independent() {
 #[tokio::test]
 async fn test_watch_with_limit_and_order() {
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let mut stream = Box::pin(
         tasks
@@ -415,13 +474,14 @@ async fn test_regression_open_from_snapshot_rejects_u64_max_last_seq() {
     // the entire log as "new". The fix uses `checked_add` and returns
     // `CortexAdapterError::Redex(Encode)` on overflow.
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
     let (state_bytes, _) = tasks.snapshot().unwrap();
     tasks.close().unwrap();
 
     // Fresh Redex to avoid channel re-use interference.
     let redex2 = Redex::new();
-    let result = TasksAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, Some(u64::MAX));
+    let result =
+        TasksAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, Some(u64::MAX)).await;
     assert!(result.is_err(), "u64::MAX last_seq must be rejected");
     let msg = format!("{}", result.unwrap_err());
     assert!(
@@ -433,21 +493,17 @@ async fn test_regression_open_from_snapshot_rejects_u64_max_last_seq() {
 
 #[tokio::test]
 async fn test_regression_fold_rejects_checksum_mismatch() {
-    // Regression: neither `TasksFold` nor `MemoriesFold` used to
-    // verify `EventMeta::checksum` against the payload tail. A
-    // corrupted RedEX record (disk corruption, tampered on-disk
-    // file, truncated tail) would fold into state anyway, silently
-    // poisoning the materialized view. The fix recomputes
-    // `compute_checksum(tail)` in both folds and returns
-    // `RedexError::Encode` on mismatch.
+    // Regression (originally): neither `TasksFold` nor `MemoriesFold`
+    // verified `EventMeta::checksum` against the payload tail.
     //
-    // We can't easily corrupt bytes mid-RedEX without reaching into
-    // private state. The direct surface: construct an
-    // `EventEnvelope` with a WRONG `EventMeta.checksum`, ingest via
-    // the raw `CortexAdapter` path (which bypasses `compute_checksum`
-    // stamping), and observe the fold task halt. The TasksAdapter's
-    // typed `create`/`rename`/etc. always stamp the correct checksum,
-    // so we use the raw path here.
+    // Updated for BUG #141 (2026-04-30): both folds now stamp
+    // `RedexError::Decode` on checksum mismatch (instead of
+    // `Encode`), and the cortex adapter's `Stop` policy treats
+    // `Decode` as skip-and-continue. The original test asserted
+    // the fold halted on checksum mismatch; that was a DoS vector
+    // (one bad event wedges a multi-tenant cortex). The new
+    // contract: the bad event is logged + skipped, fold_errors
+    // increments by one, and state is NOT poisoned.
     use bytes::Bytes;
     use net::adapter::net::cortex::tasks::{TasksFold, TasksState};
     use net::adapter::net::cortex::{
@@ -469,10 +525,7 @@ async fn test_regression_fold_rejects_checksum_mismatch() {
     )
     .unwrap();
 
-    // Stamp an EventMeta with a deliberately-wrong checksum. The
-    // checksum check runs BEFORE dispatch-routing + tail decode, so
-    // the tail bytes don't need to be well-formed — the fold must
-    // halt on the checksum comparison before ever looking at them.
+    // Stamp an EventMeta with a deliberately-wrong checksum.
     let tail = b"any bytes would have matched some xxh3 except this one".to_vec();
     let wrong_checksum = compute_checksum(&tail).wrapping_add(1);
     let wrong_meta = EventMeta::new(
@@ -486,17 +539,23 @@ async fn test_regression_fold_rejects_checksum_mismatch() {
         .ingest(EventEnvelope::new(wrong_meta, Bytes::from(tail)))
         .unwrap();
 
-    // Drive the fold task forward; wait_for_seq returns when the
-    // adapter has processed the event OR when the fold task has
-    // stopped — under Stop policy, checksum mismatch is terminal.
     adapter.wait_for_seq(seq).await;
 
+    // Post-#141: the fold task is STILL running — Decode-class
+    // errors are recoverable per-event failures, not stream-fatal.
     assert!(
-        !adapter.is_running(),
-        "fold task must have stopped after checksum mismatch under FoldErrorPolicy::Stop"
+        adapter.is_running(),
+        "fold task must continue after checksum mismatch (BUG #141 — \
+         decode errors are recoverable under Stop policy)"
+    );
+    assert_eq!(
+        adapter.fold_errors(),
+        1,
+        "the bad event must be counted in fold_errors"
     );
 
-    // State must NOT contain the poisoned task.
+    // State must NOT contain the poisoned task — the fold rejected
+    // the event before mutating state.
     let state = adapter.state();
     let guard = state.read();
     assert!(
@@ -525,7 +584,7 @@ async fn test_regression_open_from_snapshot_bumps_app_seq_past_replayed_events()
     // Redex. The restored adapter must see `seq_or_ts = 4` (not 2)
     // on its first new ingest.
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     // Events 0, 1 — pre-snapshot.
     tasks.create(1, "a", 100).unwrap();
@@ -542,8 +601,9 @@ async fn test_regression_open_from_snapshot_bumps_app_seq_past_replayed_events()
 
     // Restore on the SAME Redex so the file already contains seqs
     // 2, 3 in the replay range.
-    let restored =
-        TasksAdapter::open_from_snapshot(&redex, ORIGIN, &state_bytes, last_seq).unwrap();
+    let restored = TasksAdapter::open_from_snapshot(&redex, ORIGIN, &state_bytes, last_seq)
+        .await
+        .unwrap();
 
     // The restored adapter should fold in the replay range (seqs
     // 2, 3) and then accept a new ingest. The new ingest's
@@ -579,7 +639,7 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
     // into the snapshot payload and restores it so per-origin
     // monotonicity is preserved.
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     // Ingest 3 events — their EventMeta::seq_or_ts values run 0, 1, 2.
     tasks.create(1, "a", 100).unwrap();
@@ -592,7 +652,9 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
 
     // Restore on a FRESH Redex — same origin.
     let redex2 = Redex::new();
-    let tasks2 = TasksAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, last_seq).unwrap();
+    let tasks2 = TasksAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, last_seq)
+        .await
+        .unwrap();
 
     // Next ingest on the restored adapter.
     let new_seq = tasks2.create(4, "d", 400).unwrap();
@@ -619,6 +681,199 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
 }
 
 #[tokio::test]
+async fn test_open_returns_with_state_already_caught_up() {
+    // BUG #148 fix changed `TasksAdapter::open[_with_config]` to await
+    // the inner fold task's catch-up before returning. After this
+    // change a fresh adapter opened against a non-empty Redex sees
+    // the full state synchronously — no `wait_for_seq` required.
+    //
+    // Pre-fix the constructor returned immediately and the fold task
+    // ran concurrently, so reading state right after `open` could
+    // observe a partial replay. Pin the new "fully caught up" guarantee.
+    let redex = Redex::new();
+    {
+        let a = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
+        a.create(1, "first", 100).unwrap();
+        a.create(2, "second", 200).unwrap();
+        let seq = a.create(3, "third", 300).unwrap();
+        a.wait_for_seq(seq).await;
+        a.close().unwrap();
+    }
+
+    // Reopen and read state IMMEDIATELY — no wait_for_seq.
+    let b = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
+    let state = b.state();
+    let guard = state.read();
+    assert_eq!(
+        guard.len(),
+        3,
+        "post-open state must be fully caught up — saw {} tasks, expected 3",
+        guard.len(),
+    );
+}
+
+#[tokio::test]
+async fn test_open_on_empty_redex_does_not_block() {
+    // Edge case: `open` against a fresh empty Redex must not block
+    // on `wait_for_seq` (file.next_seq() == 0 → no events to await).
+    // Wrap in a tight tokio::time::timeout so a regression that
+    // accidentally awaits an unreachable seq surfaces as a test
+    // failure rather than a hung CI run.
+    let redex = Redex::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        TasksAdapter::open(&redex, ORIGIN),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Ok(_))),
+        "open() on an empty Redex must complete promptly; got {result:?}",
+    );
+}
+
+#[tokio::test]
+async fn test_open_from_snapshot_with_empty_replay_tail_keeps_snapshot_app_seq() {
+    // When a snapshot's `last_seq` already covers every event in the
+    // file, the wrapper fold sees nothing during catch-up and the
+    // snapshot's persisted `app_seq` survives unchanged. The first
+    // post-restore ingest stamps `seq_or_ts = persisted_app_seq`.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
+    tasks.create(1, "a", 100).unwrap();
+    tasks.create(2, "b", 200).unwrap();
+    let seq = tasks.create(3, "c", 300).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    // Snapshot covers every event — replay tail will be empty.
+    let (state_bytes, last_seq) = tasks.snapshot().unwrap();
+    tasks.close().unwrap();
+
+    // Restore on a fresh Redex so `next_seq == 0` post-restore.
+    let redex2 = Redex::new();
+    let restored = TasksAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, last_seq)
+        .await
+        .unwrap();
+
+    // Persisted app_seq was 3 (three pre-snapshot ingests). The first
+    // post-restore ingest must stamp seq_or_ts = 3.
+    let new_seq = restored.create(4, "d", 400).unwrap();
+    restored.wait_for_seq(new_seq).await;
+
+    let file = redex2
+        .open_file(
+            &ChannelName::new(TASKS_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(new_seq, new_seq + 1);
+    let meta = EventMeta::from_bytes(&events[0].payload[..EVENT_META_SIZE]).unwrap();
+    assert_eq!(
+        meta.seq_or_ts, 3,
+        "post-restore counter must continue from snapshot's persisted app_seq (got {}, expected 3)",
+        meta.seq_or_ts,
+    );
+}
+
+#[tokio::test]
+async fn test_regression_open_advances_app_seq_past_existing_same_origin_events() {
+    // Regression for BUG #148 secondary-fix: pre-fix
+    // `TasksAdapter::open` set `app_seq = AtomicU64::new(0)`
+    // unconditionally, so reopening against a Redex (or persistent
+    // file) that already had same-origin events caused the next
+    // ingest to stamp `EventMeta::seq_or_ts = 0`, colliding with the
+    // pre-existing event's `seq_or_ts = 0`. The piggyback fix wires
+    // a `WatermarkingFold` wrapper around `TasksFold` that advances
+    // `app_seq` via `fetch_max(seq_or_ts + 1)` as the fold task
+    // replays existing events; the constructor awaits catch-up
+    // before returning, so the first ingest after `open` is
+    // guaranteed past every replayed value.
+    let redex = Redex::new();
+
+    // Seed via a first adapter (events get seq_or_ts 0, 1, 2).
+    {
+        let a = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
+        a.create(1, "first", 100).unwrap();
+        a.create(2, "second", 200).unwrap();
+        let seq = a.create(3, "third", 300).unwrap();
+        a.wait_for_seq(seq).await;
+        a.close().unwrap();
+    }
+
+    // Reopen via plain `open` (NOT `open_from_snapshot` — that path
+    // has its own coverage via the existing snapshot regression tests
+    // above).
+    let b = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
+    let new_seq = b.create(4, "fourth", 400).unwrap();
+    b.wait_for_seq(new_seq).await;
+
+    // Read the raw event. Its `seq_or_ts` must be 3 (continuing past
+    // the replayed events), NOT 0 (which would duplicate the first
+    // seeded event).
+    let file = redex
+        .open_file(
+            &ChannelName::new(TASKS_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(new_seq, new_seq + 1);
+    assert_eq!(events.len(), 1);
+    let meta = EventMeta::from_bytes(&events[0].payload[..EVENT_META_SIZE]).unwrap();
+    assert_eq!(
+        meta.seq_or_ts, 3,
+        "first ingest after reopen-on-existing-log must continue past replayed events' \
+         seq_or_ts (got {}, expected 3)",
+        meta.seq_or_ts,
+    );
+}
+
+#[tokio::test]
+async fn test_regression_open_ignores_other_origins_when_advancing_app_seq() {
+    // The `WatermarkingFold` wrapper installed by BUG #148's fix
+    // only advances `app_seq` for events whose `origin_hash` matches
+    // the adapter's. An adapter for origin A reopening against a
+    // file populated by origin B should still see `app_seq = 0` for
+    // its own first ingest — otherwise two cross-origin daemons
+    // sharing a channel would interleave each other's counters and
+    // every per-origin sequence space would collide.
+    let redex = Redex::new();
+    const ORIGIN_A: u32 = 0x0000_00AA;
+    const ORIGIN_B: u32 = 0x0000_00BB;
+
+    // Origin B writes some events.
+    {
+        let b = TasksAdapter::open(&redex, ORIGIN_B).await.unwrap();
+        b.create(10, "b1", 100).unwrap();
+        b.create(11, "b2", 200).unwrap();
+        let seq = b.create(12, "b3", 300).unwrap();
+        b.wait_for_seq(seq).await;
+        b.close().unwrap();
+    }
+
+    // Origin A opens. Its watermarking fold sees three replayed
+    // events but ignores them all (origin_hash mismatch), so
+    // `app_seq` stays at 0.
+    let a = TasksAdapter::open(&redex, ORIGIN_A).await.unwrap();
+    let new_seq = a.create(20, "a1", 400).unwrap();
+    a.wait_for_seq(new_seq).await;
+
+    let file = redex
+        .open_file(
+            &ChannelName::new(TASKS_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(new_seq, new_seq + 1);
+    let meta = EventMeta::from_bytes(&events[0].payload[..EVENT_META_SIZE]).unwrap();
+    assert_eq!(
+        meta.seq_or_ts, 0,
+        "origin A's first ingest must not be polluted by origin B's seq_or_ts values \
+         (got {}, expected 0)",
+        meta.seq_or_ts,
+    );
+    assert_eq!(meta.origin_hash, ORIGIN_A);
+}
+
+#[tokio::test]
 async fn test_regression_checksum_is_computed_not_zero() {
     // Regression: `EventMeta::checksum` used to be hardcoded to 0 in
     // the tasks adapter's `ingest_typed`. The documented contract
@@ -626,7 +881,7 @@ async fn test_regression_checksum_is_computed_not_zero() {
     // the payload tail. Verify the on-disk event's meta.checksum
     // matches `compute_checksum(tail)`.
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let seq = tasks.create(42, "distinctive title", 12345).unwrap();
     tasks.wait_for_seq(seq).await;
@@ -667,7 +922,7 @@ async fn test_regression_watch_without_order_by_is_stable() {
     // demonstrably non-ascending, then assert the watch output is
     // IdAsc.
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
     const N: u64 = 64;
     let mut last = 0;
     for id in 1..=N {
@@ -691,7 +946,7 @@ async fn test_snapshot_and_restore_skips_replay() {
     // SAME redex — state matches without the fold replaying events
     // 0..=last_seq (the adapter tails at FromSeq(last_seq+1)).
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     tasks.create(1, "alpha", 100).unwrap();
     tasks.create(2, "beta", 200).unwrap();
@@ -706,7 +961,9 @@ async fn test_snapshot_and_restore_skips_replay() {
     // Reopen on the same redex — the file still holds seqs 0..=3,
     // but the restored adapter's fold starts at seq 4 (last_seq+1),
     // so those old events are NOT replayed. State comes from bytes.
-    let tasks2 = TasksAdapter::open_from_snapshot(&redex, ORIGIN, &bytes, last_seq).unwrap();
+    let tasks2 = TasksAdapter::open_from_snapshot(&redex, ORIGIN, &bytes, last_seq)
+        .await
+        .unwrap();
 
     {
         let state = tasks2.state();
@@ -732,7 +989,7 @@ async fn test_snapshot_and_restore_skips_replay() {
 #[tokio::test]
 async fn test_snapshot_empty_state_has_no_last_seq() {
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
     let (bytes, last_seq) = tasks.snapshot().unwrap();
     assert_eq!(last_seq, None);
     assert!(!bytes.is_empty()); // even empty state serializes to >0 bytes.
@@ -741,7 +998,7 @@ async fn test_snapshot_empty_state_has_no_last_seq() {
 #[tokio::test]
 async fn test_ingest_after_close_errors() {
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
     tasks.create(1, "a", 100).unwrap();
     tasks.close().unwrap();
     assert!(tasks.create(2, "b", 101).is_err());
@@ -767,7 +1024,9 @@ async fn test_persistent_tasks_recover_across_processes() {
 
     {
         let redex = Redex::new().with_persistent_dir(&base);
-        let tasks = TasksAdapter::open_with_config(&redex, ORIGIN, cfg).unwrap();
+        let tasks = TasksAdapter::open_with_config(&redex, ORIGIN, cfg)
+            .await
+            .unwrap();
         tasks.create(1, "durable", 100).unwrap();
         tasks.create(2, "also durable", 101).unwrap();
         let seq = tasks.complete(1, 102).unwrap();
@@ -777,7 +1036,9 @@ async fn test_persistent_tasks_recover_across_processes() {
 
     // Fresh Redex manager, same base_dir — state replays from disk.
     let redex2 = Redex::new().with_persistent_dir(&base);
-    let tasks2 = TasksAdapter::open_with_config(&redex2, ORIGIN, cfg).unwrap();
+    let tasks2 = TasksAdapter::open_with_config(&redex2, ORIGIN, cfg)
+        .await
+        .unwrap();
     tasks2.wait_for_seq(2).await;
 
     let state = tasks2.state();
@@ -798,7 +1059,7 @@ async fn test_snapshot_and_watch_snapshot_reflects_current_state() {
     // `snapshot_and_watch` is `(initial, watcher.stream().skip(1))`,
     // any regression in delta behavior is caught upstream.
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     // Seed one pending + one completed; snapshot-for-pending must
     // reflect both the positive and negative filter evaluation.
@@ -832,7 +1093,7 @@ async fn test_regression_snapshot_and_watch_delivers_post_call_updates() {
     // after the call must eventually land on the stream, including
     // the case where the change races stream construction.
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
     let seq = tasks.create(1, "seed", 100).unwrap();
     tasks.wait_for_seq(seq).await;
 
@@ -874,7 +1135,7 @@ async fn test_regression_snapshot_and_watch_forwards_divergent_stream_initial() 
     // the stream MUST deliver the N+1 state within a short window.
     for trial in 0..20 {
         let redex = Redex::new();
-        let tasks = std::sync::Arc::new(TasksAdapter::open(&redex, ORIGIN).unwrap());
+        let tasks = std::sync::Arc::new(TasksAdapter::open(&redex, ORIGIN).await.unwrap());
         let seq = tasks.create(1, "seed", 100).unwrap();
         tasks.wait_for_seq(seq).await;
 

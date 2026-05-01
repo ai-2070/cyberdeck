@@ -266,11 +266,15 @@ impl StandbyGroup {
     ) -> Result<u32, GroupError> {
         let old_active = self.active_index;
 
-        // Mark old active as unhealthy
-        self.coord.mark_unhealthy(old_active);
-        self.members[old_active as usize].role = MemberRole::Standby;
-
-        // Find the standby with the most recent sync
+        // The search for a replacement runs FIRST; only if it
+        // succeeds do we mutate the old active's state. If we instead
+        // demoted `old_active` first and the search then returned
+        // `NoHealthyMember`, the function would exit with `Err` but
+        // leave `self.active_index` pointing at the now-unhealthy,
+        // now-`Standby`-roled `old_active`. A subsequent
+        // `on_node_recovery` for that member only marks it healthy —
+        // it doesn't restore the `Active` role — so the group would
+        // be silently demoted forever.
         let best_standby = self
             .members
             .iter()
@@ -279,6 +283,11 @@ impl StandbyGroup {
             .max_by_key(|m| m.synced_through)
             .map(|m| m.index)
             .ok_or(GroupError::NoHealthyMember)?;
+
+        // Now safe to mutate — search succeeded, promotion will
+        // complete.
+        self.coord.mark_unhealthy(old_active);
+        self.members[old_active as usize].role = MemberRole::Standby;
 
         // Promote
         self.active_index = best_standby;
@@ -642,6 +651,79 @@ mod tests {
         assert_eq!(group.buffered_event_count(), 0);
         assert_eq!(group.synced_through(1), Some(10));
         assert_eq!(group.synced_through(2), Some(10));
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #103: pre-fix
+    /// `promote` mutated `active`'s health and role to
+    /// `Unhealthy`/`Standby` BEFORE searching for a replacement.
+    /// If the search returned `NoHealthyMember`, the function
+    /// exited with `Err` but left `self.active_index` pointing
+    /// at the now-unhealthy, now-`Standby`-roled `old_active`.
+    /// `on_node_recovery` only marks healthy — it doesn't
+    /// restore the `Active` role — so the group was silently
+    /// demoted forever.
+    ///
+    /// We pin the fix by:
+    ///   1. Building a 3-member group with one active and two standbys.
+    ///   2. Marking BOTH standbys unhealthy so promote will fail.
+    ///   3. Calling `promote()` and asserting `Err(NoHealthyMember)`.
+    ///   4. Asserting the group is still in its pre-promote state:
+    ///      `active_origin`, `active_index`, and the active role
+    ///      are unchanged. Pre-fix this would have flipped the
+    ///      active to `Standby` + `Unhealthy`.
+    #[test]
+    fn promote_does_not_half_mutate_on_no_healthy_member() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+
+        let pre_active_origin = group.active_origin();
+        let pre_active_index = group.active_index();
+
+        // Mark every non-active member unhealthy so promote can't
+        // find a replacement.
+        let total = group.coord.member_count();
+        for idx in 0..total {
+            if idx != pre_active_index {
+                group.coord.mark_unhealthy(idx);
+            }
+        }
+
+        // Promotion must fail.
+        let err = group
+            .promote(|| Box::new(StatefulDaemon::new()), &reg, &sched)
+            .expect_err("promote must fail when no healthy standby exists");
+        assert!(matches!(err, GroupError::NoHealthyMember));
+
+        // Group state must NOT have been mutated. Pre-fix this
+        // would have flipped the active to Standby + Unhealthy
+        // before discovering there was no replacement.
+        assert_eq!(
+            group.active_origin(),
+            pre_active_origin,
+            "active_origin must be unchanged when promote fails"
+        );
+        assert_eq!(
+            group.active_index(),
+            pre_active_index,
+            "active_index must be unchanged when promote fails"
+        );
+        assert_eq!(
+            group.members[pre_active_index as usize].role,
+            MemberRole::Active,
+            "old active's role must NOT have been demoted to Standby"
+        );
+        assert!(
+            group.active_healthy(),
+            "old active's health must NOT have been flipped to Unhealthy"
+        );
     }
 
     #[test]

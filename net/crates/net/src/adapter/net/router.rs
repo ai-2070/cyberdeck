@@ -510,6 +510,16 @@ impl NetRouter {
         let mut new_data = BytesMut::with_capacity(data.len());
         let mut fwd_header = routing_header;
         fwd_header.forward();
+        // Re-check expiry after `forward()` decrements the TTL: if
+        // TTL hit 0, the next hop would just drop the packet on its
+        // own `is_expired()` check — wasting one forward, bandwidth,
+        // and a queue slot per last-hop packet. Drop locally here so
+        // the next hop never sees the doomed packet.
+        if fwd_header.is_expired() {
+            self.packets_dropped.fetch_add(1, Ordering::Relaxed);
+            self.routing_table.record_drop(stream_id);
+            return Err(RouterError::TtlExpired);
+        }
         fwd_header.write_to(&mut new_data);
         new_data.extend_from_slice(&data[ROUTING_HEADER_SIZE..]);
 
@@ -846,6 +856,93 @@ mod tests {
             "stream stats should record 1 packet for stream_id 0x{:X}",
             expected_stream_id
         );
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #119: pre-fix
+    /// `route_packet` decremented TTL via `forward()` and queued
+    /// the packet for the next hop without checking whether the
+    /// post-decrement TTL was 0. The next hop received a TTL=0
+    /// packet and dropped it on its own `is_expired()` check —
+    /// wasting one forward + bandwidth + queue slot per
+    /// last-hop packet. Post-fix the router drops here with
+    /// `TtlExpired` if `forward()` made the TTL 0.
+    #[tokio::test]
+    async fn route_packet_drops_when_forward_makes_ttl_zero() {
+        let local_id = 0x1234u64;
+        let dest_id = 0x9999u64;
+        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+
+        let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
+        let router = NetRouter::new(config).await.unwrap();
+        router.routing_table().add_route(dest_id, dest_addr);
+
+        // TTL = 1 — `forward()` will decrement to 0. Pre-fix
+        // this would still queue the packet (RouteAction::Forwarded);
+        // post-fix it's dropped with TtlExpired.
+        let routing = RoutingHeader::new(dest_id, 0x5678, 1);
+        let routing_bytes = routing.to_bytes();
+
+        let net = NetHeader::new(
+            0xAAAA,
+            0xBEEF,
+            1,
+            [0u8; 12],
+            0,
+            0,
+            super::super::protocol::PacketFlags::NONE,
+        );
+        let net_bytes = net.to_bytes();
+
+        let mut packet = BytesMut::with_capacity(ROUTING_HEADER_SIZE + HEADER_SIZE);
+        packet.extend_from_slice(&routing_bytes);
+        packet.extend_from_slice(&net_bytes);
+
+        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let result = router.route_packet(packet.freeze(), from);
+
+        match result {
+            Err(RouterError::TtlExpired) => {} // expected
+            Ok(action) => panic!(
+                "post-fix must drop with TtlExpired, not forward (got {:?})",
+                action
+            ),
+            Err(e) => panic!("unexpected error: {:?}", e),
+        }
+    }
+
+    /// Sanity: a TTL=2 packet should still forward (decrements
+    /// to 1 — non-zero, next hop accepts).
+    #[tokio::test]
+    async fn route_packet_forwards_when_ttl_remains_positive_after_decrement() {
+        let local_id = 0x1234u64;
+        let dest_id = 0x9999u64;
+        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+
+        let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
+        let router = NetRouter::new(config).await.unwrap();
+        router.routing_table().add_route(dest_id, dest_addr);
+
+        let routing = RoutingHeader::new(dest_id, 0x5678, 2);
+        let routing_bytes = routing.to_bytes();
+        let net = NetHeader::new(
+            0xAAAA,
+            0xBEEF,
+            1,
+            [0u8; 12],
+            0,
+            0,
+            super::super::protocol::PacketFlags::NONE,
+        );
+        let net_bytes = net.to_bytes();
+        let mut packet = BytesMut::with_capacity(ROUTING_HEADER_SIZE + HEADER_SIZE);
+        packet.extend_from_slice(&routing_bytes);
+        packet.extend_from_slice(&net_bytes);
+        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let result = router.route_packet(packet.freeze(), from);
+        match result {
+            Ok(RouteAction::Forwarded(addr)) => assert_eq!(addr, dest_addr),
+            other => panic!("expected Forwarded, got {:?}", other),
+        }
     }
 
     #[test]

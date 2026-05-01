@@ -108,8 +108,19 @@ impl SubnetGateway {
         hop_ttl: u8,
         hop_count: u8,
     ) -> ForwardDecision {
-        // TTL check
-        if hop_ttl > 0 && hop_count >= hop_ttl {
+        // TTL check.
+        //
+        // Treating `hop_ttl == 0` as "expired" is critical:
+        // `NetHeader::new` defaults `hop_ttl` to 0 and `hop_count`
+        // is excluded from AAD (mutable in transit), so a malicious
+        // or buggy peer could craft `hop_ttl=0` packets that loop
+        // through gateways with no Net-layer bound. Routing-layer
+        // TTL still bounds end-to-end loops for routed packets, but
+        // pure subnet-gateway forwarding paths (no routing header)
+        // would have no cap. Any header that hasn't explicitly set
+        // `hop_ttl` via `NetHeader::with_hops(ttl)` is dropped at
+        // the gateway.
+        if hop_ttl == 0 || hop_count >= hop_ttl {
             self.dropped
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return ForwardDecision::Drop(DropReason::TtlExpired);
@@ -209,13 +220,25 @@ mod tests {
         hash
     }
 
+    /// Default `hop_ttl` for tests that aren't testing TTL itself.
+    /// Post-#88, `hop_ttl == 0` is treated as expired by the
+    /// gateway, so non-TTL tests must pass a non-zero value to
+    /// avoid short-circuiting on the TTL check.
+    const TEST_TTL: u8 = 8;
+
     #[test]
     fn test_global_always_forwards() {
         let reg = ChannelConfigRegistry::new();
         let ch = make_channel("test/global", Visibility::Global, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
-        let decision = gw.should_forward(SubnetId::new(&[1, 1]), SubnetId::new(&[2, 1]), ch, 0, 0);
+        let decision = gw.should_forward(
+            SubnetId::new(&[1, 1]),
+            SubnetId::new(&[2, 1]),
+            ch,
+            TEST_TTL,
+            0,
+        );
         assert_eq!(decision, ForwardDecision::Forward);
     }
 
@@ -225,7 +248,13 @@ mod tests {
         let ch = make_channel("test/local", Visibility::SubnetLocal, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
-        let decision = gw.should_forward(SubnetId::new(&[1, 1]), SubnetId::new(&[1, 2]), ch, 0, 0);
+        let decision = gw.should_forward(
+            SubnetId::new(&[1, 1]),
+            SubnetId::new(&[1, 2]),
+            ch,
+            TEST_TTL,
+            0,
+        );
         assert_eq!(decision, ForwardDecision::Drop(DropReason::SubnetLocal));
     }
 
@@ -236,11 +265,18 @@ mod tests {
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
         // Child to parent — allowed
-        let decision = gw.should_forward(SubnetId::new(&[1, 2]), SubnetId::new(&[1]), ch, 0, 0);
+        let decision =
+            gw.should_forward(SubnetId::new(&[1, 2]), SubnetId::new(&[1]), ch, TEST_TTL, 0);
         assert_eq!(decision, ForwardDecision::Forward);
 
         // Sibling to sibling — not allowed
-        let decision = gw.should_forward(SubnetId::new(&[1, 2]), SubnetId::new(&[1, 3]), ch, 0, 0);
+        let decision = gw.should_forward(
+            SubnetId::new(&[1, 2]),
+            SubnetId::new(&[1, 3]),
+            ch,
+            TEST_TTL,
+            0,
+        );
         assert_eq!(decision, ForwardDecision::Drop(DropReason::NotAncestor));
     }
 
@@ -253,11 +289,11 @@ mod tests {
         gw.export_channel(ch, vec![SubnetId::new(&[2])]);
 
         // Forward to exported target
-        let decision = gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), ch, 0, 0);
+        let decision = gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), ch, TEST_TTL, 0);
         assert_eq!(decision, ForwardDecision::Forward);
 
         // Drop to non-exported target
-        let decision = gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[3]), ch, 0, 0);
+        let decision = gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[3]), ch, TEST_TTL, 0);
         assert_eq!(decision, ForwardDecision::Drop(DropReason::NotExported));
     }
 
@@ -277,6 +313,36 @@ mod tests {
         assert_eq!(decision, ForwardDecision::Drop(DropReason::TtlExpired));
     }
 
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #88: previously
+    /// the TTL gate was `hop_ttl > 0 && hop_count >= hop_ttl`,
+    /// short-circuiting to "always forward" when `hop_ttl == 0`.
+    /// `NetHeader::new` defaults `hop_ttl` to 0 and the field is
+    /// excluded from AAD-protection (`hop_count` is mutable in
+    /// transit per `protocol.rs:319`), so an attacker could craft
+    /// `hop_ttl=0` packets that loop through gateways forever.
+    /// Post-fix, `hop_ttl == 0` is treated as expired.
+    #[test]
+    fn ttl_zero_is_treated_as_expired() {
+        let reg = ChannelConfigRegistry::new();
+        let ch = make_channel("test/ttl-zero", Visibility::Global, &reg);
+        let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
+
+        let decision = gw.should_forward(
+            SubnetId::new(&[1]),
+            SubnetId::new(&[2]),
+            ch,
+            0, // ttl = 0 — pre-fix this short-circuited to forward
+            0, // hop_count = 0
+        );
+        assert_eq!(
+            decision,
+            ForwardDecision::Drop(DropReason::TtlExpired),
+            "pre-fix: this returned Forward because the guard was \
+             `hop_ttl > 0 && hop_count >= hop_ttl`, which short-\
+             circuits when hop_ttl == 0"
+        );
+    }
+
     #[test]
     fn test_unknown_channel_defaults_subnet_local() {
         // Unknown channels cannot be proven safe to cross subnet boundaries,
@@ -286,7 +352,13 @@ mod tests {
         let reg = ChannelConfigRegistry::new();
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
-        let decision = gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), 0x9999, 0, 0);
+        let decision = gw.should_forward(
+            SubnetId::new(&[1]),
+            SubnetId::new(&[2]),
+            0x9999,
+            TEST_TTL,
+            0,
+        );
         assert_eq!(decision, ForwardDecision::Drop(DropReason::SubnetLocal));
     }
 
@@ -327,7 +399,7 @@ mod tests {
             SubnetId::new(&[1]),
             SubnetId::new(&[2]),
             colliding_hash,
-            0,
+            TEST_TTL,
             0,
         );
         assert_eq!(decision, ForwardDecision::Drop(DropReason::SubnetLocal));
@@ -340,9 +412,27 @@ mod tests {
         let ch_local = make_channel("test/stats-local", Visibility::SubnetLocal, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
-        gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), ch_global, 0, 0);
-        gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), ch_local, 0, 0);
-        gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), ch_global, 0, 0);
+        gw.should_forward(
+            SubnetId::new(&[1]),
+            SubnetId::new(&[2]),
+            ch_global,
+            TEST_TTL,
+            0,
+        );
+        gw.should_forward(
+            SubnetId::new(&[1]),
+            SubnetId::new(&[2]),
+            ch_local,
+            TEST_TTL,
+            0,
+        );
+        gw.should_forward(
+            SubnetId::new(&[1]),
+            SubnetId::new(&[2]),
+            ch_global,
+            TEST_TTL,
+            0,
+        );
 
         assert_eq!(gw.forwarded_count(), 2);
         assert_eq!(gw.dropped_count(), 1);

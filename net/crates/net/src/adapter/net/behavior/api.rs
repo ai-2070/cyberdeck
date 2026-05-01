@@ -58,6 +58,90 @@ impl ApiMethod {
     }
 }
 
+/// Maximum recursion depth permitted by [`SchemaType::validate`].
+///
+/// `SchemaType` is `#[derive(Deserialize)]` and contains
+/// recursive variants (`Array { items: Box<SchemaType> }`,
+/// `Object { properties: HashMap<_, SchemaType> }`,
+/// `AnyOf { schemas: Vec<SchemaType> }`). An attacker who can
+/// ship a schema (announcements broadcast over the mesh, or any
+/// caller that parses untrusted JSON into `SchemaType`) could
+/// otherwise submit a deeply-nested schema and crash the
+/// validator (and the whole process) via stack overflow on an
+/// unbounded recursive `validate`. 128 is generous for realistic
+/// schemas (typical JSON Schemas rarely exceed depth 10) and well
+/// clear of the typical default 8 MB Linux stack.
+pub const MAX_SCHEMA_DEPTH: usize = 128;
+
+/// Scan the byte stream of a JSON document and reject if
+/// nesting depth (the deepest stack of `{` and `[` after
+/// balancing) exceeds `max_depth`.
+///
+/// This is the deserialize-side defence for [`SchemaType`]: an
+/// adversarial schema with thousands of nested `{"type":"array",
+/// "items":...}` levels would otherwise either trip `serde_json`'s
+/// internal limit (currently 128 by default but tied to a
+/// transitive dependency) or stack-overflow the typed
+/// deserialize. Pre-scanning the bytes has a single linear-time
+/// cost regardless of which deserialize path follows.
+///
+/// String literals are handled correctly: bracket characters
+/// inside a `"..."` string don't change depth, and escapes
+/// (`\"`, `\\`) are skipped so a `}` inside a string can't fool
+/// the counter.
+///
+/// Returns `Err(serde_json::Error)` with a `Custom` kind so
+/// callers can match on `*::is_data` / `*::is_eof` etc. uniformly
+/// with the standard `serde_json::from_slice` error surface.
+fn check_json_nesting_depth(data: &[u8], max_depth: usize) -> Result<(), serde_json::Error> {
+    use serde::de::Error;
+    let mut depth: usize = 0;
+    let mut max_seen: usize = 0;
+    let mut i = 0;
+    let n = data.len();
+    while i < n {
+        let b = data[i];
+        match b {
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                if depth > max_seen {
+                    max_seen = depth;
+                }
+                if depth > max_depth {
+                    return Err(serde_json::Error::custom(format!(
+                        "max nesting depth exceeded ({} > {})",
+                        depth, max_depth
+                    )));
+                }
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'"' => {
+                // Skip the rest of the string. Honor `\"` (don't
+                // exit) and `\\` (don't treat the following char
+                // as an escape). Anything else inside the string
+                // is opaque to the depth counter.
+                i += 1;
+                while i < n {
+                    match data[i] {
+                        b'\\' if i + 1 < n => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
 /// JSON Schema type definitions
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -179,6 +263,37 @@ pub enum StringFormat {
 }
 
 impl SchemaType {
+    /// Deserialize a `SchemaType` from JSON bytes with an explicit
+    /// nesting-depth cap.
+    ///
+    /// Callers that deserialize peer-supplied / untrusted JSON
+    /// into `SchemaType` MUST use this entry point. The
+    /// derive-`Deserialize` path inherits `serde_json`'s built-in
+    /// 128-frame recursion limit, but that's tied to a transitive
+    /// dependency and may shift across versions; we pin a local
+    /// cap matching [`MAX_SCHEMA_DEPTH`] by **pre-scanning** the
+    /// input bytes for max nesting depth (cheap O(n) walk over
+    /// `{`/`[`/`}`/`]` outside of strings) and rejecting before
+    /// any deserialize work runs. This also guards against
+    /// `serde_json::from_slice::<SchemaType>(...)` callsites that
+    /// might bypass [`Self::validate`]'s post-parse cap entirely.
+    ///
+    /// Returns:
+    /// - `Err(serde_json::Error)` with kind `Custom("max nesting
+    ///   depth exceeded")` if depth > [`MAX_SCHEMA_DEPTH`].
+    /// - The standard `serde_json::Error` variants from the
+    ///   downstream `from_slice` call otherwise.
+    pub fn try_from_slice(data: &[u8]) -> Result<Self, serde_json::Error> {
+        check_json_nesting_depth(data, MAX_SCHEMA_DEPTH)?;
+        serde_json::from_slice(data)
+    }
+
+    /// Deserialize a `SchemaType` from a JSON string with an
+    /// explicit nesting-depth cap. See [`Self::try_from_slice`].
+    pub fn try_from_str(s: &str) -> Result<Self, serde_json::Error> {
+        Self::try_from_slice(s.as_bytes())
+    }
+
     /// Create a string schema
     pub fn string() -> Self {
         SchemaType::String {
@@ -293,8 +408,33 @@ impl SchemaType {
         self
     }
 
-    /// Validate a JSON value against this schema
+    /// Validate a JSON value against this schema.
+    ///
+    /// The recursion is bounded by [`MAX_SCHEMA_DEPTH`]; exceeding
+    /// it returns [`ValidationError::RecursionLimitExceeded`]
+    /// instead of blowing the stack. Recursive variants (`Array`,
+    /// `Object`, `AnyOf`) call `validate` recursively, so an
+    /// attacker who could ship a `SchemaType` (announcements
+    /// broadcast over the mesh, or any caller that parses
+    /// untrusted JSON into `SchemaType`) could otherwise submit a
+    /// deeply-nested schema and crash the validator — and the
+    /// whole process — via stack overflow when a request got
+    /// validated against it.
     pub fn validate(&self, value: &serde_json::Value) -> Result<(), ValidationError> {
+        self.validate_with_depth(value, 0)
+    }
+
+    /// Internal depth-bounded validate — see [`validate`].
+    fn validate_with_depth(
+        &self,
+        value: &serde_json::Value,
+        depth: usize,
+    ) -> Result<(), ValidationError> {
+        if depth >= MAX_SCHEMA_DEPTH {
+            return Err(ValidationError::RecursionLimitExceeded {
+                limit: MAX_SCHEMA_DEPTH,
+            });
+        }
         match (self, value) {
             (SchemaType::Null, serde_json::Value::Null) => Ok(()),
             (SchemaType::Null, _) => Err(ValidationError::TypeMismatch {
@@ -463,12 +603,20 @@ impl SchemaType {
                     }
                 }
                 for (i, v) in arr.iter().enumerate() {
-                    items
-                        .validate(v)
-                        .map_err(|e| ValidationError::ArrayItemError {
+                    if let Err(e) = items.validate_with_depth(v, depth + 1) {
+                        // Surface the recursion-limit signal
+                        // unwrapped — wrapping it in
+                        // `ArrayItemError` would obscure the
+                        // anti-DoS check from callers walking
+                        // the error chain.
+                        if matches!(e, ValidationError::RecursionLimitExceeded { .. }) {
+                            return Err(e);
+                        }
+                        return Err(ValidationError::ArrayItemError {
                             index: i,
                             error: Box::new(e),
-                        })?;
+                        });
+                    }
                 }
                 Ok(())
             }
@@ -495,12 +643,17 @@ impl SchemaType {
                 // Validate properties
                 for (key, val) in obj {
                     if let Some(schema) = properties.get(key) {
-                        schema
-                            .validate(val)
-                            .map_err(|e| ValidationError::PropertyError {
+                        if let Err(e) = schema.validate_with_depth(val, depth + 1) {
+                            // Same as Array — surface the
+                            // recursion-limit signal unwrapped.
+                            if matches!(e, ValidationError::RecursionLimitExceeded { .. }) {
+                                return Err(e);
+                            }
+                            return Err(ValidationError::PropertyError {
                                 property: key.clone(),
                                 error: Box::new(e),
-                            })?;
+                            });
+                        }
                     } else if !additional_properties {
                         return Err(ValidationError::UnknownProperty {
                             property: key.clone(),
@@ -527,8 +680,15 @@ impl SchemaType {
 
             (SchemaType::AnyOf { schemas }, v) => {
                 for schema in schemas {
-                    if schema.validate(v).is_ok() {
-                        return Ok(());
+                    match schema.validate_with_depth(v, depth + 1) {
+                        Ok(()) => return Ok(()),
+                        Err(ValidationError::RecursionLimitExceeded { limit }) => {
+                            // Don't swallow the recursion-limit
+                            // signal — surface it instead of
+                            // converting to AnyOfFailed.
+                            return Err(ValidationError::RecursionLimitExceeded { limit });
+                        }
+                        Err(_) => {}
                     }
                 }
                 Err(ValidationError::AnyOfFailed {
@@ -637,6 +797,19 @@ pub enum ValidationError {
         /// Number of candidate schemas that were all tried and failed
         schema_count: usize,
     },
+    /// Schema recursion depth exceeded (anti-DoS guard).
+    ///
+    /// Returned by [`SchemaType::validate`] when the recursive
+    /// walk through nested `Array`/`Object`/`AnyOf` variants
+    /// exceeds [`MAX_SCHEMA_DEPTH`]. Without this cap, an
+    /// attacker who could ship a `SchemaType` (announcements
+    /// broadcast over the mesh, or any caller parsing untrusted
+    /// JSON) could submit a deeply nested schema and crash the
+    /// validator (and the process) via stack overflow.
+    RecursionLimitExceeded {
+        /// The depth limit that was exceeded.
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -675,6 +848,9 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationError::AnyOfFailed { schema_count } => {
                 write!(f, "value did not match any of {} schemas", schema_count)
+            }
+            ValidationError::RecursionLimitExceeded { limit } => {
+                write!(f, "schema recursion depth exceeded {}", limit)
             }
         }
     }
@@ -1765,6 +1941,163 @@ mod tests {
         let schema = SchemaType::array(SchemaType::integer());
         assert!(schema.validate(&serde_json::json!([1, 2, 3])).is_ok());
         assert!(schema.validate(&serde_json::json!([1, "two", 3])).is_err());
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #109: pre-fix
+    /// `SchemaType::validate` recursed without bound through
+    /// `Array { items }` / `Object { properties }` / `AnyOf { schemas }`.
+    /// An attacker who could ship a `SchemaType` (announcements
+    /// broadcast over the mesh, or any caller parsing untrusted
+    /// JSON) could submit a deeply-nested schema and crash the
+    /// process via stack overflow when a request was validated.
+    /// Post-fix: depth is bounded by `MAX_SCHEMA_DEPTH`;
+    /// exceeding it returns `RecursionLimitExceeded` instead.
+    ///
+    /// We pin the bound by constructing a schema deeper than the
+    /// limit (chained Array variants — each `Array { items: ... }`
+    /// adds one level of recursion). With a payload that walks
+    /// through every level, validate must surface the
+    /// recursion-limit error rather than blowing the stack.
+    #[test]
+    fn validate_returns_recursion_limit_error_on_deeply_nested_schema() {
+        // Build an Array<Array<Array<...<Integer>...>>> with
+        // depth = MAX_SCHEMA_DEPTH + 5 (well past the cap).
+        let mut schema = SchemaType::integer();
+        for _ in 0..MAX_SCHEMA_DEPTH + 5 {
+            schema = SchemaType::array(schema);
+        }
+
+        // Build a matching nested-array payload so each level
+        // descends into the next.
+        let mut value = serde_json::json!(1);
+        for _ in 0..MAX_SCHEMA_DEPTH + 5 {
+            value = serde_json::json!([value]);
+        }
+
+        // Pre-fix: stack overflow. Post-fix: bounded error.
+        let result = schema.validate(&value);
+        match result {
+            Err(ValidationError::RecursionLimitExceeded { limit }) => {
+                assert_eq!(limit, MAX_SCHEMA_DEPTH);
+            }
+            other => panic!("expected RecursionLimitExceeded, got {:?}", other),
+        }
+    }
+
+    /// Sanity: a schema at exactly `MAX_SCHEMA_DEPTH` levels of
+    /// nesting must still validate successfully (no false-positive
+    /// recursion error).
+    #[test]
+    fn validate_accepts_schema_at_recursion_limit() {
+        let mut schema = SchemaType::integer();
+        // depth = MAX_SCHEMA_DEPTH - 1 means the validator visits
+        // depth values 0..MAX_SCHEMA_DEPTH, all under the cap.
+        for _ in 0..(MAX_SCHEMA_DEPTH - 1) {
+            schema = SchemaType::array(schema);
+        }
+        let mut value = serde_json::json!(1);
+        for _ in 0..(MAX_SCHEMA_DEPTH - 1) {
+            value = serde_json::json!([value]);
+        }
+        assert!(
+            schema.validate(&value).is_ok(),
+            "schema right at the depth limit must still validate"
+        );
+    }
+
+    /// CR-9: deeply-nested input must be rejected at the deserialize
+    /// boundary, BEFORE `validate` is called. Pre-fix the cap was
+    /// only enforced post-parse — an adversarial schema could
+    /// trigger the recursive `Deserialize` to allocate a deep
+    /// `SchemaType` tree (or stack-overflow on a very deep input)
+    /// before any validation ran.
+    #[test]
+    fn try_from_slice_rejects_input_over_max_schema_depth() {
+        // Build a JSON string with MAX_SCHEMA_DEPTH + 50 nested
+        // arrays. Even though valid JSON, it must trip the
+        // depth-scan guard before serde_json runs.
+        let depth = MAX_SCHEMA_DEPTH + 50;
+        let mut s = String::new();
+        for _ in 0..depth {
+            s.push('[');
+        }
+        s.push_str("null");
+        for _ in 0..depth {
+            s.push(']');
+        }
+        let err = SchemaType::try_from_str(&s)
+            .expect_err("deeply-nested JSON must be rejected by the depth pre-scan");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("max nesting depth exceeded"),
+            "error message must name the depth cap; got: {}",
+            msg
+        );
+    }
+
+    /// CR-9: the depth pre-scan must not be fooled by JSON strings
+    /// containing brackets. A long string of `}`s inside `"..."`
+    /// must NOT be counted as depth-out (which would let an
+    /// attacker mask real depth).
+    #[test]
+    fn try_from_slice_handles_brackets_inside_strings_correctly() {
+        // A schema with a `pattern` field containing brackets in
+        // a string. The string brackets must be ignored by the
+        // depth counter.
+        let json = r#"{"type":"string","pattern":"[}{]\""}"#;
+        let r = SchemaType::try_from_str(json);
+        assert!(
+            r.is_ok(),
+            "valid schema with bracket-bearing string must parse: {:?}",
+            r.err()
+        );
+    }
+
+    /// CR-9: a moderately-deep schema (well under both the depth
+    /// pre-scan cap AND serde_json's internal recursion limit)
+    /// must parse cleanly. The internal serde_json limit (128) and
+    /// our `MAX_SCHEMA_DEPTH` (128) are intentionally aligned, but
+    /// each `Box<SchemaType>` adds a serde call frame on top of
+    /// the byte-counter depth, so the effective serde-side ceiling
+    /// is a bit below `MAX_SCHEMA_DEPTH`. We pin a depth of 32
+    /// here — comfortably representative of any real-world nested
+    /// schema and well within both caps.
+    #[test]
+    fn try_from_slice_accepts_normal_depth_schema() {
+        let depth = 32usize;
+        let mut s = String::new();
+        for _ in 0..depth {
+            s.push_str(r#"{"type":"array","items":"#);
+        }
+        s.push_str(r#"{"type":"null"}"#);
+        for _ in 0..depth {
+            s.push('}');
+        }
+        let r = SchemaType::try_from_str(&s);
+        assert!(
+            r.is_ok(),
+            "moderately-nested schema (depth {}) must parse; got: {:?}",
+            depth,
+            r.err()
+        );
+    }
+
+    /// CR-9: direct unit test on the depth scanner — confirms
+    /// it counts both `{`/`}` and `[`/`]` correctly and respects
+    /// string-literal boundaries.
+    #[test]
+    fn check_json_nesting_depth_unit() {
+        assert!(check_json_nesting_depth(b"{}", 1).is_ok());
+        assert!(check_json_nesting_depth(b"{}", 0).is_err()); // depth 1 > 0
+        assert!(check_json_nesting_depth(b"[[[[]]]]", 4).is_ok());
+        assert!(check_json_nesting_depth(b"[[[[]]]]", 3).is_err());
+        // Brackets inside a string are NOT counted.
+        assert!(check_json_nesting_depth(b"\"[[[[\"", 0).is_ok());
+        // Escaped quote keeps us inside the string.
+        assert!(check_json_nesting_depth(b"\"[\\\"[[\"", 0).is_ok());
+        // Mixed nesting.
+        assert!(check_json_nesting_depth(b"{\"a\":[1,2]}", 2).is_ok());
+        assert!(check_json_nesting_depth(b"{\"a\":[1,2]}", 1).is_err());
     }
 
     #[test]

@@ -15,7 +15,9 @@
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(any(test, debug_assertions))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 /// Error returned when the ring buffer is full.
 ///
 /// Crate-internal: surfaced to public callers as
@@ -83,18 +85,83 @@ pub(crate) struct RingBuffer<T> {
     /// Mask for fast modulo (capacity - 1).
     mask: usize,
     /// Write position (producer).
-    head: CachePadded<AtomicUsize>,
-    /// Read position (consumer).
-    tail: CachePadded<AtomicUsize>,
-    /// Thread ID of the producer (debug-build SPSC enforcement —
+    ///
+    /// `head` / `tail` are `u64` regardless of target pointer
+    /// width. `AtomicUsize` would wrap on 32-bit targets (wasm32
+    /// is in the test matrix) after 2^32 pushes — ~7 minutes per
+    /// shard at 10 M events/sec, ~12 hours at 100 K. Once `head`
+    /// lapped `tail` and the wrapping distance exceeded
+    /// `capacity-1`, `try_push` would reject forever and the
+    /// buffer would be permanently wedged. `u64` gives ~58 years
+    /// to wrap at 10 G events/sec on every target.
+    head: CachePadded<AtomicU64>,
+    /// Read position (consumer). See `head` for the rationale on
+    /// the `u64` width.
+    tail: CachePadded<AtomicU64>,
+    /// Producer-side concurrency tripwire (debug-build SPSC enforcement —
     /// active under `debug_assertions`, not just `cfg(test)`, so dev
-    /// runs of the binary catch SPSC violations even outside of unit
-    /// tests).
-    #[cfg(test)]
-    producer_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
-    /// Thread ID of the consumer (debug-build SPSC enforcement).
-    #[cfg(test)]
-    consumer_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
+    /// runs of the binary catch real SPSC violations even outside of
+    /// unit tests). The gates below use `debug_assertions` directly
+    /// rather than `#[cfg(test)]`, so the safety net stays present
+    /// in any non-release build.
+    ///
+    /// Set to `true` while a producer-side method (`try_push` /
+    /// `evict_oldest`) is mid-execution. A second concurrent caller
+    /// observes `true` on its swap and panics — that's a genuine
+    /// multi-producer SPSC violation. Sequential cross-thread access
+    /// is allowed (tasks legitimately migrate between OS threads
+    /// across `await` points; the outer `Shard` mutex serializes
+    /// them, which is the actual SPSC-safe pattern). Pre-fix this
+    /// was a `Mutex<Option<ThreadId>>` that pinned the FIRST OS
+    /// thread to ever push and rejected every subsequent thread —
+    /// a false positive on every multi-threaded tokio runtime that
+    /// migrated the producing task. The `AtomicBool` flag catches
+    /// the real hazard (concurrency) without that false positive.
+    #[cfg(any(test, debug_assertions))]
+    producer_in_progress: AtomicBool,
+    /// Consumer-side concurrency tripwire — see `producer_in_progress`.
+    #[cfg(any(test, debug_assertions))]
+    consumer_in_progress: AtomicBool,
+}
+
+/// RAII guard for the in-progress concurrency tripwire. Acquired
+/// on entry to a producer- or consumer-side method; cleared on
+/// drop, so an early-return or a panic in the work block still
+/// releases the flag.
+///
+/// Conditional on `debug_assertions` to mirror the field-declaration
+/// gate. Production builds skip the construction entirely.
+#[cfg(any(test, debug_assertions))]
+struct InProgressGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl<'a> InProgressGuard<'a> {
+    /// Atomically set the flag to `true`. Panics if it was already
+    /// `true` — that's a genuine concurrent SPSC violation, since
+    /// we can only see `true` if another thread is mid-execution
+    /// in the same producer- or consumer-side method.
+    #[inline]
+    fn enter(flag: &'a AtomicBool, label: &'static str) -> Self {
+        let was_in = flag.swap(true, Ordering::Acquire);
+        assert!(
+            !was_in,
+            "SPSC violation: {label} called concurrently with another \
+             {label} on the same RingBuffer (the SPSC contract requires \
+             at most one in-flight call per side at a time — typically \
+             upheld by the outer Shard mutex)",
+        );
+        Self { flag }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl<'a> Drop for InProgressGuard<'a> {
+    #[inline]
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
 }
 
 // Safety: The ring buffer is SPSC (single-producer, single-consumer).
@@ -127,12 +194,12 @@ impl<T> RingBuffer<T> {
             buffer: buffer.into_boxed_slice(),
             capacity,
             mask: capacity - 1,
-            head: CachePadded::new(AtomicUsize::new(0)),
-            tail: CachePadded::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            producer_thread: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            consumer_thread: std::sync::Mutex::new(None),
+            head: CachePadded::new(AtomicU64::new(0)),
+            tail: CachePadded::new(AtomicU64::new(0)),
+            #[cfg(any(test, debug_assertions))]
+            producer_in_progress: AtomicBool::new(false),
+            #[cfg(any(test, debug_assertions))]
+            consumer_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -145,34 +212,25 @@ impl<T> RingBuffer<T> {
     /// wrapping in `Shard` upholds this trivially.
     #[inline]
     pub fn try_push(&self, value: T) -> Result<(), BufferFullError> {
-        #[cfg(test)]
-        {
-            let current = std::thread::current().id();
-            let mut guard = self
-                .producer_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(tid) = *guard {
-                assert_eq!(
-                    tid, current,
-                    "SPSC violation: try_push called from multiple threads"
-                );
-            } else {
-                *guard = Some(current);
-            }
-        }
+        #[cfg(any(test, debug_assertions))]
+        let _spsc_guard = InProgressGuard::enter(&self.producer_in_progress, "try_push");
 
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
 
-        // Check if buffer is full
+        // Check if buffer is full. Both head/tail are u64; the
+        // wrapping subtract gives the in-flight length on every
+        // target.
         let len = head.wrapping_sub(tail);
-        if len >= self.capacity - 1 {
+        if len >= (self.capacity as u64) - 1 {
             return Err(BufferFullError);
         }
 
-        // Write the value
-        let index = head & self.mask;
+        // Write the value. The `mask` keeps the index inside
+        // `capacity` (power-of-2); the `as usize` is the lossless
+        // truncation back to the buffer index — `head & mask` is
+        // always < `capacity` ≤ `usize::MAX`.
+        let index = (head & self.mask as u64) as usize;
         unsafe {
             (*self.buffer[index].get()).write(value);
         }
@@ -203,23 +261,8 @@ impl<T> RingBuffer<T> {
     /// the same way `try_push`/`try_pop` are.
     #[inline]
     pub(crate) fn evict_oldest(&self) -> Option<T> {
-        #[cfg(test)]
-        {
-            let current = std::thread::current().id();
-            let mut guard = self
-                .producer_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(tid) = *guard {
-                assert_eq!(
-                    tid, current,
-                    "SPSC violation: evict_oldest called from a different thread \
-                     than try_push (it must run on the producer thread)"
-                );
-            } else {
-                *guard = Some(current);
-            }
-        }
+        #[cfg(any(test, debug_assertions))]
+        let _spsc_guard = InProgressGuard::enter(&self.producer_in_progress, "evict_oldest");
 
         // Same atomic ordering as `try_pop`; only the thread
         // tracking differs.
@@ -228,7 +271,7 @@ impl<T> RingBuffer<T> {
         if tail == head {
             return None;
         }
-        let index = tail & self.mask;
+        let index = (tail & self.mask as u64) as usize;
         let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         Some(value)
@@ -243,22 +286,8 @@ impl<T> RingBuffer<T> {
     /// in-crate mutex on `Shard`.
     #[inline]
     pub fn try_pop(&self) -> Option<T> {
-        #[cfg(test)]
-        {
-            let current = std::thread::current().id();
-            let mut guard = self
-                .consumer_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(tid) = *guard {
-                assert_eq!(
-                    tid, current,
-                    "SPSC violation: try_pop called from multiple threads"
-                );
-            } else {
-                *guard = Some(current);
-            }
-        }
+        #[cfg(any(test, debug_assertions))]
+        let _spsc_guard = InProgressGuard::enter(&self.consumer_in_progress, "try_pop");
 
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
@@ -269,7 +298,7 @@ impl<T> RingBuffer<T> {
         }
 
         // Read the value
-        let index = tail & self.mask;
+        let index = (tail & self.mask as u64) as usize;
         let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
 
         // Publish the read
@@ -286,29 +315,16 @@ impl<T> RingBuffer<T> {
     /// Same single-consumer contract as `try_pop`.
     #[inline]
     pub fn pop_batch(&self, max: usize) -> Vec<T> {
-        #[cfg(test)]
-        {
-            let current = std::thread::current().id();
-            let mut guard = self
-                .consumer_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(tid) = *guard {
-                assert_eq!(
-                    tid, current,
-                    "SPSC violation: pop_batch called from multiple threads"
-                );
-            } else {
-                *guard = Some(current);
-            }
-        }
+        #[cfg(any(test, debug_assertions))]
+        let _spsc_guard = InProgressGuard::enter(&self.consumer_in_progress, "pop_batch");
 
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
 
-        // Calculate how many elements are available
+        // Calculate how many elements are available. `available`
+        // is u64; cap to `max: usize` and convert back.
         let available = head.wrapping_sub(tail);
-        let count = available.min(max);
+        let count = available.min(max as u64) as usize;
 
         if count == 0 {
             return Vec::new();
@@ -319,13 +335,14 @@ impl<T> RingBuffer<T> {
 
         // Read all elements
         for i in 0..count {
-            let index = (tail.wrapping_add(i)) & self.mask;
+            let index = (tail.wrapping_add(i as u64) & self.mask as u64) as usize;
             let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
             result.push(value);
         }
 
         // Publish all reads at once
-        self.tail.store(tail.wrapping_add(count), Ordering::Release);
+        self.tail
+            .store(tail.wrapping_add(count as u64), Ordering::Release);
 
         result
     }
@@ -364,28 +381,14 @@ impl<T> RingBuffer<T> {
     /// [`pop_batch`]: Self::pop_batch
     #[inline]
     pub fn pop_batch_into(&self, dst: &mut Vec<T>, max: usize) -> usize {
-        #[cfg(test)]
-        {
-            let current = std::thread::current().id();
-            let mut guard = self
-                .consumer_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(tid) = *guard {
-                assert_eq!(
-                    tid, current,
-                    "SPSC violation: pop_batch_into called from multiple threads"
-                );
-            } else {
-                *guard = Some(current);
-            }
-        }
+        #[cfg(any(test, debug_assertions))]
+        let _spsc_guard = InProgressGuard::enter(&self.consumer_in_progress, "pop_batch_into");
 
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
 
         let available = head.wrapping_sub(tail);
-        let count = available.min(max);
+        let count = available.min(max as u64) as usize;
 
         if count == 0 {
             return 0;
@@ -395,22 +398,27 @@ impl<T> RingBuffer<T> {
         dst.reserve(count);
 
         for i in 0..count {
-            let index = (tail.wrapping_add(i)) & self.mask;
+            let index = (tail.wrapping_add(i as u64) & self.mask as u64) as usize;
             let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
             dst.push(value);
         }
 
-        self.tail.store(tail.wrapping_add(count), Ordering::Release);
+        self.tail
+            .store(tail.wrapping_add(count as u64), Ordering::Release);
 
         count
     }
 
     /// Get the current number of elements in the buffer.
+    ///
+    /// `head` / `tail` are `u64` regardless of target; the
+    /// in-flight count fits in `usize` because it's bounded by
+    /// `capacity - 1` which is itself a `usize`.
     #[inline]
     pub fn len(&self) -> usize {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
-        head.wrapping_sub(tail)
+        head.wrapping_sub(tail) as usize
     }
 
     /// Check if the buffer is empty.
@@ -448,20 +456,15 @@ impl<T> RingBuffer<T> {
 
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
-        // Reset thread tracking — &mut self guarantees exclusive access,
-        // so draining from any thread is safe here. unwrap_or_else
-        // recovers from poisoned mutexes (a spawned thread may have
-        // panicked during SPSC violation detection).
-        #[cfg(test)]
+        // Clear the in-progress flags before the drain so the
+        // `try_pop` calls below don't trip the consumer-side guard.
+        // `&mut self` proves we are the unique accessor here, so
+        // any non-cleared flag is leftover state from a prior
+        // panicking caller — safe to clear.
+        #[cfg(any(test, debug_assertions))]
         {
-            *self
-                .producer_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = None;
-            *self
-                .consumer_thread
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = None;
+            self.producer_in_progress.store(false, Ordering::Release);
+            self.consumer_in_progress.store(false, Ordering::Release);
         }
         // Drop any remaining elements. `&mut self` proves we are the
         // unique accessor, so the SPSC contract holds trivially.
@@ -762,73 +765,72 @@ mod tests {
         }
     }
 
-    #[cfg(test)]
+    /// BUG #78: cursors must be `u64` regardless of target pointer
+    /// width. Pre-fix `head` and `tail` were `AtomicUsize`; on
+    /// 32-bit they wrapped after 2^32 pushes and the buffer
+    /// permanently wedged once the wrapping distance exceeded
+    /// `capacity-1`. Pin the type-level invariant so a future
+    /// regression to `AtomicUsize` would fail this test.
+    ///
+    /// We can't actually push 2^32 items in a unit test, but we
+    /// CAN verify the cursor field types via `std::mem::size_of`:
+    /// `AtomicU64` is always 8 bytes, regardless of target pointer
+    /// width. (`AtomicUsize` would be 4 on 32-bit, 8 on 64-bit.)
     #[test]
-    fn test_regression_spsc_multi_producer_detected() {
-        // Regression: the SPSC ring buffer exposed &self methods with an
-        // unsafe Sync impl, meaning safe code could call try_push from
-        // multiple threads — causing silent data corruption.
-        //
-        // Fix: debug builds now track the producer/consumer thread IDs
-        // and panic on violation.
+    fn ring_buffer_cursors_are_u64_on_every_target() {
+        // Confirm at the type level via size_of_val. `head` lives
+        // inside CachePadded so the alignment is the cache line
+        // size, but the inner AtomicU64 is exactly 8 bytes.
+        // We can't directly inspect head's type from a unit test,
+        // so we assert on the underlying load type — `u64` —
+        // which is the load-bearing property.
+        let buf: RingBuffer<u32> = RingBuffer::new(4);
+        let head_val: u64 = buf.head.load(Ordering::Relaxed);
+        let tail_val: u64 = buf.tail.load(Ordering::Relaxed);
+        assert_eq!(head_val, 0);
+        assert_eq!(tail_val, 0);
+        // `wrapping_sub` returns u64 — type-level pin (this would
+        // fail to compile if the cursors were AtomicUsize on a
+        // 32-bit target).
+        let len: u64 = head_val.wrapping_sub(tail_val);
+        assert_eq!(len, 0);
+    }
+
+    /// Pin the new SPSC-tripwire semantics: SEQUENTIAL cross-thread
+    /// access is allowed (it's exactly what tokio multi-threaded
+    /// runtimes do — a task migrates between OS threads across
+    /// `await` points; the outer `Shard` mutex serializes the calls,
+    /// which IS the SPSC-safe pattern). Pre-fix the tripwire was
+    /// thread-identity-based and falsely fired on any task migration,
+    /// causing `bus_shutdown_drain` and `ffi_shutdown_race` to fail
+    /// on master under multi-threaded runtimes.
+    #[test]
+    fn sequential_cross_thread_push_is_allowed() {
         use std::sync::Arc;
         use std::thread;
 
         let buf = Arc::new(RingBuffer::new(1024));
 
-        // Pin the producer identity from thread A
+        // Push from this thread.
         buf.try_push(1).unwrap();
 
-        // Attempt push from thread B — should panic inside the thread
+        // Push from a different thread, AFTER the first push has
+        // returned. This is sequential, not concurrent — SPSC-safe.
+        // Pre-fix this panicked because the tripwire pinned the OS
+        // thread identity; post-fix it's allowed.
         let buf2 = buf.clone();
-        let result = thread::spawn(move || {
-            buf2.try_push(2).unwrap();
-        })
-        .join();
+        let result = thread::spawn(move || buf2.try_push(2).unwrap()).join();
 
         assert!(
-            result.is_err(),
-            "SPSC violation should be detected when two threads push"
+            result.is_ok(),
+            "sequential cross-thread push must be allowed (the SPSC \
+             contract is about non-concurrency, not thread identity — \
+             tokio task migration must not trip the tripwire)",
         );
     }
 
-    /// Regression: BUG_REPORT.md #35 — `evict_oldest` previously
-    /// had no debug-build thread guard, so a future refactor that
-    /// called it from the consumer thread (or a third thread) would
-    /// silently corrupt SPSC state with no compile- or test-time
-    /// signal. The fix makes `evict_oldest` track the producer
-    /// thread the same way `try_push` does. This test pins the
-    /// guard by spawning a second thread that calls `evict_oldest`
-    /// after the first thread already pinned the producer identity
-    /// via `try_push`.
-    #[cfg(test)]
     #[test]
-    fn test_regression_evict_oldest_thread_guard() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let buf = Arc::new(RingBuffer::new(4));
-        // Pin producer identity via try_push from this thread.
-        buf.try_push(1).unwrap();
-
-        // Different thread calling evict_oldest should panic.
-        let buf2 = buf.clone();
-        let result = thread::spawn(move || {
-            let _ = buf2.evict_oldest();
-        })
-        .join();
-
-        assert!(
-            result.is_err(),
-            "evict_oldest must panic when called from a non-producer \
-             thread (BUG_REPORT.md #35)"
-        );
-    }
-
-    #[cfg(test)]
-    #[test]
-    fn test_regression_spsc_multi_consumer_detected() {
-        // Same as above but for the consumer side.
+    fn sequential_cross_thread_pop_is_allowed() {
         use std::sync::Arc;
         use std::thread;
 
@@ -836,19 +838,134 @@ mod tests {
         buf.try_push(1).unwrap();
         buf.try_push(2).unwrap();
 
-        // Pin the consumer identity from thread A
         let _ = buf.try_pop();
 
-        // Attempt pop from thread B — should panic inside the thread
         let buf2 = buf.clone();
-        let result = thread::spawn(move || {
-            let _ = buf2.try_pop();
-        })
-        .join();
+        let result = thread::spawn(move || buf2.try_pop()).join();
 
         assert!(
-            result.is_err(),
-            "SPSC violation should be detected when two threads pop"
+            result.is_ok(),
+            "sequential cross-thread pop must be allowed",
         );
     }
+
+    #[test]
+    fn sequential_cross_thread_evict_oldest_is_allowed() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let buf = Arc::new(RingBuffer::new(4));
+        buf.try_push(1).unwrap();
+
+        let buf2 = buf.clone();
+        let result = thread::spawn(move || buf2.evict_oldest()).join();
+
+        assert!(
+            result.is_ok(),
+            "sequential cross-thread evict_oldest must be allowed",
+        );
+    }
+
+    /// Regression: a real SPSC violation IS a concurrent call.
+    /// Simulate it by pre-setting the in-progress flag (modelling
+    /// "another caller is mid-execution") and verify the tripwire
+    /// fires. This is the deterministic version of the race-test
+    /// further down — same invariant, no scheduling dependency.
+    #[test]
+    fn concurrent_producer_panics_via_simulated_in_progress_flag() {
+        let buf = RingBuffer::<i32>::new(8);
+
+        // Simulate "another producer is mid-call" by setting the
+        // in-progress flag.
+        buf.producer_in_progress.store(true, Ordering::Release);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            buf.try_push(1).unwrap();
+        }));
+        assert!(
+            result.is_err(),
+            "try_push must panic when a producer is already in-progress (real SPSC violation)",
+        );
+
+        // Restore the flag so `Drop` doesn't trip its own assertion
+        // when the buffer is destroyed.
+        buf.producer_in_progress.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn concurrent_consumer_panics_via_simulated_in_progress_flag() {
+        let buf = RingBuffer::<i32>::new(8);
+        buf.try_push(1).unwrap();
+
+        buf.consumer_in_progress.store(true, Ordering::Release);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = buf.try_pop();
+        }));
+        assert!(
+            result.is_err(),
+            "try_pop must panic when a consumer is already in-progress",
+        );
+
+        buf.consumer_in_progress.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn concurrent_evict_oldest_panics_via_simulated_in_progress_flag() {
+        let buf = RingBuffer::<i32>::new(4);
+        buf.try_push(1).unwrap();
+
+        // `evict_oldest` shares the producer-side flag (it's a
+        // producer-side operation that runs from the
+        // `BackpressureMode::DropOldest` retry path on the producer
+        // thread). A concurrent `try_push` or another `evict_oldest`
+        // is a real SPSC violation.
+        buf.producer_in_progress.store(true, Ordering::Release);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = buf.evict_oldest();
+        }));
+        assert!(
+            result.is_err(),
+            "evict_oldest must panic when a producer is already in-progress",
+        );
+
+        buf.producer_in_progress.store(false, Ordering::Release);
+    }
+
+    /// The in-progress guard MUST clear the flag on Drop, so an
+    /// early-return inside the work block (or a panic) doesn't
+    /// permanently latch the tripwire on. Pin this directly: the
+    /// `count == 0` early-return path in `pop_batch_into` exits
+    /// without touching the buffer; the next call must succeed.
+    #[test]
+    fn guard_releases_flag_on_early_return() {
+        let buf = RingBuffer::<i32>::new(4);
+        let mut scratch = Vec::new();
+
+        // Empty buffer → early return at `count == 0`.
+        let popped = buf.pop_batch_into(&mut scratch, 8);
+        assert_eq!(popped, 0);
+
+        // Flag must have been cleared by the guard's Drop.
+        assert!(
+            !buf.consumer_in_progress.load(Ordering::Acquire),
+            "in-progress flag must be cleared on early return",
+        );
+
+        // A subsequent call from a different thread must succeed
+        // (would panic if the flag was still set).
+        buf.try_push(42).unwrap();
+        assert_eq!(buf.pop_batch_into(&mut scratch, 8), 1);
+    }
+
+    // A panic-during-work test would require either an injection
+    // hook in `try_push` (we don't add production-code seams for
+    // tests) or a custom `T` whose drop panics inside the unsafe
+    // write. Both options bring more risk than they buy. The
+    // RAII-correctness of the guard is mechanical: `InProgressGuard`
+    // implements `Drop` that unconditionally clears the flag, and
+    // `Drop` runs on unwind regardless of where in the function the
+    // panic originates. The early-return test above covers the
+    // non-panic teardown path; the unwind path is structural.
 }

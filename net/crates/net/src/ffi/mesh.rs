@@ -135,6 +135,11 @@ fn token_err_to_code(e: &CoreTokenError) -> c_int {
         CoreTokenError::DelegationExhausted => NET_ERR_TOKEN_DELEGATION_EXHAUSTED,
         CoreTokenError::DelegationNotAllowed => NET_ERR_TOKEN_DELEGATION_NOT_ALLOWED,
         CoreTokenError::NotAuthorized => NET_ERR_TOKEN_NOT_AUTHORIZED,
+        // Maps to `NET_ERR_IDENTITY` since a public-only keypair
+        // is fundamentally an identity-availability issue, not a
+        // token-content issue. The error message in `Display`
+        // makes the cause clear to the caller.
+        CoreTokenError::ReadOnly => NET_ERR_IDENTITY,
     }
 }
 
@@ -143,16 +148,32 @@ fn token_err_to_code(e: &CoreTokenError) -> c_int {
 // =========================================================================
 
 /// Shared tokio runtime. One per process, lazy-initialized.
+///
+/// On `tokio::Builder::build()` failure (worker-thread
+/// `pthread_create` failure under `RLIMIT_NPROC` / container
+/// limits / memory pressure) we `eprintln! + std::process::abort()`
+/// rather than panic. `abort` is `extern "C"`-safe (terminates
+/// rather than unwinds), so the failure cannot escape across the
+/// surrounding `extern "C"` FFI frame into C / Go-cgo / NAPI /
+/// PyO3 callers — that would be undefined behaviour. A daemon
+/// that can't construct its async runtime is dead in the water,
+/// so termination is the appropriate response.
 fn runtime() -> &'static Arc<Runtime> {
     use std::sync::OnceLock;
     static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
     RT.get_or_init(|| {
-        Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("mesh ffi tokio runtime"),
-        )
+        match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => Arc::new(rt),
+            Err(e) => {
+                eprintln!(
+                    "FATAL: mesh FFI tokio runtime build failure ({e:?}); aborting to avoid panic across the FFI boundary"
+                );
+                std::process::abort();
+            }
+        }
     })
 }
 
@@ -1695,8 +1716,23 @@ fn alloc_bytes(src: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> c_int 
         }
         return 0;
     }
-    // Layout::array for u8 cannot overflow for any valid usize.
-    let layout = std::alloc::Layout::array::<u8>(len).expect("byte layout");
+    // `Layout::array::<u8>(len)` rejects `len > isize::MAX` (the
+    // documented bound — NOT `usize::MAX`). The current call
+    // sites stay well under that limit because `to_bytes()`
+    // produces token-sized payloads, so the failure mode is
+    // unreachable today; defending against it here also keeps the
+    // helper safe to reuse from non-token code paths in the
+    // future. A panic here would unwind across the surrounding
+    // `extern "C"` boundary.
+    let layout = match std::alloc::Layout::array::<u8>(len) {
+        Ok(l) => l,
+        // Reuse the closest sentinel we have — `NET_ERR_IDENTITY`
+        // covers the only call sites today (token/identity helpers
+        // that delegate to `alloc_bytes`). The negative integer is
+        // an FFI-safe error code; the alternative `panic!` would
+        // unwind across `extern "C"`.
+        Err(_) => return NET_ERR_IDENTITY,
+    };
     let ptr = unsafe { std::alloc::alloc(layout) };
     if ptr.is_null() {
         std::alloc::handle_alloc_error(layout);
@@ -1713,12 +1749,30 @@ fn alloc_bytes(src: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> c_int 
 /// returned by reference, etc.). The `len` argument MUST match the
 /// length returned by the allocating call — the buffer was allocated
 /// with `Layout::array::<u8>(len)` and is freed with the same layout.
+///
+/// We silently no-op on `len > isize::MAX`: the allocation that
+/// produced `ptr` could not have come from this process under that
+/// layout (the allocator would have rejected the matching
+/// `alloc`), so any such call is already memory-corruption
+/// territory and the safest response is to abandon the free rather
+/// than unwind. `net_free_bytes` is `extern "C"` with no
+/// `catch_unwind` shim, so a panic would unwind across the FFI
+/// boundary into a C / Go-cgo / NAPI / PyO3 caller — undefined
+/// behaviour.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_free_bytes(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
         return;
     }
-    let layout = std::alloc::Layout::array::<u8>(len).expect("byte layout");
+    // Reject `len > isize::MAX` before calling `Layout::array`. The
+    // allocating call paired with this free uses the same layout and
+    // would itself have failed for any such `len`, so a buffer
+    // matching this `len` cannot have come from us; treat as a no-op
+    // rather than panic across the FFI boundary.
+    let layout = match std::alloc::Layout::array::<u8>(len) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
     unsafe {
         std::alloc::dealloc(ptr, layout);
     }
@@ -1935,14 +1989,22 @@ pub extern "C" fn net_identity_issue_token(
         return NET_ERR_IDENTITY;
     };
     let h = unsafe { &*signer };
-    let token = PermissionToken::issue(
+    // Route through `try_issue` so a public-only signer keypair
+    // (post-migration zeroize, etc.) surfaces as
+    // `TokenError::ReadOnly` → `NET_ERR_IDENTITY` instead of
+    // panic-unwinding across this `extern "C"` frame into the
+    // caller's binding.
+    let token = match PermissionToken::try_issue(
         &h.keypair,
         subject_id,
         scope,
         channel_hash,
         u64::from(ttl_seconds),
         delegation_depth,
-    );
+    ) {
+        Ok(t) => t,
+        Err(e) => return token_err_to_code(&e),
+    };
     alloc_bytes(&token.to_bytes(), out_token, out_token_len)
 }
 
@@ -2696,7 +2758,7 @@ fn scope_filter_from_json(f: ScopeFilterJson) -> ScopeFilterOwned {
             // empty announcements, so a query containing `[""]`
             // would never match a real tenant and would only pin
             // to Global candidates. Fall back to Any when cleaned
-            // list is empty (Cubic P2).
+            // list is empty.
             Some(ts) => {
                 let cleaned: Vec<String> = ts.into_iter().filter(|t| !t.is_empty()).collect();
                 if cleaned.is_empty() {
@@ -2712,7 +2774,7 @@ fn scope_filter_from_json(f: ScopeFilterJson) -> ScopeFilterOwned {
             _ => ScopeFilterOwned::Any,
         },
         "regions" => match f.regions {
-            // Same reasoning as `tenants` above (Cubic P2).
+            // Same reasoning as `tenants` above.
             Some(rs) => {
                 let cleaned: Vec<String> = rs.into_iter().filter(|r| !r.is_empty()).collect();
                 if cleaned.is_empty() {
@@ -3035,6 +3097,36 @@ mod tests {
         // not try to free it, since we never allocated.
         let mut sentinel: u8 = 0;
         net_free_bytes(&mut sentinel as *mut u8, 0);
+    }
+
+    /// BUG #58: `net_free_bytes` must NOT panic when called with a
+    /// `len` larger than `isize::MAX`. Pre-fix
+    /// `Layout::array::<u8>(len).expect(...)` panicked on such
+    /// values (a documented `Layout::array` failure mode); the
+    /// panic would unwind across the `extern "C"` boundary into
+    /// any non-Rust caller (C / Go-cgo / NAPI / PyO3) — undefined
+    /// behaviour. Now the function silently no-ops on
+    /// `Layout::array` failure: an allocation of that size could
+    /// not have come from this process under matching layout
+    /// rules, so it's already memory-corruption territory and
+    /// abandoning the free is the safest response.
+    #[test]
+    fn net_free_bytes_does_not_panic_on_oversized_len() {
+        // We can't actually allocate a buffer of `isize::MAX + 1`
+        // bytes to free; the fix's load-bearing check is that the
+        // function reaches the `Err(_) => return` branch instead
+        // of panicking. Pass a non-null pointer with an oversized
+        // len; with the old `expect("byte layout")` this panics.
+        // We use a stack sentinel as the pointer — the function
+        // must short-circuit without touching it.
+        let mut sentinel: u8 = 0;
+        let ptr = &mut sentinel as *mut u8;
+        // `usize::MAX` is well past `isize::MAX`, so
+        // `Layout::array::<u8>(usize::MAX)` is `Err(LayoutError)`.
+        net_free_bytes(ptr, usize::MAX);
+        // If we got here without panicking, the fix is in place.
+        // Sentinel must still be untouched (we never tried to free).
+        assert_eq!(sentinel, 0, "sentinel must not have been written through");
     }
 
     /// Regression for a cubic-flagged P1: `net_mesh_shutdown`

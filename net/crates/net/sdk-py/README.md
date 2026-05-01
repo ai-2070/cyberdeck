@@ -123,6 +123,38 @@ node = NetNode(
     mesh_role='initiator',
     mesh_peer_public_key='...',
 )
+
+# Persistent producer nonce — required for cross-restart
+# dedup against JetStream / Redis adapters. The bus loads (or
+# creates on first run) a u64 nonce at this path and stamps it on
+# every batch, so retries from a crashed-and-restarted producer
+# are recognized by the backend's dedup window.
+node = NetNode(
+    shards=4,
+    redis_url='redis://localhost:6379',
+    producer_nonce_path='/var/lib/myapp/producer.nonce',
+)
+```
+
+## Redis Streams consumer-side dedup helper
+
+The Redis adapter writes a stable `dedup_id` field on every XADD
+entry — see [`bindings/python/README.md`](../bindings/python/README.md#redis-streams-consumer-side-dedup-helper)
+for the full contract. `RedisStreamDedup` is exposed on the
+underlying `net` PyO3 module; `sdk-py`'s `NetNode` wrapper does
+not yet re-export it (tracked in `SDK_PYTHON_PARITY_PLAN.md`).
+Import directly:
+
+```python
+from net import RedisStreamDedup
+
+dedup = RedisStreamDedup(capacity=64_000)
+
+# Read entries from your Redis client of choice; pull the
+# `dedup_id` field from each entry and test-and-insert.
+for entry_id, fields in r.xrange("net:shard:0", "0", "+"):
+    if not dedup.is_duplicate(fields[b"dedup_id"].decode()):
+        process(entry_id, fields)
 ```
 
 ## NAT Traversal (optimization, not correctness)

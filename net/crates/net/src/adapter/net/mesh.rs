@@ -126,6 +126,76 @@ fn graph_id_to_node_id(graph_id: &[u8; 32]) -> u64 {
 /// as if the network link is severed.
 pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
 
+/// Cancellation-safe rollback for a freshly registered peer
+/// session + addr map + routing entry.
+///
+/// `handle_routed_handshake` schedules its msg2 send on a
+/// background task, so the rollback path must survive task drop.
+/// A fire-and-forget `tokio::spawn` whose only rollback was inside
+/// the spawned future's error arm would skip the rollback if that
+/// future was cancelled (runtime shutdown, parent task abort)
+/// before the send completed — the responder would keep session
+/// keys the initiator never received the matching msg2 for,
+/// wedged forever with no idle sweeper to reap it.
+///
+/// This guard moves the rollback into `Drop`, which runs
+/// synchronously whenever the spawned future is dropped. The
+/// successful-send arm calls `commit()` to consume the guard
+/// without invoking `Drop` (`std::mem::forget`); cancellation,
+/// panic, or any non-success path lets the guard drop naturally,
+/// and `Drop` reverts all three registrations.
+struct PeerRegistrationGuard {
+    peer_node_id: u64,
+    registered_next_hop: SocketAddr,
+    peers: Arc<DashMap<u64, PeerInfo>>,
+    peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    router: Arc<NetRouter>,
+}
+
+impl PeerRegistrationGuard {
+    /// Mark the registration as durable. Drops `self` *without*
+    /// running the rollback — the post-handshake send completed
+    /// successfully, so the registrations should stay in place.
+    fn commit(self) {
+        // `mem::forget` skips `Drop`. The Arc fields would
+        // normally decrement on drop, but since we want them
+        // alive (they're shared with the rest of the bus), we
+        // need to drop them manually before forgetting the
+        // wrapper. SAFETY: reading the Arc fields out of the
+        // struct via `ptr::read` and forgetting the rest is the
+        // standard cancel-Drop pattern.
+        let me = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `me` is `ManuallyDrop`, so its fields won't be
+        // dropped automatically. We read them out and let them
+        // drop normally, which decrements the Arc strong counts
+        // — exactly what would happen on a non-guarded path.
+        unsafe {
+            let _peers = std::ptr::read(&me.peers);
+            let _peer_addrs = std::ptr::read(&me.peer_addrs);
+            let _router = std::ptr::read(&me.router);
+        }
+    }
+}
+
+impl Drop for PeerRegistrationGuard {
+    fn drop(&mut self) {
+        // Match the original inline rollback's semantics: only
+        // remove entries whose addr / next-hop still equals the
+        // value we wrote. A concurrent retry for the same peer
+        // may have already replaced them with a fresh, valid
+        // registration — we must not overwrite that.
+        self.peers.remove_if(&self.peer_node_id, |_, pi| {
+            pi.addr == self.registered_next_hop
+        });
+        self.peer_addrs.remove_if(&self.peer_node_id, |_, addr| {
+            *addr == self.registered_next_hop
+        });
+        self.router
+            .routing_table()
+            .remove_route_if_next_hop_is(self.peer_node_id, self.registered_next_hop);
+    }
+}
+
 /// Shared context for the packet dispatch loop.
 struct DispatchCtx {
     local_node_id: u64,
@@ -150,6 +220,21 @@ struct DispatchCtx {
     /// In-flight initiator handshakes; dispatch completes them when a
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
+    /// In-flight DIRECT initiator handshakes, keyed by the peer's
+    /// socket address. The initiator registers a oneshot here
+    /// BEFORE sending msg1; the dispatch loop's direct-handshake
+    /// branch looks up the source, forwards the parsed payload
+    /// bytes through the oneshot, and removes the entry.
+    ///
+    /// Polling `socket_arc.recv_from` directly from
+    /// `try_handshake_initiator` would race the dispatch receive
+    /// loop spawned by `start()` — tokio dispatches each datagram
+    /// to exactly one waiter, so the handshake response could be
+    /// swallowed by either side. If no entry matches the source
+    /// (e.g., the
+    /// responder side or pre-start invocations), the dispatcher
+    /// falls through to its drop-direct-handshake behaviour.
+    pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
     /// Our Noise static keypair — needed to construct responder state
     /// when a routed msg1 arrives for us.
     static_keypair: StaticKeypair,
@@ -919,6 +1004,12 @@ pub struct MeshNode {
     /// node_id. Populated by `connect_via`; consumed by the dispatch
     /// loop when the matching msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
+    /// In-flight direct-handshake initiators, keyed by the peer's
+    /// `SocketAddr`. Populated by `try_handshake_initiator` BEFORE
+    /// sending msg1; consumed by the dispatch loop when a matching
+    /// direct handshake response arrives. See the matching field
+    /// on `DispatchCtx` for context.
+    pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
     /// Proximity graph — topology awareness from pingwave propagation
     proximity_graph: Arc<ProximityGraph>,
     /// Automatic reroute policy
@@ -1126,6 +1217,16 @@ pub struct MeshNode {
     shutdown_notify: Arc<Notify>,
     /// Whether the node has been started
     started: AtomicBool,
+    /// Number of `accept()` calls currently awaiting
+    /// `handshake_responder`. A simple `started.load(Acquire)`
+    /// guard at `accept` entry is a TOCTOU — `start()` could fire
+    /// between the check and the `handshake_responder` poll, after
+    /// which the dispatcher would race the responder for inbound
+    /// msg1 packets and silently swallow them. The counter closes
+    /// the race: `accept()` increments on entry, decrements on
+    /// exit, and `start()` refuses while any `accept()` is in
+    /// flight.
+    accept_in_flight: std::sync::atomic::AtomicUsize,
 }
 
 impl MeshNode {
@@ -1297,6 +1398,8 @@ impl MeshNode {
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
         let pending_handshakes: Arc<DashMap<u64, PendingHandshake>> = Arc::new(DashMap::new());
+        let pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>> =
+            Arc::new(DashMap::new());
 
         // Hoist the subnet knobs before `config` is moved into the
         // struct literal; the publish + subscribe paths read these
@@ -1325,6 +1428,7 @@ impl MeshNode {
             inbound: Arc::new(DashMap::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
+            pending_direct_initiators,
             proximity_graph,
             reroute_policy,
             peer_addrs,
@@ -1381,6 +1485,7 @@ impl MeshNode {
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             started: AtomicBool::new(false),
+            accept_in_flight: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1675,7 +1780,62 @@ impl MeshNode {
     ///
     /// Waits for an incoming handshake packet and completes the handshake.
     /// Returns the peer's address and assigns the given node_id.
+    ///
+    /// # Ordering contract
+    ///
+    /// `accept()` MUST be called before [`Self::start()`]. Once
+    /// `start()` has spawned the dispatch loop, the dispatcher
+    /// consumes every inbound UDP datagram from the shared socket;
+    /// `try_handshake_responder` polls the same socket directly and
+    /// races the dispatcher for incoming msg1 packets. Because no
+    /// per-pending-responder registry exists today (initiator-side
+    /// handshakes use one — see `pending_direct_initiators` at
+    /// `mesh.rs:~1216`; the responder side is a deferred design item),
+    /// a `start() → accept()` ordering produces a swallowed msg1 and
+    /// a hang. To prevent that hang silently turning into a debugging
+    /// nightmare, calling `accept()` after `start()` now returns an
+    /// explicit error rather than spinning forever.
     pub async fn accept(&self, peer_node_id: u64) -> Result<(SocketAddr, u64), AdapterError> {
+        use std::sync::atomic::Ordering as AtOrd;
+
+        // Race-free entry guard. Increment `accept_in_flight`
+        // BEFORE checking `started`. `start()` checks
+        // `accept_in_flight` after its CAS and refuses, so the
+        // windows are ordered: accept either sees `started=true`
+        // and bails OUT (so accept_in_flight goes back to 0 and
+        // start sees 0), or `start` sees accept_in_flight > 0 and
+        // refuses to run. Reasoning is symmetric to a
+        // reader-writer SeqCst handshake: the SeqCst total order
+        // on these two atomics makes "either accept observes
+        // start and bails, or start observes accept and refuses"
+        // mutually exclusive. A bare `started.load(Acquire)` check
+        // would be a TOCTOU: `start()` could fire between the
+        // check and `handshake_responder`'s recv_from, after
+        // which the dispatcher would race the responder for
+        // msg1.
+        //
+        // RAII guard `AcceptGuard` decrements on drop so any
+        // early-return (Err from handshake_responder, panic in
+        // session construction, future cancellation) doesn't
+        // leak the in-flight count.
+        struct AcceptGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for AcceptGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, AtOrd::AcqRel);
+            }
+        }
+
+        self.accept_in_flight.fetch_add(1, AtOrd::AcqRel);
+        let _guard = AcceptGuard(&self.accept_in_flight);
+
+        if self.started.load(AtOrd::SeqCst) {
+            return Err(AdapterError::Fatal(
+                "Mesh::accept called after start() — the dispatch loop is already \
+                 consuming inbound packets and would race the responder handshake. \
+                 Call accept() for every peer BEFORE invoking start()."
+                    .into(),
+            ));
+        }
         let (keys, peer_addr) = self.handshake_responder(peer_node_id).await?;
 
         let remote_static_pub = keys.remote_static_pub;
@@ -1717,9 +1877,40 @@ impl MeshNode {
     ///
     /// Must be called after `connect()` / `accept()` to begin processing
     /// inbound packets.
+    ///
+    /// Refuses (no-op return) if any `accept()` call is currently
+    /// in flight. Symmetric to `accept`'s contract: either
+    /// `accept` observes `started=true` and bails (in-flight
+    /// count goes to 0, then `start` proceeds), or `start`
+    /// observes `accept_in_flight > 0` and refuses. The SeqCst
+    /// orderings make this mutually exclusive. Without this
+    /// counter check, `start` could fire between `accept`'s
+    /// `started.load` and its `handshake_responder` poll, after
+    /// which the dispatcher would race the responder for the
+    /// inbound msg1.
     pub fn start(&self) {
-        if self.started.swap(true, Ordering::AcqRel) {
+        use std::sync::atomic::Ordering as AtOrd;
+        if self.started.swap(true, AtOrd::SeqCst) {
             return; // already started
+        }
+        // After flipping `started`, observe `accept_in_flight`.
+        // If any accept is mid-handshake, roll back and refuse.
+        // The accept side either saw our SeqCst store before
+        // its load (and bailed cleanly) or saw it after (and
+        // we see its incremented counter). Spurious "concurrent
+        // start + accept" is rare in production (start is
+        // typically called once at boot), but the rollback
+        // keeps semantics honest.
+        if self.accept_in_flight.load(AtOrd::SeqCst) > 0 {
+            // Roll back the flag so a subsequent `start()` after
+            // accept finishes can succeed normally.
+            self.started.store(false, AtOrd::SeqCst);
+            tracing::warn!(
+                "MeshNode::start() called while an accept() is in flight — \
+                 refusing to start the dispatch loop to avoid racing the \
+                 responder handshake. Retry start() after accept() returns."
+            );
+            return;
         }
 
         let recv_handle = self.spawn_receive_loop();
@@ -2045,6 +2236,7 @@ impl MeshNode {
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
             pending_handshakes: self.pending_handshakes.clone(),
+            pending_direct_initiators: self.pending_direct_initiators.clone(),
             static_keypair: self.static_keypair.clone(),
             psk: self.config.psk,
             socket: self.socket.clone(),
@@ -2342,6 +2534,19 @@ impl MeshNode {
         };
 
         if parsed.header.flags.is_handshake() {
+            // If a direct initiator has registered an oneshot
+            // keyed by this source, forward the parsed payload
+            // bytes through it. Otherwise (no entry, e.g.
+            // responder side or unsolicited handshake) fall
+            // through to drop. Without this routing, polling
+            // `socket_arc.recv_from` directly from
+            // `try_handshake_initiator` would race this dispatch
+            // loop — tokio routes a UDP datagram to exactly one
+            // waiter — and the response could be swallowed by
+            // either consumer.
+            if let Some((_, tx)) = ctx.pending_direct_initiators.remove(&source) {
+                let _ = tx.send(parsed.payload);
+            }
             return;
         }
 
@@ -2365,8 +2570,24 @@ impl MeshNode {
         };
 
         if parsed.header.flags.is_heartbeat() {
+            // `verify_and_touch_heartbeat` fuses AEAD verify with
+            // `session.touch()` so a future caller can't reorder
+            // them or forget to touch on success — the type
+            // system enforces verify-then-touch atomically.
+            // Fast-pathing the heartbeat without verifying the
+            // AEAD tag would let an attacker with the cleartext
+            // `session_id` (visible on every prior data packet)
+            // and the source UDP address spoof heartbeats from
+            // `peer_addr`, indefinitely defeating session-idle
+            // timeout and injecting false
+            // `failure_detector.heartbeat(...)` notifications.
+            // The failure-detector callback is mesh-specific
+            // (legacy adapter has no such observer) and stays
+            // here, after a successful verify.
+            if !session.verify_and_touch_heartbeat(&parsed) {
+                return;
+            }
             failure_detector.heartbeat(peer_node_id, source);
-            session.touch();
             return;
         }
 
@@ -2544,27 +2765,45 @@ impl MeshNode {
         // pointing at `source` — if a concurrent handshake for the same
         // `peer_node_id` already installed a newer (valid) route, we must
         // not overwrite it.
+        //
+        // A Drop guard owns the rollback. The send marks the
+        // guard `completed` only on success; cancellation, panic,
+        // or any non-success drops the guard, which runs the
+        // rollback. Drop is invoked synchronously when the spawned
+        // future is dropped (whether by cancellation or normal
+        // completion), so the rollback is no longer dependent on
+        // the future actually awaiting through to its error arm.
+        // A fire-and-forget `tokio::spawn` with rollback only
+        // inside the spawned future on socket-send error would
+        // skip the rollback if the runtime was shutting down or
+        // the task was cancelled before the send completed,
+        // leaving the peer/session/route in an unsendable state.
         let socket = ctx.socket.clone();
-        let peers = ctx.peers.clone();
-        let peer_addrs = ctx.peer_addrs.clone();
-        let router = ctx.router.clone();
-        let registered_next_hop = source;
         let payload = routed.freeze();
+        let guard = PeerRegistrationGuard {
+            peer_node_id,
+            registered_next_hop: source,
+            peers: ctx.peers.clone(),
+            peer_addrs: ctx.peer_addrs.clone(),
+            router: ctx.router.clone(),
+        };
         tokio::spawn(async move {
-            if let Err(e) = socket.send_to(&payload, next_hop).await {
-                tracing::warn!(
-                    peer = format!("{:#x}", peer_node_id),
-                    error = %e,
-                    "routed handshake: msg2 send failed; unregistering peer"
-                );
-                // Only remove entries that still match what we wrote;
-                // a concurrent retry for the same peer may have already
-                // replaced them with a fresh, valid registration.
-                peers.remove_if(&peer_node_id, |_, pi| pi.addr == registered_next_hop);
-                peer_addrs.remove_if(&peer_node_id, |_, addr| *addr == registered_next_hop);
-                router
-                    .routing_table()
-                    .remove_route_if_next_hop_is(peer_node_id, registered_next_hop);
+            match socket.send_to(&payload, next_hop).await {
+                Ok(_) => {
+                    // `commit` consumes the guard via `mem::forget`,
+                    // so the rollback Drop is skipped and the
+                    // registrations stay in place.
+                    guard.commit();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        peer = format!("{:#x}", peer_node_id),
+                        error = %e,
+                        "routed handshake: msg2 send failed; unregistering peer"
+                    );
+                    // `guard` drops at end of scope, running the
+                    // rollback.
+                }
             }
         });
     }
@@ -2618,91 +2857,112 @@ impl MeshNode {
             // `ArcSwapOption::load` — lock-free on the hot path.
             let handler_guard = ctx.migration_handler.load();
             if let Some(handler) = handler_guard.as_ref() {
-                // Extract the payload from the event frame wrapper
+                // Extract the payload(s) from the event frame wrapper.
+                //
+                // Iterate every event in the frame and log a
+                // warning for the (anomalous) multi-event case.
+                // The protocol design is single-event-per-frame,
+                // but the wire format permits multi-event — a
+                // hostile (or buggy) peer batching multiple
+                // migration messages into one frame must not
+                // silently lose every message past the first;
+                // operators need to see the protocol violation
+                // rather than a silent stall.
                 let events =
                     EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-                let payload = match events.into_iter().next() {
-                    Some(data) => data,
-                    None => return,
-                };
+                if events.is_empty() {
+                    return;
+                }
+                if events.len() > 1 {
+                    tracing::warn!(
+                        n = events.len(),
+                        from_node = from_node,
+                        "migration subprotocol received multi-event frame \
+                         (protocol design is single-event per frame); \
+                         processing each message in order"
+                    );
+                }
 
-                match handler.handle_message(&payload, from_node) {
-                    Ok(outbound) => {
-                        // BFS queue: self-destined messages loop back
-                        // through the dispatcher in-place; any output
-                        // the loopback produces joins the same queue
-                        // so remote-bound follow-ups reach the socket.
-                        //
-                        // The 2-node case where orchestrator and
-                        // source/target share a node uses this path —
-                        // `peers.get(&local_node_id)` is None, so the
-                        // loopback short-circuit is the only way a
-                        // self-destined wire message gets dispatched.
-                        //
-                        // Regression (Cubic-AI P1): the earlier
-                        // implementation `tokio::spawn`ed each
-                        // loopback with a fire-and-forget closure,
-                        // discarding `handle_message`'s return value.
-                        // Any outbound produced by the loopback —
-                        // including remote-bound messages that should
-                        // have ridden the wire — disappeared, wedging
-                        // state transitions whenever a self-bounce
-                        // chained into a further reply. The in-place
-                        // queue preserves all downstream messages.
-                        //
-                        // Handler work is synchronous and cheap; doing
-                        // it on the receive-loop task is fine.
-                        let mut pending: std::collections::VecDeque<_> = outbound.into();
-                        while let Some(msg) = pending.pop_front() {
-                            if msg.dest_node == ctx.local_node_id {
-                                match handler.handle_message(&msg.payload, ctx.local_node_id) {
-                                    Ok(more) => pending.extend(more),
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "migration handler loopback error",
-                                        );
+                for payload in events {
+                    match handler.handle_message(&payload, from_node) {
+                        Ok(outbound) => {
+                            // BFS queue: self-destined messages loop back
+                            // through the dispatcher in-place; any output
+                            // the loopback produces joins the same queue
+                            // so remote-bound follow-ups reach the socket.
+                            //
+                            // The 2-node case where orchestrator and
+                            // source/target share a node uses this path —
+                            // `peers.get(&local_node_id)` is None, so the
+                            // loopback short-circuit is the only way a
+                            // self-destined wire message gets dispatched.
+                            //
+                            // The in-place queue preserves all
+                            // downstream messages. A
+                            // `tokio::spawn`ed fire-and-forget
+                            // loopback would discard
+                            // `handle_message`'s return value,
+                            // and any outbound it produced —
+                            // including remote-bound messages
+                            // that should have ridden the wire —
+                            // would disappear, wedging state
+                            // transitions whenever a self-bounce
+                            // chained into a further reply.
+                            //
+                            // Handler work is synchronous and cheap; doing
+                            // it on the receive-loop task is fine.
+                            let mut pending: std::collections::VecDeque<_> = outbound.into();
+                            while let Some(msg) = pending.pop_front() {
+                                if msg.dest_node == ctx.local_node_id {
+                                    match handler.handle_message(&msg.payload, ctx.local_node_id) {
+                                        Ok(more) => pending.extend(more),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "migration handler loopback error",
+                                            );
+                                        }
                                     }
-                                }
-                                continue;
-                            }
-                            let dest_session = ctx
-                                .peers
-                                .get(&msg.dest_node)
-                                .map(|e| (e.value().addr, e.value().session.clone()));
-
-                            if let Some((dest_addr, dest_sess)) = dest_session {
-                                // Respect partition filter on outbound path
-                                if ctx.partition_filter.contains(&dest_addr) {
                                     continue;
                                 }
-                                let socket = ctx.socket.clone();
-                                let payload = Bytes::from(msg.payload);
-                                tokio::spawn(async move {
-                                    let pool = dest_sess.thread_local_pool();
-                                    let mut builder = pool.get();
-                                    let seq = {
-                                        let stream = dest_sess
-                                            .get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
-                                        stream.next_tx_seq()
-                                    };
-                                    let events = vec![payload];
-                                    let packet = builder.build_subprotocol(
-                                        SUBPROTOCOL_MIGRATION as u64,
-                                        seq,
-                                        &events,
-                                        PacketFlags::NONE,
-                                        SUBPROTOCOL_MIGRATION,
-                                    );
-                                    let _ = socket.send_to(&packet, dest_addr).await;
-                                });
+                                let dest_session = ctx
+                                    .peers
+                                    .get(&msg.dest_node)
+                                    .map(|e| (e.value().addr, e.value().session.clone()));
+
+                                if let Some((dest_addr, dest_sess)) = dest_session {
+                                    // Respect partition filter on outbound path
+                                    if ctx.partition_filter.contains(&dest_addr) {
+                                        continue;
+                                    }
+                                    let socket = ctx.socket.clone();
+                                    let payload = Bytes::from(msg.payload);
+                                    tokio::spawn(async move {
+                                        let pool = dest_sess.thread_local_pool();
+                                        let mut builder = pool.get();
+                                        let seq = {
+                                            let stream = dest_sess
+                                                .get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
+                                            stream.next_tx_seq()
+                                        };
+                                        let events = vec![payload];
+                                        let packet = builder.build_subprotocol(
+                                            SUBPROTOCOL_MIGRATION as u64,
+                                            seq,
+                                            &events,
+                                            PacketFlags::NONE,
+                                            SUBPROTOCOL_MIGRATION,
+                                        );
+                                        let _ = socket.send_to(&packet, dest_addr).await;
+                                    });
+                                }
                             }
                         }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "migration handler error");
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "migration handler error");
-                    }
-                }
+                } // end multi-event payload loop
                 return; // handler processed it
             }
             // No handler set — synthesize a `ComputeNotSupported`
@@ -2713,8 +2973,13 @@ impl MeshNode {
             // `SnapshotReady`) — other inbound types arrive only
             // mid-migration, and a migration can't be mid-state
             // against a node that has no compute runtime.
+            //
+            // Iterate every event in the frame so a multi-event
+            // migration packet (protocol violation, but possible
+            // on the wire) gets one reply per request rather than
+            // one for the first and silent drops for the rest.
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            if let Some(payload) = events.into_iter().next() {
+            for payload in events {
                 if let Some(reply) = synthesize_compute_not_supported_reply(&payload) {
                     let dest_session = ctx
                         .peers
@@ -2752,9 +3017,19 @@ impl MeshNode {
         // `tx_credit_remaining` without touching the inbound event
         // queue. The grant payload is an event frame carrying a
         // 12-byte `StreamWindow` message.
+        //
+        // Iterate the full event vector and apply each grant. The
+        // codec supports multi-event frames, and `StreamWindow` is
+        // fixed-size at 16 bytes — there's no codec ambiguity.
+        // Using `events.into_iter().next()` would drop every
+        // grant past the first when a peer batched multiple
+        // stream credits into one event-frame packet, stalling
+        // those streams until the sender retransmitted
+        // (`apply_authoritative_grant` is monotonic so retransmits
+        // eventually catch up — efficiency loss, not data loss).
         if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_WINDOW {
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            if let Some(payload) = events.into_iter().next() {
+            for payload in events {
                 match StreamWindow::decode(&payload) {
                     Ok(grant) => {
                         // Quarantine guard: a grant that arrives for a
@@ -2785,14 +3060,18 @@ impl MeshNode {
         }
 
         // Channel membership: Subscribe / Unsubscribe / Ack.
+        //
+        // Iterate every event in the frame. `events.into_iter()
+        // .next()` would drop every membership op past the first
+        // when a peer batched multiple Subscribe/Unsubscribe
+        // events into one frame. Each membership op is
+        // independent and idempotent on the receiver, so
+        // iterating is structurally safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_CHANNEL_MEMBERSHIP {
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            let payload = match events.into_iter().next() {
-                Some(data) => data,
-                None => return,
-            };
-
-            // Resolve the sender's node_id from the session they arrived on.
+            if events.is_empty() {
+                return;
+            }
             let from_node = ctx
                 .peers
                 .iter()
@@ -2800,18 +3079,26 @@ impl MeshNode {
                 .map(|e| e.value().node_id)
                 .unwrap_or(0);
 
-            Self::handle_membership_message(&payload, from_node, ctx);
+            for payload in events {
+                Self::handle_membership_message(&payload, from_node, ctx);
+            }
             return;
         }
 
         // Capability announcement: signed, versioned capability metadata.
         // Feeds the local `CapabilityIndex`; never responded to.
+        //
+        // Iterate every event in the frame. `events.into_iter()
+        // .next()` would drop every announcement past the first
+        // when a peer batched multiple capability updates into
+        // one frame. Each announcement is independently signed
+        // and version-skip safe on the index side, so iterating
+        // is structurally safe.
         if parsed.header.subprotocol_id == SUBPROTOCOL_CAPABILITY_ANN {
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            let Some(payload) = events.into_iter().next() else {
+            if events.is_empty() {
                 return;
-            };
-
+            }
             let from_node = ctx
                 .peers
                 .iter()
@@ -2819,7 +3106,9 @@ impl MeshNode {
                 .map(|e| e.value().node_id)
                 .unwrap_or(0);
 
-            Self::handle_capability_announcement(&payload, from_node, ctx);
+            for payload in events {
+                Self::handle_capability_announcement(&payload, from_node, ctx);
+            }
             return;
         }
 
@@ -2832,11 +3121,9 @@ impl MeshNode {
         if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_REFLEX {
             use super::traversal::reflex;
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            let payload = events.into_iter().next().unwrap_or_default();
-            let Some(msg) = reflex::decode(&payload) else {
+            if events.is_empty() {
                 return;
-            };
-
+            }
             let from_node = ctx
                 .peers
                 .iter()
@@ -2847,51 +3134,64 @@ impl MeshNode {
                 return;
             }
 
-            match msg {
-                reflex::ReflexMsg::Request => {
-                    // Echo the observed source address back. Source
-                    // is read from `PeerInfo.addr` — the last
-                    // address our kernel saw packets from this peer
-                    // arrive on, equivalent to a STUN server's
-                    // "observed source" because NAT-rewriting is
-                    // applied by the time packets reach our socket.
-                    let Some((dest_addr, dest_sess)) = ctx
-                        .peers
-                        .get(&from_node)
-                        .map(|e| (e.value().addr, e.value().session.clone()))
-                    else {
-                        return;
-                    };
-                    if ctx.partition_filter.contains(&dest_addr) {
-                        return;
-                    }
-                    let response = reflex::encode_response(dest_addr);
-                    let socket = ctx.socket.clone();
-                    tokio::spawn(async move {
-                        let pool = dest_sess.thread_local_pool();
-                        let mut builder = pool.get();
-                        let seq = {
-                            let stream = dest_sess
-                                .get_or_create_stream(super::traversal::SUBPROTOCOL_REFLEX as u64);
-                            stream.next_tx_seq()
+            // Iterate every event in the frame.
+            // `events.into_iter().next()` would drop every reflex
+            // message past the first when a peer batched multiple
+            // probes into one packet. Reflex Request/Response are
+            // each independent so multi-event handling is
+            // structurally safe.
+            for payload in events {
+                let Some(msg) = reflex::decode(&payload) else {
+                    continue;
+                };
+                match msg {
+                    reflex::ReflexMsg::Request => {
+                        // Echo the observed source address back. Source
+                        // is read from `PeerInfo.addr` — the last
+                        // address our kernel saw packets from this peer
+                        // arrive on, equivalent to a STUN server's
+                        // "observed source" because NAT-rewriting is
+                        // applied by the time packets reach our socket.
+                        let Some((dest_addr, dest_sess)) = ctx
+                            .peers
+                            .get(&from_node)
+                            .map(|e| (e.value().addr, e.value().session.clone()))
+                        else {
+                            continue;
                         };
-                        let events = vec![response];
-                        let packet = builder.build_subprotocol(
-                            super::traversal::SUBPROTOCOL_REFLEX as u64,
-                            seq,
-                            &events,
-                            PacketFlags::NONE,
-                            super::traversal::SUBPROTOCOL_REFLEX,
-                        );
-                        let _ = socket.send_to(&packet, dest_addr).await;
-                    });
-                }
-                reflex::ReflexMsg::Response(observed) => {
-                    // Complete the pending probe (if any). A probe
-                    // that already timed out has no oneshot entry;
-                    // the late response is dropped silently.
-                    if let Some((_, (_gen, tx))) = ctx.pending_reflex_probes.remove(&from_node) {
-                        let _ = tx.send(observed);
+                        if ctx.partition_filter.contains(&dest_addr) {
+                            continue;
+                        }
+                        let response = reflex::encode_response(dest_addr);
+                        let socket = ctx.socket.clone();
+                        tokio::spawn(async move {
+                            let pool = dest_sess.thread_local_pool();
+                            let mut builder = pool.get();
+                            let seq = {
+                                let stream = dest_sess.get_or_create_stream(
+                                    super::traversal::SUBPROTOCOL_REFLEX as u64,
+                                );
+                                stream.next_tx_seq()
+                            };
+                            let events = vec![response];
+                            let packet = builder.build_subprotocol(
+                                super::traversal::SUBPROTOCOL_REFLEX as u64,
+                                seq,
+                                &events,
+                                PacketFlags::NONE,
+                                super::traversal::SUBPROTOCOL_REFLEX,
+                            );
+                            let _ = socket.send_to(&packet, dest_addr).await;
+                        });
+                    }
+                    reflex::ReflexMsg::Response(observed) => {
+                        // Complete the pending probe (if any). A probe
+                        // that already timed out has no oneshot entry;
+                        // the late response is dropped silently.
+                        if let Some((_, (_gen, tx))) = ctx.pending_reflex_probes.remove(&from_node)
+                        {
+                            let _ = tx.send(observed);
+                        }
                     }
                 }
             }
@@ -2912,11 +3212,9 @@ impl MeshNode {
         if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_RENDEZVOUS {
             use super::traversal::rendezvous;
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            let payload = events.into_iter().next().unwrap_or_default();
-            let Some(msg) = rendezvous::decode(&payload) else {
+            if events.is_empty() {
                 return;
-            };
-
+            }
             let from_node = ctx
                 .peers
                 .iter()
@@ -2927,43 +3225,57 @@ impl MeshNode {
                 return;
             }
 
-            match msg {
-                rendezvous::RendezvousMsg::PunchRequest(req) => {
-                    Self::handle_punch_request(from_node, req, ctx);
-                }
-                rendezvous::RendezvousMsg::PunchIntroduce(intro) => {
-                    // Endpoint side of the rendezvous. Complete
-                    // any installed observer waiter (for tests /
-                    // explicit awaits), then schedule the
-                    // keep-alive train + observer. The
-                    // `PunchAck` fires only once the observer
-                    // sees inbound traffic from `peer_reflex`
-                    // (or — on localhost — at the punch_deadline
-                    // fallback). Plan §3 endpoint semantics.
-                    if let Some((_, (_gen, tx))) = ctx.pending_punch_introduces.remove(&intro.peer)
-                    {
-                        let _ = tx.send(intro);
+            // Iterate every event in the frame.
+            // `events.into_iter().next()` would drop every
+            // rendezvous message past the first when a peer
+            // batched PunchRequest / PunchIntroduce / PunchAck
+            // into one packet. Each is independent — no
+            // cross-event ordering dependency — so multi-event
+            // handling is structurally safe.
+            for payload in events {
+                let Some(msg) = rendezvous::decode(&payload) else {
+                    continue;
+                };
+                match msg {
+                    rendezvous::RendezvousMsg::PunchRequest(req) => {
+                        Self::handle_punch_request(from_node, req, ctx);
                     }
-                    Self::schedule_punch(from_node, intro, ctx);
-                }
-                rendezvous::RendezvousMsg::PunchAck(ack) => {
-                    if ack.to_peer == ctx.local_node_id {
-                        // Final recipient: complete the correlation
-                        // oneshot keyed by `from_peer`. A late ack
-                        // for an abandoned `connect_direct` is
-                        // dropped silently.
-                        if let Some((_, (_gen, tx))) = ctx.pending_punch_acks.remove(&ack.from_peer)
+                    rendezvous::RendezvousMsg::PunchIntroduce(intro) => {
+                        // Endpoint side of the rendezvous. Complete
+                        // any installed observer waiter (for tests /
+                        // explicit awaits), then schedule the
+                        // keep-alive train + observer. The
+                        // `PunchAck` fires only once the observer
+                        // sees inbound traffic from `peer_reflex`
+                        // (or — on localhost — at the punch_deadline
+                        // fallback). Plan §3 endpoint semantics.
+                        if let Some((_, (_gen, tx))) =
+                            ctx.pending_punch_introduces.remove(&intro.peer)
                         {
-                            let _ = tx.send(ack);
+                            let _ = tx.send(intro);
                         }
-                    } else {
-                        // Coordinator role: forward verbatim to
-                        // `to_peer` via our session with that
-                        // peer. The forwarded ack keeps the same
-                        // bytes — `from_peer` still points at the
-                        // original sender, which is what the
-                        // recipient correlates on.
-                        Self::forward_punch_ack(ack, ctx);
+                        Self::schedule_punch(from_node, intro, ctx);
+                    }
+                    rendezvous::RendezvousMsg::PunchAck(ack) => {
+                        if ack.to_peer == ctx.local_node_id {
+                            // Final recipient: complete the correlation
+                            // oneshot keyed by `from_peer`. A late ack
+                            // for an abandoned `connect_direct` is
+                            // dropped silently.
+                            if let Some((_, (_gen, tx))) =
+                                ctx.pending_punch_acks.remove(&ack.from_peer)
+                            {
+                                let _ = tx.send(ack);
+                            }
+                        } else {
+                            // Coordinator role: forward verbatim to
+                            // `to_peer` via our session with that
+                            // peer. The forwarded ack keeps the same
+                            // bytes — `from_peer` still points at the
+                            // original sender, which is what the
+                            // recipient correlates on.
+                            Self::forward_punch_ack(ack, ctx);
+                        }
                     }
                 }
             }
@@ -3166,10 +3478,20 @@ impl MeshNode {
                                 continue;
                             }
                             let session = &entry.value().session;
-                            let mut builder =
-                                PacketBuilder::new(&[0u8; 32], session.session_id());
-                            // Heartbeat
-                            let packet = builder.build_heartbeat();
+                            // `Session::build_heartbeat` routes
+                            // through `thread_local_pool` (same
+                            // pool the data path uses) so
+                            // heartbeats and data share a single
+                            // `tx_counter`. Constructing a fresh
+                            // `PacketBuilder::new(&[0u8; 32],
+                            // session.session_id())` per heartbeat
+                            // would (a) use the wrong key so the
+                            // receiver's AEAD verify would reject
+                            // every tag, and (b) reuse counter=0
+                            // across heartbeats so the replay
+                            // window would reject every heartbeat
+                            // after the first.
+                            let packet = session.build_heartbeat();
                             let _ = socket.send_to(&packet, peer_addr).await;
                             // Pingwave (raw UDP — not encrypted, topology is public)
                             let _ = socket.send_to(&pw_bytes, peer_addr).await;
@@ -5006,8 +5328,8 @@ impl MeshNode {
         // set/clear/commit could interleave between our reads
         // and let us publish a torn state — e.g., the new
         // override's reflex paired with the pre-override NAT
-        // class. Cubic P1. The lock is held only for the two
-        // atomic reads, not across the signing or network send.
+        // class. The lock is held only for the two atomic reads,
+        // not across the signing or network send.
         #[cfg(feature = "nat-traversal")]
         let (caps, reflex_snapshot) = {
             use super::traversal::classify::NatClass;
@@ -5118,7 +5440,7 @@ impl MeshNode {
         let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
         // See doc-comment: without a policy, an unresolvable
-        // "unknown" cannot be admitted as same-subnet (Cubic P1).
+        // "unknown" cannot be admitted as same-subnet.
         let policy_installed = self.local_subnet_policy.is_some();
         self.capability_index
             .find_nodes_scoped(filter, scope, |nid| {
@@ -5283,10 +5605,10 @@ impl MeshNode {
         // short-circuit (session is already on the path we want)
         // vs. re-handshake to upgrade (session exists but on the
         // wrong path — typically a relayed session that a fresh
-        // direct/punched attempt should replace). Cubic P1
-        // flagged that unconditionally short-circuiting on any
-        // existing session left callers stuck on the relay
-        // forever, defeating the optimization.
+        // direct/punched attempt should replace).
+        // Unconditionally short-circuiting on any existing session
+        // would leave callers stuck on the relay forever,
+        // defeating the optimization.
         let session_matches = |want_addr: std::net::SocketAddr| {
             self.peers
                 .get(&peer_node_id)
@@ -5313,14 +5635,13 @@ impl MeshNode {
         // circuits only when an existing session is already on
         // exactly that coordinator's path. An unrelated session
         // (stale, dead, on a different hop) is NOT treated as
-        // success — Cubic P1 flagged that `contains_key`-based
-        // short-circuit here would mask a failed direct attempt
-        // behind whatever stale session happened to still be in
-        // the peers map, so `connect_direct` reported "success"
-        // without actually establishing the intended path. The
-        // handshake runs unless we can confirm the existing
-        // session is already the one this call was asked to
-        // resolve.
+        // success — a `contains_key`-based short-circuit here
+        // would mask a failed direct attempt behind whatever
+        // stale session happened to still be in the peers map,
+        // so `connect_direct` would report "success" without
+        // actually establishing the intended path. The handshake
+        // runs unless we can confirm the existing session is
+        // already the one this call was asked to resolve.
         let connect_via_coordinator = |coord_addr: std::net::SocketAddr| async move {
             if session_matches(coord_addr) {
                 return Ok(peer_node_id);
@@ -5341,17 +5662,17 @@ impl MeshNode {
                 // `dest == self` and completes locally. Only
                 // when that direct attempt fails do we try the
                 // routing table's first-hop as a fallback
-                // (pingwave-installed routes, etc.). Cubic P2:
-                // the earlier implementation always went via
-                // the routing table, which added an unnecessary
-                // relay hop when a direct path was available.
+                // (pingwave-installed routes, etc.). Always
+                // going via the routing table would add an
+                // unnecessary relay hop when a direct path is
+                // available.
                 //
-                // Stats note (cubic P1): `record_relay_fallback`
-                // fires only when we actually fall back to the
-                // routed path — not on entry. A successful
-                // direct connect is not a fallback; attributing
-                // it as one breaks `TraversalStats.relay_fallbacks`'s
-                // documented meaning ("ended up on the routed-
+                // Stats note: `record_relay_fallback` fires only
+                // when we actually fall back to the routed path
+                // — not on entry. A successful direct connect is
+                // not a fallback; attributing it as one breaks
+                // `TraversalStats.relay_fallbacks`'s documented
+                // meaning ("ended up on the routed-
                 // handshake path") and makes the counter useless
                 // for assessing NAT-traversal effectiveness.
                 // `Direct` is the one branch that genuinely
@@ -5552,7 +5873,7 @@ impl MeshNode {
         let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
         // Same warm-up rule as `find_nodes_by_filter_scoped` —
-        // see that doc-comment for the rationale (Cubic P1).
+        // see that doc-comment for the rationale.
         let policy_installed = self.local_subnet_policy.is_some();
         self.capability_index
             .find_best_node_scoped(req, scope, |nid| {
@@ -6065,7 +6386,6 @@ impl MeshNode {
         peer_node_id: u64,
     ) -> Result<SessionKeys, AdapterError> {
         let timeout = self.config.handshake_timeout;
-        let socket_arc = self.socket.socket_arc();
 
         // Prologue uses the 32-bit `routing_id` projection of the node
         // ids — the same projection routed handshakes use, so the two
@@ -6084,41 +6404,89 @@ impl MeshNode {
         let mut builder = PacketBuilder::new(&[0u8; 32], 0);
         let packet = builder.build_handshake(&msg1);
 
-        self.socket
-            .send_to(&packet, peer_addr)
-            .await
-            .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+        // Polling `socket_arc.recv_from` directly would race
+        // `spawn_receive_loop`'s consumer post-`start()` (tokio
+        // dispatches a UDP datagram to exactly one waiter), so:
+        //   - Pre-`start()`: use `recv_from`; the dispatcher isn't
+        //     running, so there's no race. This preserves the
+        //     existing init-time ordering where `connect()` is
+        //     called before `start()`.
+        //   - Post-`start()`: register an oneshot in
+        //     `pending_direct_initiators`, then send msg1, then
+        //     await the oneshot. The dispatcher's direct-handshake
+        //     branch forwards the parsed payload bytes through.
+        // Concurrent direct connects on the same node also work
+        // — each registers under its own peer_addr.
+        let payload_bytes = if self.started.load(Ordering::Acquire) {
+            let (tx, rx) = oneshot::channel::<Bytes>();
+            // Register BEFORE sending msg1 so we can't miss a
+            // fast responder that replies before we'd otherwise
+            // be ready to receive. `insert` replaces any prior
+            // entry for the same `peer_addr` — last writer wins.
+            self.pending_direct_initiators.insert(peer_addr, tx);
 
-        // Wait for response
-        let parsed = tokio::time::timeout(timeout, async {
-            loop {
-                let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
-                recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
+            if let Err(e) = self.socket.send_to(&packet, peer_addr).await {
+                self.pending_direct_initiators.remove(&peer_addr);
+                return Err(AdapterError::Connection(format!("send failed: {}", e)));
+            }
 
-                let (n, source) = socket_arc
-                    .recv_from(&mut recv_buf)
-                    .await
-                    .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
-
-                if source != peer_addr {
-                    continue;
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(payload)) => payload,
+                Ok(Err(_)) => {
+                    // Sender dropped — the dispatcher removed our
+                    // entry without forwarding. Should not happen
+                    // unless start() shut down; treat as timeout.
+                    self.pending_direct_initiators.remove(&peer_addr);
+                    return Err(AdapterError::Connection("handshake channel dropped".into()));
                 }
-
-                recv_buf.truncate(n);
-                let data = recv_buf.freeze();
-
-                if let Some(p) = ParsedPacket::parse(data, source) {
-                    if p.header.flags.is_handshake() {
-                        return Ok::<_, AdapterError>(p);
-                    }
+                Err(_) => {
+                    // Timeout — the responder never replied or its
+                    // reply arrived for a different source. Clean up.
+                    self.pending_direct_initiators.remove(&peer_addr);
+                    return Err(AdapterError::Connection("handshake timeout".into()));
                 }
             }
-        })
-        .await
-        .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
+        } else {
+            // Pre-start fallback: dispatcher is not running, so
+            // there's nothing to forward through the registry.
+            // Poll the socket directly — no race exists yet.
+            let socket_arc = self.socket.socket_arc();
+            self.socket
+                .send_to(&packet, peer_addr)
+                .await
+                .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+
+            let parsed = tokio::time::timeout(timeout, async {
+                loop {
+                    let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
+                    recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
+
+                    let (n, source) = socket_arc
+                        .recv_from(&mut recv_buf)
+                        .await
+                        .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
+
+                    if source != peer_addr {
+                        continue;
+                    }
+
+                    recv_buf.truncate(n);
+                    let data = recv_buf.freeze();
+
+                    if let Some(p) = ParsedPacket::parse(data, source) {
+                        if p.header.flags.is_handshake() {
+                            return Ok::<_, AdapterError>(p);
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
+            parsed.payload
+        };
 
         handshake
-            .read_message(&parsed.payload)
+            .read_message(&payload_bytes)
             .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
 
         handshake
@@ -6511,7 +6879,7 @@ impl MeshNode {
         // entry — a concurrent `request_punch` to the same
         // target installs a new entry (and drops our sender),
         // and that replacement must survive our timeout/send-
-        // failure remove. (Cubic P1.)
+        // failure remove.
         let (tx, rx) = oneshot::channel();
         let gen = self
             .next_waiter_gen
@@ -7108,5 +7476,488 @@ mod reclassify_override_race_tests {
 
         assert_eq!(node.nat_class(), NatClass::Cone);
         assert_eq!(node.reflex_addr(), Some(probed));
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_aead_tests {
+    //! Regression for BUG_AUDIT_2026_04_30_CORE.md #85: the mesh
+    //! dispatch loop's heartbeat fast-path used to skip AEAD
+    //! verification, letting an off-path attacker who observed the
+    //! cleartext `session_id` and source UDP address spoof
+    //! heartbeats indefinitely. The fix routes through
+    //! [`NetSession::verify_and_touch_heartbeat`] before calling
+    //! `failure_detector.heartbeat`. The verify+touch are now fused
+    //! into the session method so a future caller can't reorder
+    //! them or forget to touch on success. These tests pin both
+    //! the AEAD-verify outcome AND the touch-on-success/no-touch-
+    //! on-failure invariant at the same coverage bar the legacy
+    //! single-peer adapter has at
+    //! `mod.rs::heartbeat_is_aead_authenticated`.
+    use super::*;
+    use crate::adapter::net::crypto::{NoiseHandshake, StaticKeypair};
+    use crate::adapter::net::pool::PacketBuilder;
+    use crate::adapter::net::protocol::{NetHeader, PacketFlags};
+
+    /// Extract the TX counter (bytes 16..24, little-endian u64) from
+    /// a serialized packet's header. Both data packets and
+    /// heartbeats patch the counter into the same wire-format
+    /// position; see `pool.rs::PacketBuilder::build` lines
+    /// `header_bytes[16..24].copy_from_slice(&counter.to_le_bytes())`
+    /// and the matching line in `build_heartbeat`.
+    fn counter_of(packet: &[u8]) -> u64 {
+        u64::from_le_bytes(
+            packet[16..24]
+                .try_into()
+                .expect("packet header is at least 24 bytes"),
+        )
+    }
+
+    fn make_session_keys() -> (
+        crate::adapter::net::crypto::SessionKeys,
+        crate::adapter::net::crypto::SessionKeys,
+    ) {
+        let psk = [0x42u8; 32];
+        let responder_kp = StaticKeypair::generate();
+        let mut initiator = NoiseHandshake::initiator(&psk, &responder_kp.public).unwrap();
+        let mut responder = NoiseHandshake::responder(&psk, &responder_kp).unwrap();
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+        (
+            initiator.into_session_keys().unwrap(),
+            responder.into_session_keys().unwrap(),
+        )
+    }
+
+    #[test]
+    fn aead_authenticated_heartbeat_passes_verification_and_touches_session() {
+        let (init_keys, resp_keys) = make_session_keys();
+        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let bytes = builder.build_heartbeat();
+
+        let parsed = ParsedPacket::parse(bytes, "127.0.0.1:5000".parse().unwrap())
+            .expect("legitimate heartbeat must parse");
+        assert!(parsed.header.flags.is_heartbeat());
+
+        let last_before = resp_session.last_activity_ns();
+        // Sleep so `current_timestamp()` ticks observably forward
+        // before `verify_and_touch_heartbeat` reads it.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        assert!(
+            resp_session.verify_and_touch_heartbeat(&parsed),
+            "AEAD-authenticated heartbeat must verify against the matched session"
+        );
+        assert!(
+            resp_session.last_activity_ns() > last_before,
+            "successful verify must touch the session — verify+touch are fused"
+        );
+    }
+
+    #[test]
+    fn unauthenticated_heartbeat_fails_verification_and_does_not_touch() {
+        let (_init_keys, resp_keys) = make_session_keys();
+        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
+
+        // Attacker forges a heartbeat header with the right
+        // session_id but garbage 16-byte tail. Pre-fix this passed
+        // through; post-fix it must fail.
+        let mut forged = bytes::BytesMut::new();
+        let mut header_bytes = NetHeader::heartbeat(resp_session.session_id()).to_bytes();
+        // Stamp a plausible nonce so the receiver gets to decrypt
+        // (otherwise it bails earlier on the counter check).
+        header_bytes[12..16].copy_from_slice(&[0u8; 4]);
+        header_bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
+        forged.extend_from_slice(&header_bytes);
+        forged.extend_from_slice(&[0xAAu8; 16]); // garbage tag
+        let parsed = ParsedPacket::parse(forged.freeze(), "127.0.0.1:5000".parse().unwrap())
+            .expect("forged heartbeat must still parse — verification is downstream");
+        assert!(parsed.header.flags.is_heartbeat());
+
+        let last_before = resp_session.last_activity_ns();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        assert!(
+            !resp_session.verify_and_touch_heartbeat(&parsed),
+            "heartbeat with garbage AEAD tag must NOT verify — pre-fix the \
+             mesh dispatcher would have called session.touch() / \
+             failure_detector.heartbeat() unconditionally"
+        );
+        assert_eq!(
+            resp_session.last_activity_ns(),
+            last_before,
+            "failed verify must NOT touch the session — verify+touch are fused"
+        );
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #87: dropping
+    /// a `PeerRegistrationGuard` whose `completed` flag is still
+    /// `false` (cancellation, panic, or non-success path) must
+    /// run the same rollback the legacy inline error arm did —
+    /// remove the peer entry, peer-addr mapping, and routing
+    /// table entry, but only if those entries still match the
+    /// values this handshake wrote (a concurrent retry may have
+    /// replaced them).
+    #[tokio::test]
+    async fn peer_registration_guard_rolls_back_on_drop_when_not_completed() {
+        let peer_id = 0xDEAD_BEEFu64;
+        let next_hop: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+
+        let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let router = Arc::new(
+            NetRouter::new(crate::adapter::net::router::RouterConfig::new(
+                0xCAFE_BABE,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .await
+            .unwrap(),
+        );
+
+        // Simulate the post-handshake registration: insert peer,
+        // peer-addr, and a route. We can't construct a fully-
+        // populated `PeerInfo` without the matched session keys,
+        // but the rollback only inspects `pi.addr`, so we build
+        // a minimal session and check post-Drop that the entry
+        // is gone.
+        let (init_keys, _resp_keys) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, next_hop, 4, false));
+        peers.insert(
+            peer_id,
+            PeerInfo {
+                node_id: peer_id,
+                addr: next_hop,
+                session,
+                remote_static_pub: [0u8; 32],
+            },
+        );
+        peer_addrs.insert(peer_id, next_hop);
+        router.add_route(peer_id, next_hop);
+
+        // Drop guard without committing.
+        {
+            let _guard = PeerRegistrationGuard {
+                peer_node_id: peer_id,
+                registered_next_hop: next_hop,
+                peers: peers.clone(),
+                peer_addrs: peer_addrs.clone(),
+                router: router.clone(),
+            };
+        } // Drop runs here.
+
+        assert!(
+            !peers.contains_key(&peer_id),
+            "peers entry must be removed by Drop rollback"
+        );
+        assert!(
+            !peer_addrs.contains_key(&peer_id),
+            "peer_addrs entry must be removed by Drop rollback"
+        );
+        assert!(
+            router.routing_table().lookup(peer_id).is_none(),
+            "route must be removed by Drop rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_registration_guard_is_no_op_on_drop_when_completed() {
+        let peer_id = 0xCAFE_F00Du64;
+        let next_hop: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+
+        let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let router = Arc::new(
+            NetRouter::new(crate::adapter::net::router::RouterConfig::new(
+                0xCAFE_BABE,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .await
+            .unwrap(),
+        );
+
+        let (init_keys, _resp_keys) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, next_hop, 4, false));
+        peers.insert(
+            peer_id,
+            PeerInfo {
+                node_id: peer_id,
+                addr: next_hop,
+                session,
+                remote_static_pub: [0u8; 32],
+            },
+        );
+        peer_addrs.insert(peer_id, next_hop);
+        router.add_route(peer_id, next_hop);
+
+        {
+            let guard = PeerRegistrationGuard {
+                peer_node_id: peer_id,
+                registered_next_hop: next_hop,
+                peers: peers.clone(),
+                peer_addrs: peer_addrs.clone(),
+                router: router.clone(),
+            };
+            // Successful-send path consumes the guard without
+            // running Drop's rollback.
+            guard.commit();
+        }
+
+        assert!(peers.contains_key(&peer_id));
+        assert!(peer_addrs.contains_key(&peer_id));
+        assert!(router.routing_table().lookup(peer_id).is_some());
+    }
+
+    /// Regression: if a concurrent retry has overwritten the
+    /// peer-addr / route to a different next-hop, the guard's
+    /// rollback must NOT clobber the newer (valid) registration.
+    /// Mirrors the `remove_if`/`remove_route_if_next_hop_is`
+    /// guarantees from the original inline rollback.
+    #[tokio::test]
+    async fn peer_registration_guard_preserves_concurrent_overwrite() {
+        let peer_id = 0xFACE_F00Du64;
+        let stale: SocketAddr = "10.0.0.3:9000".parse().unwrap();
+        let fresh: SocketAddr = "10.0.0.4:9000".parse().unwrap();
+
+        let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let router = Arc::new(
+            NetRouter::new(crate::adapter::net::router::RouterConfig::new(
+                0xCAFE_BABE,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .await
+            .unwrap(),
+        );
+
+        let (init_keys, _resp_keys) = make_session_keys();
+        let session = Arc::new(NetSession::new(init_keys, fresh, 4, false));
+        // Concurrent retry has overwritten with `fresh` — the
+        // stale guard about to drop should NOT remove this.
+        peers.insert(
+            peer_id,
+            PeerInfo {
+                node_id: peer_id,
+                addr: fresh,
+                session,
+                remote_static_pub: [0u8; 32],
+            },
+        );
+        peer_addrs.insert(peer_id, fresh);
+        router.add_route(peer_id, fresh);
+
+        {
+            let _guard = PeerRegistrationGuard {
+                peer_node_id: peer_id,
+                registered_next_hop: stale, // NOT what's currently in the maps
+                peers: peers.clone(),
+                peer_addrs: peer_addrs.clone(),
+                router: router.clone(),
+            };
+        }
+
+        assert!(
+            peers.contains_key(&peer_id),
+            "peers must keep the fresh (concurrent-retry) entry"
+        );
+        assert_eq!(*peer_addrs.get(&peer_id).unwrap(), fresh);
+        assert_eq!(router.routing_table().lookup(peer_id), Some(fresh));
+    }
+
+    // BUG #106: removed test
+    // `packet_pool_and_thread_local_pool_have_independent_counters`.
+    // The pre-fix test pinned the BUG state — that the two pools
+    // had independent counters, the very condition that produced
+    // the cross-pool nonce-reuse hazard. Since the BUG #106 fix
+    // REMOVED the `packet_pool` field and getter from
+    // `NetSession`, the test no longer compiles and is no longer
+    // meaningful: the data path uses `thread_local_pool`
+    // exclusively for tx AEAD operations.
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #97: the
+    /// production heartbeat path must (a) build with the
+    /// session's actual TX key — not `&[0u8; 32]` — and (b) use a
+    /// **shared** `tx_counter` across builders so successive
+    /// heartbeats don't all encrypt under counter=0 and trigger
+    /// the receiver's replay window. Both bugs were latent before
+    /// #85 wired up AEAD verification on the mesh receiver; this
+    /// test pins the post-fix invariant by acquiring two builders
+    /// from the SAME session pool (mirroring what the heartbeat
+    /// timer at `mesh.rs:3220` does on each tick) and verifying
+    /// that BOTH heartbeats verify against the peer session in
+    /// order. Pre-fix behavior with the all-zero key would fail
+    /// the first verify; pre-fix behavior with per-builder
+    /// counters would fail the second.
+    #[test]
+    fn pooled_heartbeat_builds_succeed_in_sequence_and_verify() {
+        let (init_keys, resp_keys) = make_session_keys();
+        let init_session = NetSession::new(
+            init_keys.clone(),
+            "127.0.0.1:5001".parse().unwrap(),
+            4,
+            false,
+        );
+        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
+
+        // Mirror the production sender — go through
+        // `Session::build_heartbeat`, not a fresh
+        // `PacketBuilder::new`.
+        let h1_bytes = init_session.build_heartbeat();
+        let h2_bytes = init_session.build_heartbeat();
+
+        let p1 = ParsedPacket::parse(h1_bytes, "127.0.0.1:5001".parse().unwrap())
+            .expect("first heartbeat must parse");
+        let p2 = ParsedPacket::parse(h2_bytes, "127.0.0.1:5001".parse().unwrap())
+            .expect("second heartbeat must parse");
+
+        assert!(
+            resp_session.verify_and_touch_heartbeat(&p1),
+            "first pooled heartbeat must verify — pre-fix the \
+             all-zero key would have produced an AEAD tag the \
+             receiver couldn't decrypt"
+        );
+        assert!(
+            resp_session.verify_and_touch_heartbeat(&p2),
+            "second pooled heartbeat must also verify — pre-fix, \
+             a per-builder fresh counter would reuse counter=0 \
+             and the receiver's replay window would reject this \
+             as a duplicate"
+        );
+    }
+
+    #[test]
+    fn replay_of_authenticated_heartbeat_fails_verification_on_second_try() {
+        let (init_keys, resp_keys) = make_session_keys();
+        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let bytes = builder.build_heartbeat();
+        let parsed = ParsedPacket::parse(bytes, "127.0.0.1:5000".parse().unwrap()).unwrap();
+
+        assert!(resp_session.verify_and_touch_heartbeat(&parsed));
+        // Replay: counter is now committed, so the second attempt
+        // must fail at the replay-window check.
+        assert!(
+            !resp_session.verify_and_touch_heartbeat(&parsed),
+            "replay of an already-accepted heartbeat must fail"
+        );
+    }
+
+    /// BUG #106 invariant: heartbeats and data-path packets share a
+    /// single TX counter via `thread_local_pool`. Pre-#106-fix,
+    /// `NetSession` exposed two pools (`packet_pool` and
+    /// `thread_local_pool`) with the same key but independent
+    /// counters; a caller that mixed `session.packet_pool().get()`
+    /// for some packets and `session.thread_local_pool().get()` for
+    /// others would produce ChaCha20-Poly1305 nonce reuse against
+    /// the same key, leaking plaintext via XOR.
+    ///
+    /// The fix removed `packet_pool` and routes all TX through
+    /// `thread_local_pool`. Today `Session::build_heartbeat` calls
+    /// `self.thread_local_pool.get().build_heartbeat()` and the
+    /// data path builds via `self.thread_local_pool.get().build(...)`.
+    /// This test pins the resulting wire-level invariant: the
+    /// counters on heartbeat and data packets interleave strictly
+    /// monotonically (no two packets ever share a counter, no
+    /// matter the order they're built in). A future contributor who
+    /// re-introduced a separate pool/counter for heartbeats would
+    /// see this test fail because both sequences would restart at
+    /// 0.
+    #[test]
+    fn heartbeat_and_data_share_tx_counter_strictly_monotonic() {
+        let (init_keys, _resp_keys) = make_session_keys();
+        let init_session = NetSession::new(
+            init_keys.clone(),
+            "127.0.0.1:5001".parse().unwrap(),
+            4,
+            false,
+        );
+
+        // Build sequence: heartbeat, data, heartbeat, data,
+        // heartbeat. All five must have strictly-increasing
+        // counters.
+        let h1 = init_session.build_heartbeat();
+        let d1 = {
+            let mut pooled = init_session.thread_local_pool().get();
+            pooled.build(
+                0xCAFE_F00D,
+                0,
+                &[bytes::Bytes::from_static(b"event-a")],
+                PacketFlags::NONE,
+            )
+        };
+        let h2 = init_session.build_heartbeat();
+        let d2 = {
+            let mut pooled = init_session.thread_local_pool().get();
+            pooled.build(
+                0xCAFE_F00D,
+                1,
+                &[bytes::Bytes::from_static(b"event-b")],
+                PacketFlags::NONE,
+            )
+        };
+        let h3 = init_session.build_heartbeat();
+
+        let counters = [
+            counter_of(&h1),
+            counter_of(&d1),
+            counter_of(&h2),
+            counter_of(&d2),
+            counter_of(&h3),
+        ];
+
+        // Strict monotonicity: each counter > the previous one.
+        for window in counters.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "tx counters must be strictly increasing across heartbeat/data \
+                 interleave; got {:?} (BUG #106 regression: heartbeats and data \
+                 are drawing from independent counters)",
+                counters
+            );
+        }
+    }
+
+    /// CR-8: source-level tripwire pinning that no dispatch
+    /// branch uses `events.into_iter().next()` to drop multi-event
+    /// frames. The original BUG #147 fix only patched
+    /// `SUBPROTOCOL_STREAM_WINDOW`; CR-8 extended the same fix to
+    /// the migration / channel-membership / capability-ann / reflex
+    /// / rendezvous branches. This test scans the file source for
+    /// any new occurrence outside fix-doc comments and fails loudly
+    /// if a future maintainer reintroduces the pattern.
+    ///
+    /// We assemble the forbidden token at runtime so the test's
+    /// own source doesn't trigger itself.
+    #[test]
+    fn cr8_dispatch_must_not_use_single_event_pattern() {
+        // Build the forbidden token from fragments so this test's
+        // source doesn't contain the literal substring.
+        let needle = format!("events.into_iter().{}()", "next");
+
+        let src = include_str!("mesh.rs");
+        for (lineno, line) in src.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // Skip line comments and doc comments — these are
+            // ALLOWED to mention the pre-fix shape (the fix-doc
+            // narratives are load-bearing context for future
+            // maintainers).
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // Skip lines inside doc-string-style comments inside
+            // string literals: we don't try to be too clever here,
+            // since a code line containing `events.into_iter().next()`
+            // outside a comment is the regression we want to catch.
+            assert!(
+                !trimmed.contains(&needle),
+                "CR-8 regression: single-event dispatch pattern reintroduced \
+                 at mesh.rs:{} — multi-event frames will silently drop \
+                 every payload past the first.\n  line: {}",
+                lineno + 1,
+                line
+            );
+        }
     }
 }

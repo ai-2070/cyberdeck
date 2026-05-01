@@ -22,6 +22,7 @@ async fn test_netdb_build_with_both_models() {
         .with_tasks()
         .with_memories()
         .build()
+        .await
         .unwrap();
 
     assert!(db.try_tasks().is_some());
@@ -35,6 +36,7 @@ async fn test_netdb_build_with_only_tasks() {
         .origin(ORIGIN)
         .with_tasks()
         .build()
+        .await
         .unwrap();
 
     assert!(db.try_tasks().is_some());
@@ -48,6 +50,7 @@ async fn test_netdb_crud_through_tasks_handle() {
         .origin(ORIGIN)
         .with_tasks()
         .build()
+        .await
         .unwrap();
 
     let tasks = db.tasks();
@@ -69,6 +72,7 @@ async fn test_netdb_find_many_on_tasks_state() {
         .origin(ORIGIN)
         .with_tasks()
         .build()
+        .await
         .unwrap();
 
     for i in 1..=10u64 {
@@ -120,6 +124,7 @@ async fn test_netdb_find_many_on_memories_state() {
         .origin(ORIGIN)
         .with_memories()
         .build()
+        .await
         .unwrap();
 
     db.memories()
@@ -197,6 +202,7 @@ async fn test_netdb_whole_snapshot_and_restore() {
             .with_tasks()
             .with_memories()
             .build()
+            .await
             .unwrap();
 
         db.tasks().create(1, "alpha", 100).unwrap();
@@ -225,6 +231,7 @@ async fn test_netdb_whole_snapshot_and_restore() {
         .with_tasks()
         .with_memories()
         .build_from_snapshot(&restored)
+        .await
         .unwrap();
 
     // Tasks state restored.
@@ -259,6 +266,7 @@ async fn test_netdb_build_from_empty_snapshot_is_fresh_open() {
         .with_tasks()
         .with_memories()
         .build_from_snapshot(&empty)
+        .await
         .unwrap();
     assert_eq!(db.tasks().count(), 0);
     assert_eq!(db.memories().count(), 0);
@@ -272,6 +280,7 @@ async fn test_netdb_close_is_idempotent() {
         .with_tasks()
         .with_memories()
         .build()
+        .await
         .unwrap();
 
     db.close().unwrap();
@@ -286,9 +295,161 @@ async fn test_netdb_tasks_without_with_tasks_panics() {
         .origin(ORIGIN)
         .with_memories()
         .build()
+        .await
         .unwrap();
     // Should panic — tasks weren't enabled.
     let _ = db.tasks();
+}
+
+/// Regression: under one `NetDb` with BOTH tasks and memories
+/// enabled, alternating ingests across the two adapters must
+/// not surface `concurrent ingest_typed produced duplicate
+/// app_seq` errors.
+///
+/// The pre-fix `ingest_typed` did `load → ingest → CAS-commit`
+/// on `app_seq`. When the `WatermarkingFold` task processed the
+/// just-ingested event before the foreground thread reached its
+/// CAS, the watermark advanced to the expected post-CAS value
+/// and the CAS surfaced a phantom-duplicate error. Single-
+/// adapter tests timed the foreground CAS first and didn't see
+/// the race; dual-adapter timing (tasks operations between two
+/// memories ingests) gave the memories fold task enough head-
+/// room to land first and the bug fired deterministically (the
+/// node-side `npm test` was the canary). Post-fix the adapter
+/// uses `fetch_add` to reserve `app_seq` atomically before
+/// ingest — the watermark and the foreground writer no longer
+/// fight over the same value.
+#[tokio::test]
+async fn test_regression_dual_model_alternating_ingests_do_not_produce_duplicate_app_seq() {
+    let redex = Redex::new();
+    let db = NetDb::builder(redex)
+        .origin(ORIGIN)
+        .with_tasks()
+        .with_memories()
+        .build()
+        .await
+        .unwrap();
+
+    db.tasks().create(1, "task", 100).unwrap();
+    db.memories()
+        .store(1, "mem", vec!["x".to_string()], "alice", 100)
+        .unwrap();
+    let t_seq = db.tasks().complete(1, 150).unwrap();
+    // Pre-fix this returned `Err(...concurrent ingest_typed produced
+    // duplicate app_seq=1...)` because the memories fold task had
+    // advanced `memories.app_seq` to 2 between the foreground
+    // load (1) and the foreground CAS, leaving the load value
+    // stale.
+    let m_seq = db
+        .memories()
+        .pin(1, 150)
+        .expect("dual-model ingest must not surface phantom-duplicate app_seq");
+
+    db.tasks().wait_for_seq(t_seq).await;
+    db.memories().wait_for_seq(m_seq).await;
+
+    assert_eq!(db.tasks().count(), 1);
+    assert_eq!(db.memories().count(), 1);
+}
+
+/// Companion regression: concurrent `tasks.create` from N
+/// threads on a SINGLE adapter must yield N distinct `app_seq`
+/// values and surface no errors. The post-fix `fetch_add` is
+/// the load-bearing primitive — it atomically reserves the next
+/// `app_seq` per call, so threads can't race onto the same
+/// number.
+///
+/// Pre-fix the load + ingest + CAS shape would have had at
+/// least one losing thread on every contended call (CAS retry
+/// wasn't even wired — the loser surfaced
+/// `concurrent ingest_typed produced duplicate app_seq` and the
+/// caller had to "rebuild adapter from snapshot to reconcile").
+/// `fetch_add` makes contention free: every caller gets a
+/// monotonically-distinct slot, no retry, no error.
+#[tokio::test]
+async fn test_regression_concurrent_ingest_into_single_tasks_adapter_succeeds() {
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
+
+    let redex = Redex::new();
+    let db = NetDb::builder(redex)
+        .origin(ORIGIN)
+        .with_tasks()
+        .build()
+        .await
+        .unwrap();
+    let db = Arc::new(db);
+
+    const N: u64 = 32;
+    let barrier = Arc::new(Barrier::new(N as usize));
+    let mut handles = Vec::with_capacity(N as usize);
+    for i in 1..=N {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            // Each thread creates a distinct task id. Every call
+            // MUST succeed — pre-fix the load+CAS race would have
+            // produced phantom-duplicate errors for the losing
+            // threads under contention.
+            db.tasks()
+                .create(i, "t", 100 * i)
+                .expect("concurrent create on a single adapter must not error")
+        }));
+    }
+    let seqs: Vec<u64> = handles
+        .into_iter()
+        .map(|h| h.join().expect("thread panicked"))
+        .collect();
+    assert_eq!(seqs.len(), N as usize, "every thread must have returned");
+
+    // Wait for the fold to apply every event so `count()` is
+    // authoritative.
+    let max_seq = *seqs.iter().max().unwrap();
+    db.tasks().wait_for_seq(max_seq).await;
+
+    assert_eq!(
+        db.tasks().count(),
+        N as usize,
+        "every concurrently-created task must have landed in state — \
+         a missing one would mean two threads stamped the same app_seq \
+         and the second overwrote the first (pre-fix CAS-race regression)",
+    );
+}
+
+/// Stress companion to the alternating-ingests regression: a
+/// tighter loop hammers both adapters under one NetDb to maximize
+/// the WatermarkingFold-vs-foreground race window. Pre-fix this
+/// would surface `concurrent ingest_typed produced duplicate
+/// app_seq` on at least one of the iterations on most runs.
+#[tokio::test]
+async fn test_regression_dual_model_stress_no_phantom_duplicate_app_seq() {
+    let redex = Redex::new();
+    let db = NetDb::builder(redex)
+        .origin(ORIGIN)
+        .with_tasks()
+        .with_memories()
+        .build()
+        .await
+        .unwrap();
+
+    const N: u64 = 50;
+    for i in 1..=N {
+        db.tasks().create(i, "t", 100 * i).unwrap();
+        db.memories()
+            .store(i, "m", vec!["t".to_string()], "alice", 100 * i)
+            .unwrap();
+    }
+    // Final round-trip — each must succeed cleanly and the
+    // watermarks must converge.
+    let t_last = db.tasks().complete(N, 999).unwrap();
+    let m_last = db.memories().pin(N, 999).unwrap();
+    db.tasks().wait_for_seq(t_last).await;
+    db.memories().wait_for_seq(m_last).await;
+
+    assert_eq!(db.tasks().count(), N as usize);
+    assert_eq!(db.memories().count(), N as usize);
 }
 
 #[tokio::test]
@@ -322,7 +483,8 @@ async fn test_regression_build_from_snapshot_error_path_is_clean() {
         .origin(ORIGIN)
         .with_tasks()
         .with_memories()
-        .build_from_snapshot(&corrupt_bundle);
+        .build_from_snapshot(&corrupt_bundle)
+        .await;
     assert!(
         first.is_err(),
         "corrupt memories snapshot must cause build to fail"
@@ -334,6 +496,7 @@ async fn test_regression_build_from_snapshot_error_path_is_clean() {
         .with_tasks()
         .with_memories()
         .build()
+        .await
         .unwrap();
     assert!(db.try_tasks().is_some());
     assert!(db.try_memories().is_some());

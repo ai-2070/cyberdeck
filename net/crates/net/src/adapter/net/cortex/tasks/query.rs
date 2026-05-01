@@ -53,23 +53,31 @@ impl TasksFilterSpec {
                 return false;
             }
         }
+        // Inclusive bounds (rejection via `<` / `>`). Strict `>` /
+        // `<` (rejection via `<=` / `>=`) would drop an event
+        // with `created_ns == cutoff` from both
+        // `created_after(cutoff)` and `created_before(cutoff)` —
+        // events would fall through holes between paginations
+        // using "last sync ns" as cutoff. Inclusive bounds also
+        // handle two events written in the same ns (achievable on
+        // Windows where wall-clock granularity is ~15ms).
         if let Some(ns) = self.created_after_ns {
-            if t.created_ns <= ns {
+            if t.created_ns < ns {
                 return false;
             }
         }
         if let Some(ns) = self.created_before_ns {
-            if t.created_ns >= ns {
+            if t.created_ns > ns {
                 return false;
             }
         }
         if let Some(ns) = self.updated_after_ns {
-            if t.updated_ns <= ns {
+            if t.updated_ns < ns {
                 return false;
             }
         }
         if let Some(ns) = self.updated_before_ns {
-            if t.updated_ns >= ns {
+            if t.updated_ns > ns {
                 return false;
             }
         }
@@ -147,25 +155,25 @@ impl<'a> TasksQuery<'a> {
         self
     }
 
-    /// Restrict to `created_ns > ns`.
+    /// Restrict to `created_ns >= ns` (inclusive).
     pub fn created_after(mut self, ns: u64) -> Self {
         self.spec.created_after_ns = Some(ns);
         self
     }
 
-    /// Restrict to `created_ns < ns`.
+    /// Restrict to `created_ns <= ns` (inclusive).
     pub fn created_before(mut self, ns: u64) -> Self {
         self.spec.created_before_ns = Some(ns);
         self
     }
 
-    /// Restrict to `updated_ns > ns`.
+    /// Restrict to `updated_ns >= ns` (inclusive).
     pub fn updated_after(mut self, ns: u64) -> Self {
         self.spec.updated_after_ns = Some(ns);
         self
     }
 
-    /// Restrict to `updated_ns < ns`.
+    /// Restrict to `updated_ns <= ns` (inclusive).
     pub fn updated_before(mut self, ns: u64) -> Self {
         self.spec.updated_before_ns = Some(ns);
         self
@@ -306,7 +314,11 @@ mod tests {
             .map(|t| t.id)
             .collect();
         ids.sort();
-        assert_eq!(ids, vec![4, 5]);
+        // BUG #142: bounds are inclusive. Task 3 (created_ns=300)
+        // qualifies — pre-fix the comparator was strict `>`, which
+        // dropped boundary events that should belong to either side
+        // of a `last_sync_ns`-style cutoff.
+        assert_eq!(ids, vec![3, 4, 5]);
     }
 
     #[test]
@@ -320,7 +332,59 @@ mod tests {
             .map(|t| t.id)
             .collect();
         ids.sort();
-        assert_eq!(ids, vec![1, 2]);
+        // BUG #142: inclusive — task 3 (created_ns=300) qualifies.
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    /// CR-20: pin the symmetric duplicate-delivery hazard the
+    /// BUG #142 inclusive-bound fix introduced. The fix made
+    /// `created_after(N)` inclusive (`>=`) so a `created_ns == N`
+    /// event isn't dropped by both halves of a `[after, before]`
+    /// pagination range. But the symmetric paginate-by-cutoff
+    /// case re-delivers the boundary:
+    ///
+    ///   poll_1: query.created_after(0) → returns events at ns=100, 200
+    ///           caller stores `last_seen_ns = 200`
+    ///   poll_2: query.created_after(200) → returns event at ns=200 AGAIN
+    ///                                       (because >= 200 is inclusive)
+    ///
+    /// Receiver-side dedup by `id` masks the duplicate today, but
+    /// a same-ns legitimate update (real secondary write at the
+    /// boundary timestamp) collides with the prior event under
+    /// the same id. This test pins the documented symmetric-
+    /// duplicate behavior so a future paginate-helper that uses
+    /// `last_seen_ns` as the next cutoff knows to advance by
+    /// `last_seen_ns + 1` (or to switch to id-based cursors).
+    #[test]
+    fn cr20_paginate_by_last_seen_ns_re_delivers_boundary_event() {
+        let s = sample();
+
+        // First "page": everything created at or after ns=100.
+        let page_1: Vec<_> = s.query().created_after(100).collect();
+        let last_seen = page_1
+            .iter()
+            .map(|t| t.created_ns)
+            .max()
+            .expect("non-empty result");
+
+        // Caller stores `last_seen` and uses it as the next
+        // page's cutoff — naive paginator pattern.
+        let page_2: Vec<_> = s.query().created_after(last_seen).collect();
+
+        // CR-20: the boundary event at `created_ns == last_seen`
+        // is RE-DELIVERED. This is the symmetric hazard the
+        // BUG #142 fix introduced.
+        let boundary_count = page_2.iter().filter(|t| t.created_ns == last_seen).count();
+        assert!(
+            boundary_count >= 1,
+            "CR-20: with inclusive `created_after`, paginating by \
+             last_seen_ns re-delivers the boundary event. The naive \
+             paginator pattern (`cutoff = last_seen_ns`) MUST advance \
+             past the boundary explicitly (e.g. `cutoff = last_seen_ns + \
+             1`) or use an id-based cursor instead. This test pins the \
+             documented behavior — fix it only if you also update the \
+             paginate-helper docs and the receiver-side dedup expectations."
+        );
     }
 
     #[test]
@@ -335,8 +399,10 @@ mod tests {
             .map(|t| t.id)
             .collect();
         ids.sort();
-        // 3 (310), 4 (410) pass. 5 (520) is not strictly before 500. 2 (250) is not strictly after 250.
-        assert_eq!(ids, vec![3, 4]);
+        // BUG #142: inclusive bounds — task 2 (updated_ns=250) is
+        // included by `updated_after(250)`, and task 5 (520) is
+        // still excluded because it's strictly above 500.
+        assert_eq!(ids, vec![2, 3, 4]);
     }
 
     #[test]

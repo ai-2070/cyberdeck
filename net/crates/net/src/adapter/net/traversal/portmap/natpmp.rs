@@ -459,6 +459,20 @@ impl PortMapperClient for NatPmpMapper {
         internal_port: u16,
         ttl: Duration,
     ) -> Result<PortMapping, PortMappingError> {
+        // Reject zero TTL up-front. Per RFC 6886 §3.3, lifetime=0
+        // is the "remove this mapping" wire signal — the same
+        // format `remove()` sends. Allowing `ttl == Duration::ZERO`
+        // here would silently REMOVE the mapping instead of
+        // creating one, and the renewal loop would then propagate
+        // `mapping.ttl = ZERO` and keep sending removes
+        // ("succeeding" while the router had nothing mapped).
+        if ttl.is_zero() {
+            return Err(PortMappingError::Transport(
+                "NAT-PMP install with ttl=0 would unmap; \
+                 caller must supply a non-zero lifetime"
+                    .into(),
+            ));
+        }
         let lifetime = ttl.as_secs().min(u32::MAX as u64) as u32;
         let req = NatPmpRequest::MapUdp {
             internal_port,
@@ -667,6 +681,46 @@ mod tests {
                 ..
             }) => {}
             other => panic!("expected MapUdp Success, got {other:?}"),
+        }
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #113: pre-fix
+    /// `install` accepted `ttl == Duration::ZERO` and turned it
+    /// into a NAT-PMP `lifetime=0`, which per RFC 6886 §3.3 is
+    /// the "remove this mapping" wire signal. The gateway acks
+    /// (mapping removed); `install` returned `Ok(...)` which
+    /// the caller treated as freshly installed — silent
+    /// data-plane failure where peers couldn't reach the node.
+    /// Compounded by the renewal loop self-removing on the
+    /// next tick.
+    ///
+    /// Post-fix: `install` rejects zero TTL synchronously
+    /// before sending the wire request, so callers see an
+    /// explicit error and the gateway is never asked to remove
+    /// what we meant to install.
+    #[tokio::test]
+    async fn install_rejects_zero_ttl_before_sending_wire_request() {
+        let gateway = Ipv4Addr::new(10, 0, 0, 1);
+        let mapper = NatPmpMapper::new(gateway);
+
+        // Pre-fix: this would send an install request with
+        // lifetime=0; the gateway would interpret it as remove
+        // and return Ok, leaving the caller with `mapping.ttl =
+        // ZERO`. Post-fix: rejected synchronously without any
+        // wire I/O.
+        let result = mapper.install(9001, Duration::ZERO).await;
+        match result {
+            Err(PortMappingError::Transport(msg)) => {
+                assert!(
+                    msg.contains("ttl=0"),
+                    "error message should mention ttl=0 (got: {msg})"
+                );
+            }
+            other => panic!(
+                "ttl=0 install must reject synchronously with Transport \
+                 error, got {:?}",
+                other
+            ),
         }
     }
 

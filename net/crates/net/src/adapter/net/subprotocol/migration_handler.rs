@@ -346,9 +346,34 @@ impl MigrationSubprotocolHandler {
                 };
 
                 // Chunk the snapshot for transport
+                //
+                // Oversized state/bindings surfaces as a
+                // `MigrationFailed` reply (StateFailed) rather than
+                // a panic in the dispatch task. The orchestrator
+                // consumes the reply and retry semantics kick in,
+                // the same shape as `maybe_seal_envelope` failure
+                // above.
+                let snapshot_bytes = match snapshot.try_to_bytes() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = self.source_handler.abort(daemon_origin);
+                        let reason =
+                            crate::adapter::net::compute::MigrationFailureReason::StateFailed(
+                                format!("snapshot serialization failed: {e}"),
+                            );
+                        outbound.push(OutboundMigrationMessage {
+                            dest_node: from_node,
+                            payload: wire::encode(&MigrationMessage::MigrationFailed {
+                                daemon_origin,
+                                reason,
+                            })?,
+                        });
+                        return Ok(outbound);
+                    }
+                };
                 let chunks = crate::adapter::net::compute::orchestrator::chunk_snapshot(
                     daemon_origin,
-                    snapshot.to_bytes(),
+                    snapshot_bytes,
                     snapshot.through_seq,
                 )?;
                 let orch = self
@@ -648,6 +673,39 @@ impl MigrationSubprotocolHandler {
                 let _ = self
                     .orchestrator
                     .abort_migration_with_reason(daemon_origin, reason);
+                // Also drop any partial reassembler we accumulated
+                // as the target. The local-source-failure path
+                // (`fail_migration_with_reason`, line ~1061)
+                // already clears this; an inbound `MigrationFailed`
+                // after the target had received some snapshot
+                // chunks would otherwise leave ~`chunk_size *
+                // chunks_received` bytes pinned in the DashMap
+                // forever (or until the same origin migrated again
+                // with a higher `seq_through`). With many ephemeral
+                // daemons this would be an unbounded leak.
+                self.reassemblers.remove(&daemon_origin);
+
+                // Cleanup completeness: neither `StandbyGroup` nor
+                // `CapabilityIndex` holds per-daemon
+                // migration-coupled state today.
+                //
+                //   * `StandbyGroup::promote` is synchronous —
+                //     either succeeds or rolls back atomically.
+                //     There is no "promotion in flight across
+                //     migration phases" state.
+                //   * `CapabilityIndex` indexes by `node_id`, not
+                //     by `daemon_origin` (verified by `grep -rn
+                //     daemon_origin src/adapter/net/behavior/
+                //     capability.rs` returning no matches).
+                //     Capabilities are node-level; failure of a
+                //     specific daemon's migration doesn't change
+                //     what the source node is advertising.
+                //
+                // So no additional teardown is needed today. If a
+                // future change adds per-daemon coupling in either
+                // subsystem, the regression test for this invariant
+                // fires loudly and the maintainer must wire
+                // teardown HERE.
             }
 
             MigrationMessage::BufferedEvents {
@@ -1253,7 +1311,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
 
         // Wire the identity context so `peer_static_lookup` returns
@@ -1338,7 +1396,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
         let passthrough = handler_no_ctx
             .maybe_seal_envelope(snapshot2, origin_hash, target_node_id)
@@ -1553,7 +1611,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: Some(envelope),
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
 
         // Build a handler with an identity_context whose unseal
@@ -1606,7 +1664,7 @@ mod tests {
         // branch above wasn't passing by coincidence.
         let snapshot_no_envelope = StateSnapshot {
             identity_envelope: None,
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
             ..snapshot.clone()
         };
         let resolved_fallback = handler
@@ -1667,7 +1725,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: Some(envelope),
-            head_payload: bytes::Bytes::new(),
+            head_payload: None,
         };
 
         // Misbehaving unsealer: always returns `Ok(None)`, even
@@ -1711,6 +1769,104 @@ mod tests {
         assert!(
             err.contains("refusing to fall back"),
             "expected 'refusing to fall back' in error message, got: {err}",
+        );
+    }
+
+    /// CR-24: pin the no-per-daemon-coupling invariant for
+    /// `StandbyGroup` and `CapabilityIndex`. The audit suggested
+    /// the `MigrationFailed` arm needed teardown for both
+    /// subsystems; investigation showed neither holds
+    /// per-daemon migration-coupled state today (see the comment
+    /// block at the MigrationFailed arm). This test fires loudly
+    /// if a future change introduces such coupling, signalling
+    /// that the maintainer MUST wire teardown into the arm.
+    ///
+    /// Mechanism: scan the source files for the canonical coupling
+    /// shapes — `daemon_origin` field on `StandbyGroup` /
+    /// `CapabilityIndex`, or migration-handler import of either
+    /// type. Any match indicates the contract has changed and
+    /// `migration_handler.rs:MigrationFailed` likely needs to
+    /// call cleanup on the new state.
+    #[test]
+    fn cr24_no_per_daemon_migration_coupling_in_standby_or_capability() {
+        let standby_src = include_str!("../compute/standby_group.rs");
+        let capability_src = include_str!("../behavior/capability.rs");
+
+        // Cubic P2: strip both line comments (`// ...`) AND block
+        // comments (`/* ... */`, including `/** ... */` doc
+        // comments) before scanning. The earlier filter only
+        // skipped `//` lines, so a token mention inside
+        // `/** ... */` would falsely trip the regression. We
+        // strip block-comment ranges first; the per-line filter
+        // then handles the line-comment case.
+        fn strip_comments(src: &str) -> String {
+            let bytes = src.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut i = 0;
+            while i < bytes.len() {
+                // Skip block comment.
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        // Preserve newlines so per-line scanning still aligns.
+                        if bytes[i] == b'\n' {
+                            out.push(b'\n');
+                        }
+                        i += 1;
+                    }
+                    if i + 1 < bytes.len() {
+                        i += 2; // skip closing */
+                    }
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        }
+
+        let capability_clean = strip_comments(capability_src);
+        let standby_clean = strip_comments(standby_src);
+
+        // CapabilityIndex must NOT index by daemon_origin. Pinned
+        // separately because it's the audit's specific claim.
+        let capability_uses_daemon_origin = capability_clean.lines().any(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("//") && trimmed.contains("daemon_origin")
+        });
+        assert!(
+            !capability_uses_daemon_origin,
+            "CR-24 regression: CapabilityIndex now references `daemon_origin` in \
+             non-comment source. The audit's CR-24 concern was that capabilities \
+             tied to a migrating daemon need teardown on MigrationFailed. With \
+             this new coupling the migration_handler MUST call \
+             `capability_index.cleanup_origin(daemon_origin)` (or equivalent) \
+             in the MigrationFailed arm. Add the call AND update this test."
+        );
+
+        // StandbyGroup must NOT have an "in-flight migration
+        // promotion" field. The audit's scenario was "promotion
+        // mid-flight" — for that to be a real concern, there
+        // would need to be a state field (e.g. `pending_promotion:
+        // Option<...>`) that survives across multiple migration-
+        // handler dispatches.
+        let standby_has_pending = standby_clean.lines().any(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                return false;
+            }
+            trimmed.contains("pending_promotion")
+                || trimmed.contains("migration_in_flight")
+                || trimmed.contains("in_migration:")
+        });
+        assert!(
+            !standby_has_pending,
+            "CR-24 regression: StandbyGroup now has a pending-promotion or \
+             in-migration field. The audit's CR-24 concern was that a mid- \
+             flight standby promotion needs teardown on MigrationFailed. With \
+             this new coupling the migration_handler MUST call rollback on \
+             StandbyGroup in the MigrationFailed arm. Add the rollback call \
+             AND update this test."
         );
     }
 }

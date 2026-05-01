@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 
 use super::migration::{MigrationError, MigrationFailureReason, MigrationPhase, MigrationState};
+use super::migration_source::MigrationSourceHandler;
 use super::registry::DaemonRegistry;
 use crate::adapter::net::continuity::superposition::SuperpositionState;
 use crate::adapter::net::state::causal::{CausalEvent, CausalLink};
@@ -868,16 +869,44 @@ pub struct MigrationOrchestrator {
     daemon_registry: Arc<DaemonRegistry>,
     /// Local node ID.
     local_node_id: u64,
+    /// Source-side migration handler.
+    ///
+    /// Production wiring (`MigrationDispatcher::new`) sets this so
+    /// the local-source path of `start_migration` registers the
+    /// migration in the source-side handler — without that
+    /// registration, `is_migrating(origin)` returns false and
+    /// `DaemonRegistry::deliver` keeps mutating the source daemon's
+    /// state past the snapshot's `seq_through`, so events arriving
+    /// between snapshot capture and cutover would be silently lost.
+    /// Tests that don't exercise the local-source path can leave
+    /// this as `None`; the fallback is direct-snapshot behavior
+    /// with a `tracing::warn!` flagging the gap.
+    source_handler: Option<Arc<MigrationSourceHandler>>,
 }
 
 impl MigrationOrchestrator {
     /// Create a new orchestrator.
+    ///
+    /// The source-side handler defaults to `None`. Production
+    /// callers should chain [`Self::with_source_handler`] to wire
+    /// the orchestrator to the dispatcher's source handler — see
+    /// the field doc for why that matters.
     pub fn new(daemon_registry: Arc<DaemonRegistry>, local_node_id: u64) -> Self {
         Self {
             migrations: DashMap::new(),
             daemon_registry,
             local_node_id,
+            source_handler: None,
         }
+    }
+
+    /// Builder: install the source-side migration handler. Required
+    /// for correct local-source migration behavior.
+    /// `MigrationDispatcher::new` already calls this; tests that
+    /// exercise the local-source code path must call it explicitly.
+    pub fn with_source_handler(mut self, source_handler: Arc<MigrationSourceHandler>) -> Self {
+        self.source_handler = Some(source_handler);
+        self
     }
 
     /// Shared handle to the daemon registry this orchestrator was
@@ -909,17 +938,69 @@ impl MigrationOrchestrator {
 
         let mut state = MigrationState::new(daemon_origin, source_node, target_node);
 
-        // If we are the source, take snapshot locally
+        // If we are the source, take snapshot locally.
         if source_node == self.local_node_id {
-            let snapshot = self
-                .daemon_registry
-                .snapshot(daemon_origin)
-                .map_err(|e| MigrationError::StateFailed(e.to_string()))?
-                .ok_or_else(|| {
-                    MigrationError::StateFailed("daemon is stateless or snapshot failed".into())
-                })?;
+            // The snapshot MUST be routed through the source-side
+            // handler so it gets registered for the migration;
+            // otherwise `source_handler.is_migrating(origin)`
+            // returns false and `DaemonRegistry::deliver` keeps
+            // routing post-snapshot events into the live source
+            // daemon's state, losing them at cutover. The remote-
+            // source path goes through
+            // `source_handler.start_snapshot` via the dispatcher
+            // (`migration_handler.rs:310-312`); we mirror that
+            // here.
+            //
+            // `orchestrator_node` is `local_node_id` here — for a
+            // self-initiated local migration the orchestrator IS this
+            // node, so the source handler's reply-routing field
+            // points back to us.
+            let snapshot = match &self.source_handler {
+                Some(handler) => {
+                    handler.start_snapshot(daemon_origin, target_node, self.local_node_id)?
+                }
+                None => {
+                    // Surface the unwired-source-handler path
+                    // loudly. Production wiring
+                    // (`MigrationDispatcher::new`) always sets the
+                    // handler, so this branch is only reached by
+                    // tests / direct orchestrator construction.
+                    // Gating this with `cfg(not(test))` and Err in
+                    // production would break integration tests
+                    // that link against the library compiled
+                    // WITHOUT `cfg(test)`. Warn-loud is the
+                    // actionable signal: operators running under
+                    // tracing see the missing-handler condition
+                    // without the cfg mismatch silently breaking
+                    // integration tests that intentionally
+                    // exercise the orchestrator without a
+                    // dispatcher.
+                    tracing::warn!(
+                        daemon_origin = format_args!("{:#x}", daemon_origin),
+                        "MigrationOrchestrator::start_migration on local source without \
+                         a source_handler installed — events arriving between snapshot \
+                         capture and cutover may be silently lost. \
+                         Production callers wire the handler via \
+                         `MigrationDispatcher::new`. Direct orchestrator construction \
+                         should call `MigrationOrchestrator::with_source_handler`."
+                    );
+                    self.daemon_registry
+                        .snapshot(daemon_origin)
+                        .map_err(|e| MigrationError::StateFailed(e.to_string()))?
+                        .ok_or_else(|| {
+                            MigrationError::StateFailed(
+                                "daemon is stateless or snapshot failed".into(),
+                            )
+                        })?
+                }
+            };
 
-            let snapshot_bytes = snapshot.to_bytes();
+            // Surface oversized-snapshot errors as a
+            // MigrationError instead of a panic that would crash the
+            // dispatch task without releasing locks.
+            let snapshot_bytes = snapshot
+                .try_to_bytes()
+                .map_err(|e| MigrationError::StateFailed(e.to_string()))?;
             let seq_through = snapshot.through_seq;
 
             state.set_snapshot(snapshot)?;
@@ -1161,6 +1242,20 @@ impl MigrationOrchestrator {
         if record.state.phase() == MigrationPhase::Cutover {
             record.state.cutover_complete()?;
         }
+        // Also resolve `SuperpositionState` here, mirroring
+        // `on_cutover_acknowledged`. On a remote orchestrator
+        // `on_cutover_acknowledged` is a no-op (operates on the
+        // source's local orchestrator, which has no record for
+        // this daemon), so this path is the ONLY authoritative
+        // one. Without the resolve, `SuperpositionState` would be
+        // stuck mid-collapse and operator dashboards / readiness
+        // probes / SDK handles keyed on superposition state
+        // wouldn't observe resolution until `on_activate_ack`
+        // removed the record entirely. The advance/resolve is
+        // idempotent — safe to run on the local-orchestrator path
+        // too if both signals arrive on the same node.
+        record.superposition.advance(MigrationPhase::Complete);
+        record.superposition.resolve();
         Ok(MigrationMessage::ActivateTarget { daemon_origin })
     }
 
@@ -1346,6 +1441,83 @@ mod tests {
         (reg, origin)
     }
 
+    /// CR-32: pin that the unwired-source-handler path emits a
+    /// loud `tracing::warn!` referencing `source_handler`. Pre-fix
+    /// this path silently fell back to `daemon_registry.snapshot`
+    /// — events arriving between snapshot capture and cutover got
+    /// lost.
+    ///
+    /// History: an earlier attempt added a `cfg(not(test))` gate
+    /// that returned `Err` in production. That broke integration
+    /// tests because they link against the library compiled
+    /// WITHOUT `cfg(test)`. Reverted to warn-loud + still-fall-
+    /// back. Production callers wire `source_handler` via
+    /// `MigrationDispatcher::new`; the warn fires only on direct
+    /// orchestrator construction (tests / SDK consumers who skip
+    /// the dispatcher).
+    ///
+    /// Tripwire pins the warn-message shape so a future maintainer
+    /// who removes the `tracing::warn!` (or drops the
+    /// `source_handler` reference) trips the test.
+    #[test]
+    fn cr32_unwired_source_handler_must_emit_loud_warn() {
+        let src = include_str!("orchestrator.rs");
+
+        // Anchor on a string we BUILD at runtime so this test's
+        // own source doesn't contain the verbatim anchor —
+        // otherwise `src.find(anchor)` would match the test's own
+        // literal and the test would silently pass even after the
+        // production warn block was removed.
+        //
+        // The runtime-assembled anchor only matches the
+        // production comment line, which writes the marker as
+        // a plain English phrase rather than concatenating
+        // fragments.
+        let anchor = format!("{}{}{}", "Surface ", "the unwired-", "source-handler");
+        let anchor_idx = src.find(&anchor).expect(
+            "regression: the production unwired-source-handler marker in \
+             start_migration's None arm is gone — either the fix was reverted or \
+             the comment was rewritten. If the fix is intentionally being changed, \
+             update this test.",
+        );
+
+        // Sanity: the anchor must occur exactly ONCE so the
+        // production block is the only match. The earlier shape
+        // would falsely pass if the anchor existed anywhere else
+        // in the file, including in this test's own source.
+        let occurrences = src.matches(&anchor).count();
+        assert_eq!(
+            occurrences, 1,
+            "anchor must occur exactly once in orchestrator.rs (production \
+             site). Got {occurrences} occurrences — the test source likely contains \
+             a verbatim copy of the anchor, defeating the tripwire."
+        );
+
+        let block: String = src[anchor_idx..]
+            .lines()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            block.contains("tracing::warn!"),
+            "regression: unwired-source-handler path must emit \
+             tracing::warn!. Block:\n{}",
+            block
+        );
+        assert!(
+            block.contains("source_handler"),
+            "regression: warn message must reference source_handler"
+        );
+        assert!(
+            block.contains("MigrationDispatcher::new") || block.contains("with_source_handler"),
+            "regression: warn message must point operators at how to wire \
+             the handler (`MigrationDispatcher::new` or \
+             `MigrationOrchestrator::with_source_handler`) so the log line is \
+             actionable. Block:\n{}",
+            block
+        );
+    }
+
     #[test]
     fn test_start_migration_local_source() {
         let (reg, origin) = setup_registry();
@@ -1361,6 +1533,147 @@ mod tests {
 
         assert!(orch.is_migrating(origin));
         assert_eq!(orch.status(origin), Some(MigrationPhase::Transfer));
+    }
+
+    /// Regression for BUG #104: pre-fix the local-source path called
+    /// `daemon_registry.snapshot()` directly and never invoked
+    /// `MigrationSourceHandler::start_snapshot`. The source-side
+    /// handler had no record of the migration; `is_migrating(origin)`
+    /// returned false; callers that consulted the source handler to
+    /// gate their buffering / write-rejection paths skipped them.
+    /// At cutover, `on_cutover` returned `DaemonNotFound` and the
+    /// dispatcher's tolerance fallback swallowed any buffered
+    /// events that *might* have been collected. The fix wires the
+    /// orchestrator to the source handler via `with_source_handler`
+    /// and routes the local-source path through
+    /// `source_handler.start_snapshot`. Pin both halves of the
+    /// post-fix invariant directly.
+    #[test]
+    fn local_source_migration_registers_in_source_handler() {
+        let (reg, origin) = setup_registry();
+        let source_handler = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        let orch =
+            MigrationOrchestrator::new(reg, 0x1111).with_source_handler(source_handler.clone());
+
+        // Pre-condition: no migration registered anywhere.
+        assert!(!source_handler.is_migrating(origin));
+        assert!(!orch.is_migrating(origin));
+
+        let _ = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+
+        // Post-condition: BOTH the orchestrator and the source
+        // handler have records of the migration. Pre-fix only the
+        // orchestrator had a record; the source handler's
+        // `is_migrating(origin)` returned false (the BUG #104
+        // failure mode).
+        assert!(
+            source_handler.is_migrating(origin),
+            "BUG #104 regression: source_handler must have a record \
+             of the local-source migration after `start_migration` \
+             returns",
+        );
+        assert!(orch.is_migrating(origin));
+    }
+
+    /// Regression: pin that the dispatcher's cutover path now finds
+    /// a real `source_handler` record for local-source migrations
+    /// and correctly drains buffered events. Pre-fix `on_cutover`
+    /// returned `DaemonNotFound` for any local-source migration
+    /// (the orchestrator never called `start_snapshot`), and the
+    /// dispatcher's tolerance fallback (`migration_handler.rs:537`)
+    /// swallowed the error and treated the cutover as having no
+    /// buffered events to forward. Post-fix `on_cutover` finds the
+    /// record and returns the buffered events for forwarding.
+    /// A future refactor that drops the `start_snapshot` wire-up
+    /// in the orchestrator's local branch would silently regress
+    /// this end-to-end drain — this test pins it directly.
+    #[test]
+    fn local_source_cutover_drains_buffered_events_through_source_handler() {
+        use crate::adapter::net::state::causal::CausalEvent;
+        use bytes::Bytes;
+
+        let (reg, origin) = setup_registry();
+        let source_handler = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        let orch =
+            MigrationOrchestrator::new(reg, 0x1111).with_source_handler(source_handler.clone());
+
+        let _ = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+
+        // Buffer two events through the source handler — the
+        // dispatcher will drain these on cutover.
+        for seq in 1..=2u64 {
+            let event = CausalEvent {
+                link: CausalLink {
+                    origin_hash: origin,
+                    horizon_encoded: 0,
+                    sequence: seq,
+                    parent_hash: 0,
+                },
+                payload: Bytes::from_static(b"buffered"),
+                received_at: 0,
+            };
+            assert!(source_handler.buffer_event(origin, event).unwrap());
+        }
+
+        let drained = source_handler
+            .on_cutover(origin)
+            .expect("post-fix on_cutover must find the local-source migration record");
+        assert_eq!(
+            drained.len(),
+            2,
+            "cutover must drain the buffered events for forwarding to target — \
+             pre-fix this returned `DaemonNotFound` for local-source migrations \
+             and the buffered events were silently lost",
+        );
+    }
+
+    /// Regression: with the source handler registered (BUG #104
+    /// fix), `source_handler.buffer_event` is now invokable for a
+    /// local-source migration. Pre-fix it returned `Ok(false)`
+    /// ("no migration active") because `start_snapshot` had never
+    /// run. Pin the fix-enabled-functionality directly: a caller
+    /// that funnels post-snapshot events through
+    /// `source_handler.buffer_event` gets them buffered (and
+    /// drainable at cutover via `on_cutover`).
+    #[test]
+    fn local_source_migration_enables_source_handler_buffering() {
+        use crate::adapter::net::state::causal::CausalEvent;
+        use bytes::Bytes;
+
+        let (reg, origin) = setup_registry();
+        let source_handler = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        let orch =
+            MigrationOrchestrator::new(reg, 0x1111).with_source_handler(source_handler.clone());
+
+        let _ = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+
+        // Now post-snapshot events can be buffered via the source
+        // handler. Pre-fix this returned `Ok(false)` because
+        // `is_migrating(origin)` was false.
+        let event = CausalEvent {
+            link: CausalLink {
+                origin_hash: origin,
+                horizon_encoded: 0,
+                sequence: 1,
+                parent_hash: 0,
+            },
+            payload: Bytes::from_static(b"post-snapshot event"),
+            received_at: 0,
+        };
+        let buffered = source_handler.buffer_event(origin, event).unwrap();
+        assert!(
+            buffered,
+            "BUG #104 fix must enable source-handler buffering for \
+             local-source migrations — pre-fix `buffer_event` returned \
+             `Ok(false)` because the migration was never registered",
+        );
+
+        let drained = source_handler.take_buffered_events(origin).unwrap();
+        assert_eq!(
+            drained.len(),
+            1,
+            "buffered event must be drainable through the source handler",
+        );
     }
 
     #[test]

@@ -8,7 +8,9 @@
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::adapter::net::identity::EntityKeypair;
-use crate::adapter::net::state::causal::{CausalChainBuilder, CausalLink, ChainError};
+use crate::adapter::net::state::causal::{
+    CausalChainBuilder, CausalLink, ChainError, CAUSAL_LINK_SIZE,
+};
 
 /// A detected discontinuity in an entity's causal chain.
 #[derive(Debug, Clone)]
@@ -157,8 +159,8 @@ impl ForkRecord {
             && self.original_origin != self.forked_origin
     }
 
-    /// Wire size: 4 + 4 + 8 + 24 + 1 + 8 = 49 bytes max.
-    pub const WIRE_SIZE: usize = 49;
+    /// Wire size: 4 + 4 + 8 + CAUSAL_LINK_SIZE + 1 + 8 = 53 bytes.
+    pub const WIRE_SIZE: usize = 4 + 4 + 8 + CAUSAL_LINK_SIZE + 1 + 8;
 
     /// Serialize to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -212,9 +214,16 @@ impl ForkRecord {
         let original_origin = u32::from_le_bytes(data[0..4].try_into().unwrap());
         let forked_origin = u32::from_le_bytes(data[4..8].try_into().unwrap());
         let fork_seq = u64::from_le_bytes(data[8..16].try_into().unwrap());
-        let fork_genesis = CausalLink::from_bytes(&data[16..40])?;
-        let has_snapshot = data[40] != 0;
-        let snapshot_seq = u64::from_le_bytes(data[41..49].try_into().unwrap());
+        // Field offsets are computed from the prefix lengths above
+        // plus `CAUSAL_LINK_SIZE` so a future wire-size change to
+        // the causal link is picked up here automatically. Pre-#130
+        // these were hand-encoded (16..40 for the link, 40 for the
+        // snapshot flag, 41..49 for the snapshot seq) and silently
+        // mis-parsed when the link width changed.
+        let link_end = 16 + CAUSAL_LINK_SIZE;
+        let fork_genesis = CausalLink::from_bytes(&data[16..link_end])?;
+        let has_snapshot = data[link_end] != 0;
+        let snapshot_seq = u64::from_le_bytes(data[link_end + 1..link_end + 9].try_into().unwrap());
         let from_snapshot_seq = if has_snapshot {
             Some(snapshot_seq)
         } else {

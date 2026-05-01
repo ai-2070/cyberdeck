@@ -160,6 +160,18 @@ impl EntityLog {
     /// Prune events up to and including a sequence number.
     ///
     /// Called after a snapshot is taken at that sequence.
+    ///
+    /// `snapshot_seq` is only advanced when `last_pruned.is_some()`
+    /// — i.e. a real event was actually pruned. The pruning
+    /// side-effects (`base_link`, `head_payload`) only fire when
+    /// at least one event is removed, so unconditionally bumping
+    /// `snapshot_seq` whenever `seq > self.snapshot_seq` (even on
+    /// an empty log, or when `seq < first_event.sequence`) would
+    /// leave `base_link.sequence` behind, producing a permanent
+    /// desync where `head_seq().max(snapshot_seq())` returns a
+    /// value the next append can't agree with. Callers that need
+    /// to install an externally-coordinated snapshot anchor on an
+    /// empty log should use `from_snapshot` instead.
     pub fn prune_through(&mut self, seq: u64) {
         // Capture the last pruned event's link and payload so that base_link
         // remains a valid chain anchor if all events are removed. Without this,
@@ -173,7 +185,12 @@ impl EntityLog {
             .map(|e| (e.link, e.payload.clone()));
 
         self.events.retain(|e| e.link.sequence > seq);
-        if seq > self.snapshot_seq {
+        // Gate the snapshot_seq bump on having actually pruned
+        // something. A no-op prune (empty log, or seq below the
+        // first event) must not advance the marker — otherwise
+        // `snapshot_seq` desyncs from `base_link.sequence` and
+        // future appends are rejected against the implied gap.
+        if last_pruned.is_some() && seq > self.snapshot_seq {
             self.snapshot_seq = seq;
         }
         // Update base_link (used as fallback when events is empty) and
@@ -483,6 +500,88 @@ mod tests {
         assert!(
             log.append(genesis).is_err(),
             "duplicate genesis must be rejected after log has events"
+        );
+    }
+
+    // ========================================================================
+    // BUG #129: prune_through(seq) on empty / out-of-range logs must not
+    // desync snapshot_seq from base_link.sequence
+    // ========================================================================
+
+    /// `prune_through` on an empty log is a no-op — `snapshot_seq`
+    /// must NOT advance past `base_link.sequence`. Pre-fix it
+    /// blindly bumped the marker, leaving a phantom snapshot
+    /// reference that no append could honor.
+    #[test]
+    fn prune_through_on_empty_log_does_not_advance_snapshot_seq() {
+        let (_, entity_id) = make_entity();
+        let mut log = EntityLog::new(entity_id);
+
+        // Pre-condition: fresh log has snapshot_seq == 0.
+        assert_eq!(log.snapshot_seq(), 0);
+        assert!(log.is_empty());
+
+        // Caller supplies an externally-coordinated seq; with no
+        // events to prune, the marker must stay put. The correct
+        // way to install an external snapshot anchor is
+        // `from_snapshot`, not this no-op call.
+        log.prune_through(1000);
+
+        assert_eq!(
+            log.snapshot_seq(),
+            0,
+            "no-op prune_through must not advance snapshot_seq",
+        );
+        // base_link.sequence remained at 0 (genesis), so head_seq()
+        // and snapshot_seq() agree.
+        assert_eq!(log.head_seq(), 0);
+    }
+
+    /// `prune_through(seq)` where `seq` is below the first event's
+    /// sequence must also be a no-op for `snapshot_seq` — pruning
+    /// found nothing to remove, so there's no recoverable anchor
+    /// at `seq`.
+    #[test]
+    fn prune_through_below_first_event_does_not_advance_snapshot_seq() {
+        let (_, entity_id) = make_entity();
+        let origin_hash = entity_id.origin_hash();
+        let mut log = EntityLog::new(entity_id);
+        let mut builder = CausalChainBuilder::new(origin_hash);
+        for i in 0..5 {
+            let event = builder.append(Bytes::from(format!("e{}", i)), 0).unwrap();
+            log.append(event).unwrap();
+        }
+        // The log holds events 1..=5. Try to prune at seq=0
+        // (below the first event) — nothing matches.
+        log.prune_through(0);
+
+        assert_eq!(log.len(), 5, "no events were pruned");
+        assert_eq!(
+            log.snapshot_seq(),
+            0,
+            "prune that touched no events must not advance snapshot_seq",
+        );
+    }
+
+    /// A successful prune still advances `snapshot_seq` — pins the
+    /// happy path so the BUG #129 gate doesn't accidentally lock
+    /// out legitimate pruning.
+    #[test]
+    fn prune_through_advances_snapshot_seq_when_events_pruned() {
+        let (_, entity_id) = make_entity();
+        let origin_hash = entity_id.origin_hash();
+        let mut log = EntityLog::new(entity_id);
+        let mut builder = CausalChainBuilder::new(origin_hash);
+        for i in 0..5 {
+            let event = builder.append(Bytes::from(format!("e{}", i)), 0).unwrap();
+            log.append(event).unwrap();
+        }
+        log.prune_through(3);
+        assert_eq!(log.len(), 2, "events 4 and 5 remain");
+        assert_eq!(
+            log.snapshot_seq(),
+            3,
+            "snapshot_seq must advance when prune actually removed events",
         );
     }
 }

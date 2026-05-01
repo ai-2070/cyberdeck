@@ -11,6 +11,13 @@
 //! - Multi-threaded concurrency (Phase 2)
 //! - Router and fair scheduler (Phase 3A)
 
+// The diff-application benches intentionally exercise the
+// deprecated `DiffEngine::apply` (version-naive) entry point. The
+// deprecation warning is the right signal for production callers
+// but only noise for the benchmark, which is measuring the
+// primitive's cost.
+#![allow(deprecated)]
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::sync::Arc;
 use std::thread;

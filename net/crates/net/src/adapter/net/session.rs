@@ -3,6 +3,7 @@
 //! This module manages session state after Noise handshake completion,
 //! including per-stream state for multiplexing.
 
+use bytes::Bytes;
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
 use std::net::SocketAddr;
@@ -15,9 +16,12 @@ use std::time::Instant;
 use crate::event::StoredEvent;
 
 use super::crypto::{PacketCipher, SessionKeys};
-use super::pool::{SharedLocalPool, SharedPacketPool};
+// `SharedPacketPool` is intentionally absent — `NetSession` uses
+// only `SharedLocalPool` as the single TX-side AEAD source.
+use super::pool::SharedLocalPool;
 use super::reliability::{create_reliability_mode, ReliabilityMode};
 use super::stream::DEFAULT_STREAM_WINDOW_BYTES;
+use super::transport::ParsedPacket;
 
 /// TIME_WAIT-style quarantine window after `close_stream`. A
 /// `StreamWindow` grant that arrives for a stream closed within
@@ -38,17 +42,24 @@ pub struct NetSession {
     session_id: u64,
     /// Remote peer address
     peer_addr: SocketAddr,
-    /// TX cipher (ChaCha20-Poly1305 with counter-based nonces)
-    tx_cipher: PacketCipher,
     /// RX cipher (ChaCha20-Poly1305 with counter-based nonces)
     rx_cipher: PacketCipher,
+    // No `tx_key` field: `thread_local_pool` is the only surface
+    // that holds the TX key on a live `NetSession`. Storing an
+    // extra copy here would re-open a cross-pool nonce-reuse
+    // hazard — independent counters under the same ChaCha20-
+    // Poly1305 key — and would only be read back through a
+    // `tx_key()` accessor whose only consumers are misuses (e.g.
+    // a fresh `PacketBuilder::new` that bypasses the
+    // thread-local pool's nonce sequencing).
     /// Per-stream state
     streams: DashMap<u64, StreamState>,
     /// Last activity timestamp (for session timeout)
     last_activity: AtomicU64,
-    /// Packet pool for zero-allocation building
-    packet_pool: SharedPacketPool,
-    /// Thread-local pool for zero-contention hot path
+    /// Thread-local pool for zero-contention hot path. The single
+    /// authoritative source of TX-side AEAD encryptions for this
+    /// session — see the `tx_key` comment above for the
+    /// cross-pool nonce-reuse rationale.
     thread_local_pool: SharedLocalPool,
     /// Default reliability mode for new streams
     default_reliable: bool,
@@ -93,21 +104,27 @@ impl NetSession {
         pool_size: usize,
         default_reliable: bool,
     ) -> Self {
-        let tx_cipher = PacketCipher::new(&keys.tx_key, keys.session_id);
         let rx_cipher = PacketCipher::new(&keys.rx_key, keys.session_id);
 
-        let packet_pool = super::pool::shared_pool(pool_size, &keys.tx_key, keys.session_id);
+        // Only `thread_local_pool` is constructed with the TX key.
+        // Independently constructing a `tx_cipher` and a
+        // `packet_pool` with the same key but independent counters
+        // would re-open a cross-pool nonce-reuse hazard — see the
+        // `tx_key` comment above. The data path uses
+        // `thread_local_pool` exclusively.
         let thread_local_pool =
             super::pool::shared_local_pool(pool_size, &keys.tx_key, keys.session_id);
 
+        // `tx_key` is consumed only by `shared_local_pool` above.
+        // Copying it into a struct field would be dead storage and
+        // a cross-pool footgun (see the `tx_key` comment on the
+        // struct above).
         Self {
             session_id: keys.session_id,
             peer_addr,
-            tx_cipher,
             rx_cipher,
             streams: DashMap::new(),
             last_activity: AtomicU64::new(current_timestamp()),
-            packet_pool,
             thread_local_pool,
             default_reliable,
             active: AtomicBool::new(true),
@@ -148,11 +165,13 @@ impl NetSession {
         self.peer_addr
     }
 
-    /// Get the TX cipher
-    #[inline]
-    pub fn tx_cipher(&self) -> &PacketCipher {
-        &self.tx_cipher
-    }
+    // No `tx_key()` accessor exists — it would be a public
+    // footgun with no legitimate callers. Any caller using
+    // `session.tx_key()` to construct a fresh `PacketBuilder`
+    // would re-introduce a cross-pool nonce-reuse hazard
+    // (independent counters under the same ChaCha20-Poly1305 key).
+    // All TX-side AEAD operations flow through `thread_local_pool`
+    // via `build_heartbeat` and the normal `send_*` paths.
 
     /// Get the RX cipher
     #[inline]
@@ -546,6 +565,22 @@ impl NetSession {
             }
         }
 
+        // Piggyback on this idle-stream sweep: drop any
+        // `recently_closed` entry whose insertion time is past
+        // `GRANT_QUARANTINE_WINDOW`. Without this sweep,
+        // `recently_closed` would only get GC'd by
+        // `is_grant_quarantined`, which is called only when an
+        // inbound `StreamWindow` grant arrives for that exact
+        // `stream_id`. A long-lived peer that opens/closes many
+        // distinct stream IDs (e.g., one short-lived stream per
+        // RPC) and never receives a late grant for each closed
+        // stream would accumulate one entry per closed stream
+        // forever — N streams/sec → ~N×T entries after T seconds,
+        // unbounded. The sweep itself is bounded by the existing
+        // eviction cadence so there's no extra wakeup cost.
+        self.recently_closed
+            .retain(|_, inserted_at| inserted_at.elapsed() < GRANT_QUARANTINE_WINDOW);
+
         evicted
     }
 
@@ -557,16 +592,71 @@ impl NetSession {
         self.streams.get(&stream_id)
     }
 
-    /// Get the packet pool
-    #[inline]
-    pub fn packet_pool(&self) -> &SharedPacketPool {
-        &self.packet_pool
-    }
-
     /// Get the thread-local pool for zero-contention packet building
     #[inline]
     pub fn thread_local_pool(&self) -> &SharedLocalPool {
         &self.thread_local_pool
+    }
+
+    /// Build an AEAD-authenticated heartbeat packet for this session.
+    ///
+    /// Routes through `thread_local_pool` so the heartbeat shares
+    /// its TX counter with data-path packets — heartbeats and data
+    /// interleave cleanly on the wire, and the receiver's replay
+    /// window admits them in either order.
+    ///
+    /// Wrapping heartbeat construction in this method removes the
+    /// surface that would otherwise let callers build heartbeats
+    /// with a fresh `PacketBuilder::new(&[0u8; 32], session_id)`,
+    /// which (a) would use the wrong key so the receiver's AEAD
+    /// verify would reject every heartbeat, and (b) would reuse
+    /// counter=0 across successive heartbeats so the replay window
+    /// would reject every heartbeat after the first.
+    #[inline]
+    pub fn build_heartbeat(&self) -> Bytes {
+        self.thread_local_pool.get().build_heartbeat()
+    }
+
+    /// Verify an inbound heartbeat's AEAD tag against this session's
+    /// RX cipher, commit the counter into the replay window, and
+    /// refresh `last_activity`. Returns `true` if the packet was
+    /// accepted; the session is mutated only on success.
+    ///
+    /// Verify and touch are fused into a single call so callers
+    /// cannot get the order wrong (verify-then-touch, never the
+    /// reverse) or forget to touch (which would defeat session
+    /// idle-timeout for legitimate heartbeats).
+    ///
+    /// Source-address validation (legacy adapter: 1:1 source per
+    /// session) and any post-accept observation (mesh:
+    /// `failure_detector.heartbeat`) remain the caller's
+    /// responsibility — those policies vary by adapter and don't
+    /// belong inside the helper.
+    ///
+    /// Heartbeats MUST decrypt the AEAD tag rather than be fast-
+    /// pathed through to `failure_detector.heartbeat` and
+    /// `session.touch()` based on `is_heartbeat()` alone — without
+    /// the decrypt step, an off-path attacker who observed the
+    /// cleartext `session_id` and source UDP address could spoof
+    /// heartbeats indefinitely.
+    pub fn verify_and_touch_heartbeat(&self, parsed: &ParsedPacket) -> bool {
+        let aad = parsed.header.aad();
+        let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
+        if !self.rx_cipher.is_valid_rx_counter(counter) {
+            return false;
+        }
+        if self
+            .rx_cipher
+            .decrypt(counter, &aad, &parsed.payload)
+            .is_err()
+        {
+            return false;
+        }
+        if !self.rx_cipher.update_rx_counter(counter) {
+            return false;
+        }
+        self.touch();
+        true
     }
 
     /// Update last activity timestamp
@@ -698,10 +788,30 @@ pub struct StreamState {
 
 /// Receive-side credit bookkeeping for the v2 round-trip window.
 ///
-/// Tracks how much credit this receiver has extended to the sender vs
-/// how much it has "consumed" (accepted off the wire). When the
-/// sender's implicit remaining credit dips below half the window, a
-/// `StreamWindow` grant is emitted and `granted` is bumped.
+/// Tracks how much credit this receiver has extended to the sender
+/// vs how much it has "consumed" (accepted off the wire).
+///
+/// **Accounting cadence:** this is receive-time accounting, NOT
+/// application-drain accounting. Every accepted packet calls
+/// [`Self::on_bytes_consumed`] from
+/// the dispatch loop (`mesh.rs::process_local_packet`), which
+/// bumps both `consumed` and `granted` by the on-wire byte
+/// count. The "outstanding" credit (`granted - consumed`)
+/// therefore stays pinned at the initial window — every byte
+/// received is paired with a matching grant.
+///
+/// This shape exists to close the v1 io::Error-on-full-kernel-
+/// buffer gap (a single serial sender used to run
+/// `Transport(io::Error)` into a full kernel buffer). Per-stream
+/// kernel-buffer protection comes from the round-trip grant
+/// loop; per-application throttling comes from a separate
+/// mechanism (per-shard queue-depth limits).
+///
+/// An earlier version of this docstring described a
+/// threshold-emit pattern ("when outstanding dips below half
+/// the window, a grant is emitted"). That description didn't
+/// match the implementation and contradicted the v2 design
+/// goal — it has been superseded by the description above.
 ///
 /// `window_bytes` is the per-grant chunk size — also the size of the
 /// sender's implicit initial window at open time. `0` disables
@@ -717,9 +827,10 @@ pub struct RxCreditState {
     /// `consumed <= granted` (unless the sender overshoots the initial
     /// window before the first grant — recoverable transient).
     consumed: AtomicU64,
-    /// Per-grant chunk size (bytes). Threshold-emit fires when the
-    /// outstanding credit `granted - consumed` would dip to or below
-    /// `window_bytes / 2`. `0` disables emission.
+    /// Per-grant chunk size (bytes). Equal to the sender's initial
+    /// window at open time. Used by the caller to size grant emission
+    /// — see [`Self::on_bytes_consumed`]. `0` disables emission
+    /// (the v1 unbounded escape hatch).
     window_bytes: u32,
 }
 
@@ -782,6 +893,19 @@ impl RxCreditState {
         if self.window_bytes == 0 {
             return None;
         }
+        // The v2 design intentionally accounts at receive time
+        // (not application-drain time) — see `mesh.rs:3110-3135`
+        // ("Accounting runs at receive time (not drain time); this
+        // closes the v1 gap where a single serial sender ran
+        // `Transport(io::Error)` into a full kernel buffer"). The
+        // credit window is for kernel-buffer protection, not
+        // application-side throttling; the latter is provided by
+        // per-shard queue-depth limits.
+        //
+        // Every call mints a matching grant of `bytes`, returning
+        // the running cumulative consumed count for the caller to
+        // ship as `total_consumed` in an authoritative
+        // `StreamWindow` packet.
         let new_consumed = self.consumed.fetch_add(bytes, Ordering::AcqRel) + bytes;
         self.granted.fetch_add(bytes, Ordering::AcqRel);
         Some(new_consumed)
@@ -1253,6 +1377,100 @@ impl std::fmt::Debug for SessionManager {
 use super::current_timestamp;
 
 #[cfg(test)]
+mod heartbeat_api_drift_check {
+    //! Tripwire for the heartbeat-unification invariant: every
+    //! production-side caller in `mod.rs` and `mesh.rs` that
+    //! constructs a heartbeat must go through
+    //! [`NetSession::build_heartbeat`]. See
+    //! `docs/HEARTBEAT_UNIFICATION_PLAN.md` Step 4.
+    //!
+    //! `PacketBuilder::new` is `pub(crate)` so the type system
+    //! already forbids external callers. Within the crate,
+    //! though, a future contributor could legitimately add a new
+    //! production caller that reaches into the pool directly
+    //! (`session.thread_local_pool().get().build_heartbeat()`)
+    //! and bypass the session helper — that pattern was the bug
+    //! shape behind #97/#106. This test counts the approved
+    //! production call sites and fails if a new one appears
+    //! without an explicit allowlist update, forcing the
+    //! contributor to confirm the design choice.
+    //!
+    //! The test scans only the *production* prefixes of each
+    //! file (everything before the first column-0
+    //! `#[cfg(test)]`), which excludes the test modules where
+    //! `PacketBuilder::new(&keys.tx_key, ...)` is the canonical
+    //! way to build a heartbeat for a manually-constructed
+    //! peer session.
+
+    fn production_prefix(src: &str) -> &str {
+        // Top-level test modules are tagged with a column-0
+        // `#[cfg(test)]` immediately followed by `mod`. Find the
+        // first such marker and treat everything before it as
+        // production code. Nested `#[cfg(test)]` mods (indented
+        // inside an `impl` or inline `mod` block) are NOT cut
+        // here, so production code in those files that follows
+        // a nested test mod is still checked. False positives
+        // from nested-test-mod content are unlikely because none
+        // of the nested test mods in this codebase reference
+        // `build_heartbeat`.
+        let needle = "\n#[cfg(test)]\nmod ";
+        match src.find(needle) {
+            Some(idx) => &src[..idx],
+            None => src,
+        }
+    }
+
+    fn count_build_heartbeat_callers(src: &str) -> Vec<String> {
+        src.lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                // Skip comments / doc-comments.
+                if trimmed.starts_with("//") {
+                    return false;
+                }
+                line.contains(".build_heartbeat(")
+            })
+            .map(|line| line.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn mod_rs_production_callers_match_allowlist() {
+        let prod = production_prefix(include_str!("mod.rs"));
+        let callers = count_build_heartbeat_callers(prod);
+        // The only approved production caller in mod.rs:
+        //   `let packet = session.build_heartbeat();`
+        // inside `spawn_heartbeat`. Pre-fix this read
+        //   `let packet = pooled.build_heartbeat();`
+        // — that pattern is the regression we want to catch.
+        let approved = ["let packet = session.build_heartbeat();"];
+        assert_eq!(
+            callers,
+            approved.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "mod.rs production callers of `.build_heartbeat()` drifted from the \
+             approved allowlist. If you intentionally added a new caller, route it \
+             through `Session::build_heartbeat` and update this allowlist. \
+             See docs/HEARTBEAT_UNIFICATION_PLAN.md."
+        );
+    }
+
+    #[test]
+    fn mesh_rs_production_callers_match_allowlist() {
+        let prod = production_prefix(include_str!("mesh.rs"));
+        let callers = count_build_heartbeat_callers(prod);
+        let approved = ["let packet = session.build_heartbeat();"];
+        assert_eq!(
+            callers,
+            approved.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "mesh.rs production callers of `.build_heartbeat()` drifted from the \
+             approved allowlist. If you intentionally added a new caller, route it \
+             through `Session::build_heartbeat` and update this allowlist. \
+             See docs/HEARTBEAT_UNIFICATION_PLAN.md."
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1454,6 +1672,50 @@ mod tests {
         let evicted = session.evict_idle_streams(Duration::from_nanos(u64::MAX), 1, "test");
         assert_eq!(evicted, 2);
         assert_eq!(session.stream_count(), 1);
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #105: pre-fix
+    /// `recently_closed` only got garbage-collected by
+    /// `is_grant_quarantined` on inbound `StreamWindow` grants.
+    /// A peer churning short-lived streams without receiving a
+    /// late grant for each accumulates one entry per closed
+    /// stream forever. Post-fix `evict_idle_streams` also
+    /// sweeps `recently_closed`, dropping entries past
+    /// `GRANT_QUARANTINE_WINDOW`.
+    #[test]
+    fn evict_idle_streams_sweeps_recently_closed_past_quarantine_window() {
+        let keys = test_keys();
+        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        // Manually pre-populate `recently_closed` with entries
+        // whose timestamps are well past the quarantine window.
+        let stale_inserted_at = Instant::now() - GRANT_QUARANTINE_WINDOW - Duration::from_secs(1);
+        session.recently_closed.insert(0xAAAA, stale_inserted_at);
+        session.recently_closed.insert(0xBBBB, stale_inserted_at);
+
+        // Add a fresh entry that should NOT be swept yet.
+        session.recently_closed.insert(0xFEEDC0DE, Instant::now());
+
+        assert_eq!(session.recently_closed.len(), 3);
+
+        // Run the sweep. No streams to evict (we didn't open
+        // any), but the recently_closed sweep should still fire.
+        session.evict_idle_streams(Duration::from_millis(1), usize::MAX, "test");
+
+        // Stale entries dropped; fresh entry kept.
+        assert!(
+            !session.recently_closed.contains_key(&0xAAAA),
+            "stale recently_closed entry past quarantine window must be swept"
+        );
+        assert!(
+            !session.recently_closed.contains_key(&0xBBBB),
+            "stale recently_closed entry past quarantine window must be swept"
+        );
+        assert!(
+            session.recently_closed.contains_key(&0xFEEDC0DE),
+            "fresh recently_closed entry within quarantine window must survive"
+        );
     }
 
     #[test]
@@ -1796,11 +2058,40 @@ mod tests {
     fn test_rx_credit_emits_authoritative_total_consumed() {
         // Every `on_bytes_consumed` returns the receiver's running
         // cumulative consumed count, which the caller ships as the
-        // `total_consumed` field of an authoritative grant.
+        // `total_consumed` field of an authoritative grant. The
+        // function bumps both `consumed` and `granted` by `bytes`
+        // — receive-time accounting, see `RxCreditState` rustdoc
+        // and BUG #84 in BUG_AUDIT_2026_04_30_CORE.md.
         let state = StreamState::new_full(false, 1, 100);
         assert_eq!(state.on_bytes_consumed(60), Some(60));
         assert_eq!(state.on_bytes_consumed(14), Some(74));
         assert_eq!(state.on_bytes_consumed(1), Some(75));
+    }
+
+    /// Regression: the v2 receive-time-accounting design (BUG #84
+    /// resolution) keeps `outstanding = granted - consumed`
+    /// pinned at the initial window size. The credit window is
+    /// for kernel-buffer protection — application-side throttling
+    /// is provided by per-shard queue-depth limits, not this
+    /// counter. This test pins the invariant.
+    #[test]
+    fn rx_credit_outstanding_stays_at_window_under_receive_time_accounting() {
+        let state = StreamState::new_full(false, 1, 100);
+        let rx = state.rx_credit();
+        // Initial: granted=100, consumed=0, outstanding=100.
+        assert_eq!(rx.outstanding(), 100);
+
+        state.on_bytes_consumed(30);
+        // Receive-time grant: granted=130, consumed=30. outstanding=100.
+        assert_eq!(rx.outstanding(), 100);
+
+        state.on_bytes_consumed(70);
+        // granted=200, consumed=100. outstanding=100.
+        assert_eq!(rx.outstanding(), 100);
+
+        // The pre-fix audit framing claimed this was a bug; closer
+        // inspection showed it's the documented v2 design. See
+        // `RxCreditState` rustdoc + `mesh.rs:3110-3135`.
     }
 
     #[test]
@@ -2202,6 +2493,35 @@ mod tests {
         /// Test-only accessor for the captured epoch.
         fn epoch_for_test(&self) -> u64 {
             self.epoch
+        }
+    }
+
+    /// CR-12: pin that no `tx_key` method exists on `NetSession`.
+    /// This is a source-string tripwire — if a future maintainer
+    /// reintroduces the accessor, the test fires loudly. The hazard
+    /// it gates (BUG #97/#106 cross-pool nonce reuse) is dormant
+    /// unless someone calls a `tx_key()` method, so a behavioural
+    /// test would not catch the regression in time. We assemble
+    /// the forbidden token at runtime so the test's OWN source
+    /// doesn't contain the literal it scans for.
+    #[test]
+    fn cr12_tx_key_accessor_must_not_exist_on_net_session() {
+        // Build the forbidden token at runtime: `fn` + space + `tx_key` + `(`.
+        // The literal `fn tx_key(` shape is what we must NOT see in
+        // a non-comment line in the source.
+        let needle = format!("{} {}{}", "fn", "tx_key", "(");
+
+        let src = include_str!("session.rs");
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue; // doc-comment / line comment
+            }
+            assert!(
+                !trimmed.contains(&needle),
+                "CR-12 regression: tx_key accessor reintroduced into session.rs:\n  {}",
+                line
+            );
         }
     }
 }

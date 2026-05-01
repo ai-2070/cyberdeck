@@ -14,7 +14,17 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["redis"]
-redis = ["net/redis"]
+# Pulls in `net-sdk` at its `redis` sub-feature for the
+# `RedisStreamDedup` consumer helper. The dedup helper is a thin
+# NAPI wrapper around the canonical Rust implementation rather
+# than a re-implementation.
+#
+# Each Node feature opts in explicitly via its own
+# `net-sdk/<sub>` activation below; the `[dependencies]` line for
+# `net-sdk` clears its default features so a Redis-only consumer
+# build does not transitively compile the compute / groups
+# surfaces.
+redis = ["net/redis", "dep:net-sdk", "net-sdk/redis"]
 jetstream = ["net/jetstream"]
 # Core mesh transport. Bundles the identity, capabilities, and
 # subnet surfaces — they share `adapter::net`'s subprotocol dispatch
@@ -36,13 +46,15 @@ nat-traversal = ["net", "net/nat-traversal"]
 # Builds on `nat-traversal`.
 port-mapping = ["nat-traversal", "net/port-mapping"]
 cortex = ["net/netdb", "net/redex-disk"]
-# Compute surface — `DaemonRuntime`, `MeshDaemon`, migration. Stage 3
-# of SDK_COMPUTE_SURFACE_PLAN. Depends on `net` (mesh transport is
-# what daemons ride) and brings in `net-sdk` at its `compute` feature
-# for the already-shipped Rust surface. `dashmap` is added here
-# because the compute module keeps a `kind -> TSFN` map that needs
+# Compute surface — `DaemonRuntime`, `MeshDaemon`, migration.
+# Depends on `net` (mesh transport is what daemons ride) and
+# brings in `net-sdk` at its `compute` feature for the
+# already-shipped Rust surface. `dashmap` is added here because
+# the compute module keeps a `kind -> TSFN` map that needs
 # concurrent access without serializing the whole NAPI runtime.
-compute = ["net", "dep:net-sdk", "dep:dashmap"]
+# `net-sdk/compute` is forwarded explicitly so the SDK's compute
+# code only compiles when this feature is active.
+compute = ["net", "dep:net-sdk", "net-sdk/compute", "dep:dashmap"]
 # HA / scaling overlays — `ReplicaGroup` / `ForkGroup` / `StandbyGroup`.
 # Follows `SDK_GROUPS_SURFACE_PLAN.md`. Sits on top of `compute`.
 # Forwards to `net-sdk/groups` so the SDK groups surface is only
@@ -58,7 +70,7 @@ test-helpers = ["groups"]
 
 [dependencies]
 net = { path = "../..", default-features = false }
-net-sdk = { path = "../../sdk", default-features = false, features = ["compute"], optional = true }
+net-sdk = { path = "../../sdk", default-features = false, optional = true }
 dashmap = { version = "6", optional = true }
 napi = { version = "3.7.0", default-features = false, features = ["napi4", "napi6", "async", "tokio_rt"] }
 napi-derive = "3.4.0"

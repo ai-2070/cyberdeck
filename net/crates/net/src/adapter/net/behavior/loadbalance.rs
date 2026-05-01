@@ -359,9 +359,21 @@ impl EndpointState {
 
     /// Returns true if new requests should be rejected for this endpoint.
     ///
-    /// When the recovery window has elapsed, exactly one request is admitted
-    /// as a probe (half-open state). All others continue to see the circuit
-    /// as open until the probe's outcome is recorded via `record_completion`.
+    /// **Pure predicate** — this method has no side effects. The
+    /// half-open probe slot is claimed lazily at selection time
+    /// via [`try_claim_half_open_probe`], so only the endpoint
+    /// actually chosen by the selector claims the probe.
+    ///
+    /// Conflating "is the circuit open?" with "CAS-claim the
+    /// half-open probe slot when the recovery window has elapsed"
+    /// would let `get_available_endpoints` claim the probe slot
+    /// for every endpoint it filters. A multi-endpoint outage past
+    /// its recovery window would then have every endpoint claim
+    /// the probe slot in the scan while only one (or zero) was
+    /// selected. The N-1 others would hold
+    /// `half_open_probe == true` with no in-flight request and no
+    /// completion path — every subsequent `is_circuit_open` would
+    /// return true forever.
     fn is_circuit_open(&self, recovery_time: Duration) -> bool {
         if !self.circuit_open.load(Ordering::Acquire) {
             return false;
@@ -373,11 +385,100 @@ impl EndpointState {
         if open_time.elapsed() < recovery_time {
             return true;
         }
-        // Recovery window elapsed — try to claim the single probe slot. If
-        // CAS fails, another probe is in flight and we keep rejecting.
+        // Recovery window has elapsed — the endpoint is admitting
+        // a half-open probe. If the probe slot is already taken,
+        // another request is in flight and we keep rejecting.
+        // Otherwise we admit (the caller will CAS-claim the slot
+        // via `try_claim_half_open_probe` only on the endpoint it
+        // actually selects).
+        self.half_open_probe.load(Ordering::Acquire)
+    }
+
+    /// Try to claim the half-open probe slot.
+    ///
+    /// Returns an [`Option<ProbeGuard<'_>>`]; the `Some` arm
+    /// carries an RAII guard whose `Drop` releases the slot
+    /// automatically. Callers that successfully drive the request
+    /// to completion MUST invoke [`ProbeGuard::commit`] before
+    /// dispatching to the network — `record_completion` is then
+    /// the path that clears the flag. Any other exit (panic
+    /// between claim and dispatch, future cancellation, fall-
+    /// through error) drops the guard and the slot rolls back
+    /// atomically.
+    ///
+    /// This guard API is intended for ASYNC callers where the
+    /// claim → completion window is materially wide (a request
+    /// future spanning a network round-trip, where cancellation
+    /// or panic between the two is plausible). The synchronous
+    /// `select` path at this module's top uses a direct
+    /// `compare_exchange` on `half_open_probe` because its claim
+    /// → release window is a few atomic ops; the borrow checker
+    /// forbids holding a `ProbeGuard<'_>` across the dashmap
+    /// `Ref`'s `drop(state)` boundary in that loop.
+    #[allow(dead_code)]
+    fn try_claim_half_open_probe(&self) -> Option<ProbeGuard<'_>> {
         self.half_open_probe
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+            .ok()
+            .map(|_| ProbeGuard { state: self })
+    }
+
+    /// Release the half-open probe slot without recording a
+    /// completion outcome. Prefer [`ProbeGuard`]'s Drop for
+    /// routine release; this method exists for paths where the
+    /// slot must be cleared via direct atomic write (e.g.
+    /// `record_completion` once the breaker fully reopens).
+    fn release_half_open_probe(&self) {
+        self.half_open_probe.store(false, Ordering::Release);
+    }
+}
+
+/// RAII guard returned by
+/// [`EndpointState::try_claim_half_open_probe`]. The Drop impl
+/// clears the `half_open_probe` slot UNLESS [`Self::commit`] was
+/// called first (which `mem::forget`-equivalent the guard, so
+/// no atomic write runs).
+///
+/// Pattern:
+/// ```ignore
+/// let probe = state.try_claim_half_open_probe()?;   // claim
+/// // ... checks that may early-return / panic ...
+/// if !state.try_record_request(max_conn) {
+///     return Err(...);                                // probe drops, slot released
+/// }
+/// probe.commit();                                     // success: ownership
+///                                                     //   transfers to record_completion
+/// // ... dispatch ...
+/// ```
+///
+/// Tracking the success vs failure path with a `bool` plus a
+/// manual `release_half_open_probe` at every fall-through is
+/// easy to miss on a future-cancel where neither `Ok` nor `Err`
+/// runs to completion.
+#[allow(dead_code)]
+pub(super) struct ProbeGuard<'a> {
+    state: &'a EndpointState,
+}
+
+impl<'a> ProbeGuard<'a> {
+    /// Forget the guard so its Drop does NOT release the slot.
+    /// Call this only on the success path AFTER the matching
+    /// `try_record_request` succeeded — `record_completion` is
+    /// then the path that clears the flag.
+    #[allow(dead_code)]
+    fn commit(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl<'a> Drop for ProbeGuard<'a> {
+    fn drop(&mut self) {
+        // Roll back the claim. Idempotent at the atomic level
+        // (`store(false)` always lands false), but the structural
+        // invariant is that this Drop only runs on the
+        // non-commit path — `mem::forget` (via `commit`) prevents
+        // it on the success path.
+        self.state.release_half_open_probe();
     }
 }
 
@@ -682,8 +783,74 @@ impl LoadBalancer {
             // Atomically reserve the connection slot. If a concurrent
             // selector filled the cap, re-run selection against fresh state.
             if let Some(state) = self.endpoints.get(&selection.node_id) {
+                // Claim the half-open probe slot ONLY on the
+                // endpoint we actually selected, AFTER the
+                // pure-predicate `is_circuit_open` check has
+                // already admitted the endpoint into `available`.
+                // Claiming during the filter pass would leak slots
+                // on multi-endpoint outages.
+                //
+                // When `circuit_open == true`, the half-open probe
+                // claim is the HARD GATE — losers of the CAS race
+                // must NOT proceed through `try_record_request`.
+                // Without strict half-open semantics, a concurrent
+                // selector that observed `half_open_probe == false`
+                // at filter time but lost the claim CAS could still
+                // ride the connection-cap path through and send
+                // real traffic to a recovering endpoint alongside
+                // the actual probe. Only the thread that wins the
+                // probe-slot CAS may test the endpoint; everyone
+                // else skips and retries selection. With the slot
+                // now claimed (by whoever won), the next
+                // iteration's `get_available_endpoints` sees
+                // `half_open_probe == true` and filters this
+                // endpoint out — losers naturally pick a different
+                // endpoint or surface `NoEndpointsAvailable` if
+                // this was the only option.
+                let circuit_open = state.circuit_open.load(Ordering::Acquire);
+                // The `ProbeGuard` RAII type is the preferred API
+                // for future async callers (where the request
+                // future may panic / cancel between claim and
+                // `record_completion`, leaking the slot without a
+                // guard). At THIS synchronous selection callsite,
+                // the guard's lifetime is tied to the dashmap
+                // `Ref` we hold via `state`; carrying it across
+                // the `drop(state); continue;` path the
+                // lost-race branch needs is forbidden by the
+                // borrow checker. Since this loop is fully
+                // synchronous (a few atomic ops between claim
+                // and either `Ok(selection)` or
+                // `release_half_open_probe`), the bool +
+                // explicit-release pattern is panic-free in
+                // practice — the only ops between claim and
+                // release are atomic loads / stores that don't
+                // unwind. We use a direct CAS here rather than
+                // `try_claim_half_open_probe` so we don't have to
+                // immediately drop the guard returned by it.
+                let claimed_probe = if circuit_open {
+                    let claim_ok = state
+                        .half_open_probe
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok();
+                    if !claim_ok {
+                        // Lost the half-open probe race. Drop the
+                        // ref guard so the retry's `endpoints.get`
+                        // doesn't deadlock, and continue to the
+                        // next attempt.
+                        drop(state);
+                        continue;
+                    }
+                    true
+                } else {
+                    false
+                };
                 if state.try_record_request(max_conn) {
                     return Ok(selection);
+                }
+                // try_record_request failed — release any probe
+                // slot we just claimed so it doesn't strand.
+                if claimed_probe {
+                    state.release_half_open_probe();
                 }
             }
         }
@@ -1140,10 +1307,26 @@ impl LoadBalancer {
     }
 }
 
-/// Generate random usize
+/// Generate random usize.
+///
+/// Aborts on `getrandom` failure rather than panic-unwinding
+/// through the FFI boundary. Load-balance random numbers are not
+/// directly auth-bearing, but this function is reachable from hot
+/// paths called by `extern "C"` FFI consumers (Python / Node / Go
+/// bindings) — a `getrandom` failure that unwound across the C
+/// ABI would be undefined behaviour. `process::abort` is
+/// `extern "C"`-safe (terminates rather than unwinds) and
+/// loss-of-availability is the only safe response when the system
+/// can't produce randomness.
 fn random_usize() -> usize {
     let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).expect("getrandom failed");
+    if let Err(e) = getrandom::fill(&mut bytes) {
+        eprintln!(
+            "FATAL: behavior::loadbalance::random_usize getrandom failure ({e:?}); \
+             aborting to avoid panic across the FFI boundary"
+        );
+        std::process::abort();
+    }
     usize::from_le_bytes(bytes)
 }
 
@@ -1732,5 +1915,399 @@ mod tests {
 
         // Breaker is now fully closed — subsequent requests go through.
         assert!(lb.select(&ctx).is_ok(), "successful probe closes breaker");
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #101: pre-fix
+    /// `is_circuit_open` was both a predicate AND CAS-claimed
+    /// the half-open probe slot when called past the recovery
+    /// window. `get_available_endpoints` calls it for every
+    /// endpoint being filtered; with N circuit-open endpoints
+    /// past their recovery window, all N got the probe slot
+    /// claimed but only one was actually selected. The N-1
+    /// others permanently held `half_open_probe == true` with
+    /// no in-flight request — every subsequent
+    /// `is_circuit_open` then returned true forever, and the
+    /// breaker never recovered until process restart.
+    ///
+    /// We pin the fix by:
+    ///   1. Building a load balancer with 3 endpoints.
+    ///   2. Tripping each endpoint's breaker.
+    ///   3. Waiting past the recovery window.
+    ///   4. Calling `select` once — this triggers
+    ///      `get_available_endpoints`, which scans all 3
+    ///      endpoints. Only the SELECTED endpoint should claim
+    ///      the probe slot; the other 2 must NOT.
+    ///   5. Asserting the unselected endpoints have
+    ///      `half_open_probe == false`.
+    #[test]
+    fn circuit_breaker_does_not_leak_probe_slot_on_multi_endpoint_scan() {
+        let config = LoadBalancerConfig {
+            strategy: Strategy::RoundRobin,
+            circuit_recovery_time_ms: 50,
+            ..Default::default()
+        };
+        let lb = LoadBalancer::new(config);
+        for i in 1..=3 {
+            lb.add_endpoint(Endpoint::new(make_node_id(i)));
+        }
+        let ctx = RequestContext::new();
+
+        // Trip every endpoint's breaker. Default failure
+        // threshold is 5 consecutive failures.
+        for _ in 0..5 {
+            for i in 1..=3 {
+                let nid = make_node_id(i);
+                // Manually trip via record_completion(false). We
+                // use a dummy connection-counter via select() to
+                // keep the connection counter consistent; if no
+                // endpoint is selectable, force it.
+                if let Some(ep) = lb.endpoints.get(&nid) {
+                    // Simulate a request lifecycle.
+                    ep.try_record_request(u32::MAX);
+                }
+                lb.record_completion(&nid, false);
+            }
+        }
+
+        // All breakers should be open. select() rejects pre-recovery.
+        assert!(
+            lb.select(&ctx).is_err(),
+            "all breakers open pre-recovery — select must fail"
+        );
+
+        // Wait past recovery window.
+        std::thread::sleep(Duration::from_millis(75));
+
+        // First select: scans all 3 endpoints. Selects ONE. The
+        // other 2 must NOT have their probe slots claimed.
+        let probe = lb.select(&ctx).expect("recovery elapsed → probe admitted");
+
+        // Audit the half_open_probe state on each endpoint:
+        // exactly one (the selected) should be true; the other
+        // two MUST be false. Pre-fix all three would be true.
+        let mut claimed = 0u32;
+        for i in 1..=3 {
+            let nid = make_node_id(i);
+            let ep = lb.endpoints.get(&nid).unwrap();
+            if ep.half_open_probe.load(Ordering::Acquire) {
+                claimed += 1;
+                // The claimed slot must be on the selected endpoint.
+                assert_eq!(
+                    nid, probe.node_id,
+                    "only the selected endpoint may have its probe slot claimed"
+                );
+            }
+        }
+        assert_eq!(
+            claimed, 1,
+            "exactly one endpoint should have a claimed probe slot — \
+             pre-fix this was 3 (the filter-time scan claimed all)"
+        );
+
+        // Probe success → selected endpoint's breaker closes;
+        // the other two are still in their post-recovery state.
+        lb.record_completion(&probe.node_id, true);
+    }
+
+    /// Cubic-ai P1: with `N` selectors racing concurrently against
+    /// a circuit-open endpoint that just exited its recovery window,
+    /// the strict half-open contract says EXACTLY one selector
+    /// admits the probe — every other selector that lost the
+    /// `try_claim_half_open_probe` CAS must skip the endpoint, not
+    /// fall through to `try_record_request` and send extra traffic
+    /// to the (still potentially sick) endpoint alongside the real
+    /// probe.
+    ///
+    /// Pre-fix (loose) semantics: losers of the probe-claim CAS
+    /// proceeded via `try_record_request`, so under sufficient
+    /// concurrency `successes` could be `> 1`. Post-fix (strict)
+    /// semantics: losers `continue`, the retry's
+    /// `get_available_endpoints` sees `half_open_probe == true`
+    /// and filters the endpoint out, the loop exits with
+    /// `NoEndpointsAvailable`. Net effect: at most one selector
+    /// admits per recovery cycle.
+    ///
+    /// The test:
+    ///   1. Trips a single endpoint's breaker.
+    ///   2. Waits past the recovery window so the next selection
+    ///      enters half-open.
+    ///   3. Spawns `N` threads, gates them on a Barrier so they
+    ///      enter `select()` as close to simultaneously as
+    ///      possible, each retains its `Selection` (no
+    ///      `record_completion`) so the probe slot stays claimed.
+    ///   4. Asserts `successes == 1`. Pre-fix this could fire
+    ///      `> 1` non-deterministically; post-fix it must be
+    ///      exactly 1.
+    #[test]
+    fn select_strict_half_open_admits_exactly_one_probe_under_concurrent_selectors() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const N: usize = 32;
+        let config = LoadBalancerConfig {
+            strategy: Strategy::RoundRobin,
+            circuit_recovery_time_ms: 50,
+            ..Default::default()
+        };
+        let lb = Arc::new(LoadBalancer::new(config));
+        lb.add_endpoint(Endpoint::new(make_node_id(1)));
+        let ctx = RequestContext::new();
+
+        // Trip the breaker (5 consecutive failures).
+        for _ in 0..5 {
+            let sel = lb.select(&ctx).expect("admitted before trip");
+            lb.record_completion(&sel.node_id, false);
+        }
+        assert!(lb.select(&ctx).is_err(), "open breaker must reject");
+
+        // Wait past the recovery window so the next selection
+        // observes `half_open_probe == false` and is admitted.
+        thread::sleep(Duration::from_millis(75));
+
+        // Race N threads through select(). DO NOT call
+        // record_completion — that would clear the probe slot
+        // and let the next thread succeed legitimately. The
+        // strict contract is: exactly one admits while the probe
+        // is in flight.
+        let barrier = Arc::new(Barrier::new(N));
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let lb = Arc::clone(&lb);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let ctx = RequestContext::new();
+                barrier.wait();
+                lb.select(&ctx).is_ok()
+            }));
+        }
+        let successes: usize = handles
+            .into_iter()
+            .map(|h| h.join().unwrap() as usize)
+            .sum();
+
+        assert_eq!(
+            successes, 1,
+            "strict half-open: exactly one selector must admit while the \
+             probe is in flight (got {successes} of {N}). Pre-fix the \
+             loose semantic let losers of the probe-claim CAS proceed \
+             through try_record_request, sending extra traffic to a \
+             still-recovering endpoint."
+        );
+
+        // Sanity: the probe slot is still claimed (no completion
+        // was recorded), and the breaker is still nominally open.
+        let ep = lb.endpoints.get(&make_node_id(1)).unwrap();
+        assert!(
+            ep.half_open_probe.load(Ordering::Acquire),
+            "probe slot must remain claimed across the test (no completion was recorded)"
+        );
+        assert!(
+            ep.circuit_open.load(Ordering::Acquire),
+            "circuit must remain open until probe completion"
+        );
+    }
+
+    /// Companion to `select_strict_half_open_admits_exactly_one_probe...`:
+    /// strict half-open semantics must NOT serialize independent
+    /// endpoints. With two distinct circuit-open endpoints both
+    /// past their recovery window, two concurrent selectors should
+    /// EACH succeed — one probe per endpoint, since each endpoint's
+    /// `half_open_probe` is its own slot. Pre-fix this also worked
+    /// (loose semantic), but a naive "strict gate" implementation
+    /// could accidentally over-tighten and lock out legitimate
+    /// per-endpoint probes; this test pins that the gate stays
+    /// scoped to the endpoint it guards.
+    #[test]
+    fn select_strict_half_open_allows_concurrent_probes_on_distinct_endpoints() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let config = LoadBalancerConfig {
+            strategy: Strategy::RoundRobin,
+            circuit_recovery_time_ms: 50,
+            ..Default::default()
+        };
+        let lb = Arc::new(LoadBalancer::new(config));
+        // Two endpoints — RR alternates between them.
+        for i in 1..=2 {
+            lb.add_endpoint(Endpoint::new(make_node_id(i)));
+        }
+        let ctx = RequestContext::new();
+
+        // Trip both breakers. Default threshold is 5 consecutive
+        // failures per endpoint.
+        for _ in 0..5 {
+            for i in 1..=2 {
+                let nid = make_node_id(i);
+                if let Some(ep) = lb.endpoints.get(&nid) {
+                    ep.try_record_request(u32::MAX);
+                }
+                lb.record_completion(&nid, false);
+            }
+        }
+        assert!(lb.select(&ctx).is_err(), "both breakers open pre-recovery");
+
+        // Wait past the recovery window so both endpoints admit a
+        // probe.
+        thread::sleep(Duration::from_millis(75));
+
+        // Race two threads. With RR + 2 endpoints, each thread
+        // should pick a different endpoint, claim its own probe,
+        // and succeed. Pre-fix or post-fix, both succeed — but a
+        // mis-scoped "strict gate" (e.g., a global probe flag
+        // instead of per-endpoint) would let only one through.
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let lb = Arc::clone(&lb);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let ctx = RequestContext::new();
+                barrier.wait();
+                lb.select(&ctx).ok().map(|s| s.node_id)
+            }));
+        }
+        let picks: Vec<NodeId> = handles
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .collect();
+
+        assert_eq!(
+            picks.len(),
+            2,
+            "both selectors must succeed against distinct endpoints \
+             (probes are per-endpoint, not global). Got picks: {:?}",
+            picks
+        );
+        assert_ne!(
+            picks[0], picks[1],
+            "the two probes must land on different endpoints — \
+             same-endpoint admission would mean strict gate failed to \
+             keep one selector out, OR RR selection raced strangely. \
+             Picks: {:?}",
+            picks
+        );
+
+        // Both endpoints should now have their probe slots claimed.
+        for i in 1..=2 {
+            let ep = lb.endpoints.get(&make_node_id(i)).unwrap();
+            assert!(
+                ep.half_open_probe.load(Ordering::Acquire),
+                "endpoint {} probe slot must be claimed (one probe per endpoint)",
+                i
+            );
+        }
+    }
+
+    /// CR-19: the `ProbeGuard` Drop must release the
+    /// half-open probe slot when the guard is dropped without
+    /// committing. We construct an `EndpointState`, manually
+    /// claim the probe via the guard API, drop the guard, and
+    /// verify the slot returned to false.
+    #[test]
+    fn cr19_probe_guard_drop_releases_probe_slot() {
+        let ep = EndpointState::new(Endpoint::new(make_node_id(0xCA)));
+        // Pre: slot is open.
+        assert!(!ep.half_open_probe.load(Ordering::Acquire));
+
+        let guard = ep
+            .try_claim_half_open_probe()
+            .expect("first claim must succeed");
+        // Probe slot is now claimed.
+        assert!(ep.half_open_probe.load(Ordering::Acquire));
+
+        // Drop without commit: slot must roll back.
+        drop(guard);
+        assert!(
+            !ep.half_open_probe.load(Ordering::Acquire),
+            "CR-19 regression: ProbeGuard Drop must release the probe slot"
+        );
+
+        // Subsequent claim succeeds — slot is reusable.
+        let _g = ep
+            .try_claim_half_open_probe()
+            .expect("post-Drop reclaim must succeed");
+    }
+
+    /// CR-19: `commit()` must SUPPRESS the Drop release. The
+    /// committed claim survives the guard going out of scope —
+    /// `record_completion` is then the path that clears it.
+    #[test]
+    fn cr19_probe_guard_commit_suppresses_release() {
+        let ep = EndpointState::new(Endpoint::new(make_node_id(0xBE)));
+        let guard = ep
+            .try_claim_half_open_probe()
+            .expect("first claim must succeed");
+        guard.commit();
+        // Slot remains claimed because commit() ran mem::forget.
+        assert!(
+            ep.half_open_probe.load(Ordering::Acquire),
+            "CR-19 regression: ProbeGuard::commit must SUPPRESS Drop release"
+        );
+        // A second claim must fail because the slot is taken.
+        assert!(
+            ep.try_claim_half_open_probe().is_none(),
+            "second claim must fail while the first is committed"
+        );
+    }
+
+    /// CR-19: panic between claim and commit MUST release the
+    /// slot via Drop. We use `catch_unwind` to confirm the slot
+    /// rolls back even when the path between claim and the
+    /// would-be commit unwinds.
+    #[test]
+    fn cr19_panic_between_claim_and_commit_releases_probe_slot() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let ep = EndpointState::new(Endpoint::new(make_node_id(0xF0)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = ep
+                .try_claim_half_open_probe()
+                .expect("first claim must succeed");
+            // Simulate a panic on the path between claim and
+            // commit — exactly what a future-cancel or in-flight
+            // panic looks like.
+            panic!("simulated mid-path failure");
+        }));
+
+        assert!(result.is_err(), "the closure must have panicked");
+        assert!(
+            !ep.half_open_probe.load(Ordering::Acquire),
+            "CR-19 regression: panic between claim and commit MUST roll \
+             back the probe slot via ProbeGuard::drop"
+        );
+    }
+
+    /// CR-21 / BUG #150: pin that this module's `random_usize`
+    /// uses the abort-on-fail pattern, NOT `expect()` or
+    /// `.unwrap()`. A getrandom panic here would unwind across
+    /// any `extern "C"` FFI frame that called into the load-
+    /// balance layer — undefined behaviour.
+    #[test]
+    fn cr21_random_usize_must_not_panic_on_getrandom_failure() {
+        let needle_expect = format!("getrandom::fill({}{})", "&mut bytes).", "expect");
+        let needle_unwrap = format!("getrandom::fill({}{})", "&mut bytes).", "unwrap");
+
+        let src = include_str!("loadbalance.rs");
+        for (lineno, line) in src.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !trimmed.contains(&needle_expect),
+                "CR-21 regression: getrandom::fill(...).expect(...) reintroduced \
+                 at loadbalance.rs:{}.\n  line: {}",
+                lineno + 1,
+                line
+            );
+            assert!(
+                !trimmed.contains(&needle_unwrap),
+                "CR-21 regression: getrandom::fill(...).unwrap() reintroduced \
+                 at loadbalance.rs:{}.\n  line: {}",
+                lineno + 1,
+                line
+            );
+        }
     }
 }

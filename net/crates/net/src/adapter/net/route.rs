@@ -383,6 +383,27 @@ impl RouteEntry {
     }
 }
 
+/// Soft cap on `RoutingTable::stream_stats` size.
+///
+/// `record_in` (and friends) insert into `stream_stats` keyed by
+/// `stream_id` extracted from raw packet bytes BEFORE AEAD
+/// verification, since the router is upstream of session keys.
+/// Without the cap, a malicious peer could spam routed packets
+/// with random `stream_id`s to exhaust router memory between
+/// `cleanup_idle_streams` ticks. The cap turns that into a
+/// bounded memory footprint:
+/// - Below the cap: tracking proceeds normally.
+/// - At or above the cap: new keys are NOT inserted (existing
+///   keys still record); `cleanup_idle_streams` reclaims slots
+///   for legitimate streams that have idled out, after which new
+///   keys may be admitted again.
+///
+/// Sized to keep the DashMap's worst-case memory bounded
+/// (~16 MB at ~256 B per entry) while leaving headroom for
+/// real workloads — peer mesh sizes ≤ a few thousand nodes
+/// rarely exceed a few thousand concurrent stream IDs.
+pub const MAX_STREAM_STATS: usize = 65_536;
+
 /// Routing table for stream-to-destination mapping
 pub struct RoutingTable {
     /// Node ID -> next hop address
@@ -563,8 +584,26 @@ impl RoutingTable {
         self.stream_stats.entry(stream_id).or_default().downgrade()
     }
 
+    /// Returns true if this stream id may be inserted into
+    /// `stream_stats`. Existing entries always proceed; new
+    /// entries are admitted only if the map is below
+    /// [`MAX_STREAM_STATS`]. The check has a TOCTOU
+    /// race against concurrent inserters but is intentionally
+    /// soft — we only need to bound growth, not enforce a strict
+    /// upper bound.
+    #[inline]
+    fn may_admit_stream(&self, stream_id: u64) -> bool {
+        if self.stream_stats.contains_key(&stream_id) {
+            return true;
+        }
+        self.stream_stats.len() < MAX_STREAM_STATS
+    }
+
     /// Record incoming packet for stream
     pub fn record_in(&self, stream_id: u64, bytes: u64) {
+        if !self.may_admit_stream(stream_id) {
+            return;
+        }
         self.stream_stats
             .entry(stream_id)
             .or_default()
@@ -573,6 +612,9 @@ impl RoutingTable {
 
     /// Record outgoing packet for stream
     pub fn record_out(&self, stream_id: u64, bytes: u64) {
+        if !self.may_admit_stream(stream_id) {
+            return;
+        }
         self.stream_stats
             .entry(stream_id)
             .or_default()
@@ -581,6 +623,9 @@ impl RoutingTable {
 
     /// Record dropped packet for stream
     pub fn record_drop(&self, stream_id: u64) {
+        if !self.may_admit_stream(stream_id) {
+            return;
+        }
         self.stream_stats
             .entry(stream_id)
             .or_default()
@@ -1139,5 +1184,85 @@ mod tests {
         );
         let entry = table.routes.get(&dest).unwrap();
         assert_eq!(entry.metric, 1, "metric must still be 1 (direct)");
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #89: the
+    /// router extracts `stream_id` from raw packet bytes BEFORE
+    /// any AEAD verification (the router is upstream of session
+    /// keys). Pre-fix, every distinct `stream_id` seen on a routed
+    /// packet would insert a fresh `SchedulerStreamStats` entry
+    /// into `stream_stats`, with no upper bound — a malicious
+    /// peer could exhaust router memory by sending packets with
+    /// random `stream_id` values between `cleanup_idle_streams`
+    /// ticks. The fix soft-caps `stream_stats` at
+    /// [`MAX_STREAM_STATS`]; new IDs above the cap are dropped
+    /// (existing entries continue to record so legitimate streams
+    /// aren't kicked out mid-flight).
+    #[test]
+    fn record_in_stops_admitting_new_streams_at_cap() {
+        let table = RoutingTable::new(0xCAFE);
+
+        // Use a tighter "virtual cap" so the test is fast: insert
+        // up to MAX_STREAM_STATS entries directly via the public
+        // API, then verify subsequent novel inserts are rejected.
+        // This walks the real cap path (no mocking).
+        for i in 0..MAX_STREAM_STATS as u64 {
+            table.record_in(i, 1);
+        }
+        assert_eq!(
+            table.stream_count(),
+            MAX_STREAM_STATS,
+            "all initial entries must be admitted (we're at the cap)"
+        );
+
+        // Try to admit one more novel stream — must be rejected.
+        let novel = MAX_STREAM_STATS as u64 + 1;
+        table.record_in(novel, 1);
+        assert!(
+            !table.stream_stats.contains_key(&novel),
+            "novel stream_id at cap must NOT be admitted (BUG #89 \
+             would have inserted unconditionally and grown the map \
+             unboundedly)"
+        );
+        assert_eq!(
+            table.stream_count(),
+            MAX_STREAM_STATS,
+            "stream_count must not grow past the cap"
+        );
+
+        // Existing entries must still record activity.
+        table.record_in(0, 100);
+        let stats = table.stream_stats.get(&0).unwrap();
+        assert!(
+            stats.get_packets_in() >= 2,
+            "existing entry must continue to record despite the \
+             cap — BUG #89 fix is admit-side only"
+        );
+    }
+
+    /// After `cleanup_idle_streams` reclaims slots, the cap
+    /// admits new IDs again. Pins that the fix is "soft cap"
+    /// rather than "hard ceiling forever".
+    #[test]
+    fn cap_admits_new_streams_after_cleanup_reclaims_slots() {
+        let table = RoutingTable::new(0xCAFE);
+        for i in 0..MAX_STREAM_STATS as u64 {
+            table.record_in(i, 1);
+        }
+
+        // Sweep with idle window=0 so every entry counts as idle
+        // (no real time has passed, but `is_idle` compares
+        // last-activity to now).
+        let removed = table.cleanup_idle_streams(0);
+        assert!(removed > 0, "cleanup must reclaim some entries");
+
+        // Now a fresh ID should be admitted.
+        let fresh: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        table.record_in(fresh, 1);
+        assert!(
+            table.stream_stats.contains_key(&fresh),
+            "after cleanup_idle_streams reclaims slots, novel \
+             stream_ids must be admissible again"
+        );
     }
 }

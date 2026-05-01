@@ -195,6 +195,22 @@ impl std::fmt::Debug for JetStreamAdapter {
 #[async_trait]
 impl Adapter for JetStreamAdapter {
     async fn init(&mut self) -> Result<(), AdapterError> {
+        // Idempotency: no-op when already initialized and log at
+        // warn so a misbehaving caller is observable. A second
+        // `init` call would otherwise overwrite `client` /
+        // `jetstream`, dropping the prior client and any in-flight
+        // publishes — an orchestrator calling `init` defensively
+        // after a perceived failure would silently lose messages.
+        // The trait says "Called once before any other methods"
+        // but doesn't enforce it.
+        if self.initialized.load(Ordering::Acquire) {
+            tracing::warn!(
+                adapter = "jetstream",
+                "JetStream adapter::init called twice; ignoring"
+            );
+            return Ok(());
+        }
+
         let client = async_nats::ConnectOptions::new()
             .connection_timeout(self.config.connect_timeout)
             .request_timeout(Some(self.config.request_timeout))
@@ -266,13 +282,18 @@ impl Adapter for JetStreamAdapter {
         // render it once and only rewrite the trailing `:{i}` per
         // event, eliminating the per-event `format!` allocation.
         //
-        // The leading `{nonce}` segment is the per-process nonce
-        // sampled at construction; without it, a producer that
-        // restarted within JetStream's dedup window collided with its
-        // prior incarnation's `shard:0:0…` ids and the new batches
-        // were silently discarded.
-        // Use the batch's process_nonce — globally consistent
-        // across all adapters in this process.
+        // The leading `{nonce}` segment is the bus's producer nonce
+        // — sourced from `EventBusConfig::producer_nonce_path` when
+        // the caller wants persistence across restarts, or from
+        // the per-process default `event::batch_process_nonce`
+        // otherwise. Without it, a producer that restarted within
+        // JetStream's dedup window collided with its prior
+        // incarnation's `shard:0:0…` ids and the new batches were
+        // silently discarded; with it, the dedup window correctly
+        // recognizes mid-batch retries from a crashed-and-restarted
+        // producer when the persistent path is configured.
+        // Use the batch's process_nonce field — bus-loaded once
+        // and consistent across every batch from this bus instance.
         let mut acks = Vec::with_capacity(serialized.len());
         let mut msg_id_buf = String::new();
         let _ = write!(
@@ -389,22 +410,68 @@ impl Adapter for JetStreamAdapter {
         // fallback saturates so a caller-supplied `limit` near
         // `usize::MAX` cannot wrap to a tiny `max_seq` and silently
         // cap the poll at zero events.
-        let max_seq = match stream.info().await {
-            Ok(info) => info.state.last_sequence,
+        //
+        // Also extract `first_sequence` so the per-event walk below
+        // can skip past a long retention-rollover gap in a single
+        // jump. Without it, `direct_get(seq)` returns NotFound for
+        // every deleted seq and the loop would increment by one
+        // and try again — after a MAXLEN trim of the first 10M
+        // sequences, `poll_shard(from_id=None)` resumes at
+        // `start_seq=1` and the consumer would do 10M sequential
+        // network RTTs before returning a single event (hung for
+        // minutes, request timeout fires, next poll resumes from
+        // where it left off — never made progress). With
+        // `first_sequence` captured up-front, the first `NotFound`
+        // jumps `current_seq` to `first_sequence` in one step.
+        let (max_seq, first_seq) = match stream.info().await {
+            Ok(info) => (info.state.last_sequence, info.state.first_sequence),
             Err(_) => {
                 let span = (fetch_limit as u64).saturating_mul(10);
-                start_seq.saturating_add(span)
+                (start_seq.saturating_add(span), 0)
             }
         };
+        // Apply the retention-rollover jump up-front: if
+        // `start_seq` is below the stream's first retained
+        // sequence, advance the cursor immediately rather than
+        // walking the deleted range one-by-one.
+        if first_seq > current_seq {
+            current_seq = first_seq;
+        }
 
         // Use direct get to fetch messages by sequence
         // Use while loop so gaps don't consume our fetch count.
         // Track every sequence we observe (regardless of deserialize
         // outcome) so the cursor can advance past corrupt entries
         // instead of stalling on them.
+        //
+        // The loop's `current_seq > max_seq` short-circuit re-reads
+        // `info()` once before declaring drain, to catch concurrent
+        // writes that appeared after our initial sample. Without
+        // the re-read, a producer writing new messages during the
+        // read would be silently truncated — `has_more=false` would
+        // come back even though the stream tail had more events.
+        // `max_seq_re_checked` tracks whether we've already paid
+        // the one bounded re-read, so a relentless producer can't
+        // spin us forever in a re-info loop.
         let mut last_seen_seq: Option<u64> = None;
+        let mut max_seq = max_seq;
+        let mut max_seq_re_checked = false;
         while events.len() < fetch_limit {
             if current_seq > max_seq {
+                // Before declaring drain, re-read `info()` once to
+                // catch concurrent writes that appeared after our
+                // initial sample. One bounded re-read per poll
+                // preserves the loop's O(span) worst-case while
+                // closing the truncation hole.
+                if !max_seq_re_checked {
+                    max_seq_re_checked = true;
+                    if let Ok(info) = stream.info().await {
+                        if info.state.last_sequence > max_seq {
+                            max_seq = info.state.last_sequence;
+                            continue;
+                        }
+                    }
+                }
                 // Searched too far without finding enough events
                 break;
             }

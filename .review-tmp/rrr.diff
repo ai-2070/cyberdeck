@@ -1,0 +1,547 @@
+diff --git a/net/crates/net/src/adapter/net/proxy.rs b/net/crates/net/src/adapter/net/proxy.rs
+index 1e465e6..4007ebc 100644
+--- a/net/crates/net/src/adapter/net/proxy.rs
++++ b/net/crates/net/src/adapter/net/proxy.rs
+@@ -230,9 +230,17 @@ impl NetProxy {
+         self.next_hop.insert(dest_id, next_hop);
+     }
+ 
+-    /// Remove a route
++    /// Remove a route.
++    ///
++    /// BUG #116: pre-fix this only removed the next_hop entry
++    /// and left `hop_stats[dest_id]` in place. A peer churning
++    /// through many destinations grew `hop_stats` indefinitely
++    /// (memory ∝ total-distinct-dest-ids-ever-seen, not active
++    /// dest count). Now `remove_route` also drops the matching
++    /// `hop_stats` entry.
+     pub fn remove_route(&self, dest_id: u64) {
+         self.next_hop.remove(&dest_id);
++        self.hop_stats.remove(&dest_id);
+     }
+ 
+     /// Lookup next hop for destination
+@@ -290,6 +298,15 @@ impl NetProxy {
+         // Update routing header (decrement TTL, increment hop count)
+         let mut new_header = header;
+         new_header.forward();
++        // BUG #119 (mirror of `router.rs:512` fix): drop here if
++        // forwarding made the TTL 0 — the next hop would just
++        // drop it on its own `is_expired()` check, wasting
++        // bandwidth and a queue slot.
++        if new_header.is_expired() {
++            self.packets_dropped.fetch_add(1, Ordering::Relaxed);
++            self.record_hop_drop(header.dest_id);
++            return ForwardResult::Dropped(ProxyError::TtlExpired);
++        }
+ 
+         // Build forwarded packet with updated header
+         let mut fwd_data = BytesMut::with_capacity(data.len());
+@@ -594,6 +611,40 @@ mod tests {
+         }
+     }
+ 
++    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #116: pre-fix
++    /// `remove_route(dest_id)` only deleted the next_hop entry
++    /// and left `hop_stats[dest_id]` in place. A peer churning
++    /// through many destinations grew `hop_stats` linearly with
++    /// total-distinct-dest-ids-ever-seen, not active dest count
++    /// — unbounded memory growth. Post-fix `remove_route` also
++    /// drops the matching `hop_stats` entry.
++    #[tokio::test]
++    async fn remove_route_also_drops_hop_stats() {
++        let config = ProxyConfig::new(0x1234, "127.0.0.1:0".parse().unwrap());
++        let proxy = NetProxy::new(config).await.unwrap();
++
++        let next_hop: SocketAddr = "127.0.0.1:9001".parse().unwrap();
++        proxy.add_route(0x5678, next_hop);
++
++        // Force hop_stats to populate by recording activity.
++        proxy.record_hop_forward(0x5678, 100, 1000);
++        proxy.record_hop_drop(0x5678);
++        assert!(
++            proxy.hop_stats(0x5678).is_some(),
++            "hop_stats must be present after recording activity"
++        );
++
++        // Remove the route — pre-fix would leave the hop_stats
++        // entry behind. Post-fix it's dropped.
++        proxy.remove_route(0x5678);
++
++        assert!(
++            proxy.hop_stats(0x5678).is_none(),
++            "hop_stats entry must be dropped along with the route — \
++             pre-fix this leaked memory linearly with churned destinations"
++        );
++    }
++
+     #[test]
+     fn test_hop_stats() {
+         let stats = HopStats::new();
+diff --git a/net/crates/net/src/adapter/net/reroute.rs b/net/crates/net/src/adapter/net/reroute.rs
+index 6447a85..70be0e8 100644
+--- a/net/crates/net/src/adapter/net/reroute.rs
++++ b/net/crates/net/src/adapter/net/reroute.rs
+@@ -17,9 +17,24 @@ use super::behavior::proximity::ProximityGraph;
+ use super::route::RoutingTable;
+ 
+ /// Saved original route before reroute, for recovery.
++///
++/// BUG #117: pre-fix this stored the original `next_hop:
++/// SocketAddr` and `on_recovery` filtered by
++/// `entry.next_hop == recovered_addr`. After a NAT rebind / peer
++/// reconnect on a different port / mobile-network change, the
++/// peer's entry in `peer_addrs` reflects the NEW address but the
++/// saved entry was keyed on the OLD address — the filter returned
++/// empty, no routes were restored, and the saved entry persisted
++/// indefinitely (DashMap entries were only dropped on successful
++/// match). Now we store the peer's stable `node_id` instead;
++/// `on_recovery` re-resolves the current addr from `peer_addrs` at
++/// recovery time, surviving NAT rebinds.
+ struct SavedRoute {
+-    /// Original next-hop address
+-    next_hop: SocketAddr,
++    /// Node ID of the peer whose failure caused this reroute. The
++    /// concrete `next_hop` SocketAddr at the time of saving may
++    /// have changed (NAT rebind), so we re-resolve from
++    /// `peer_addrs[failed_node_id]` at recovery time.
++    failed_node_id: u64,
+     /// The alternate we rerouted to
+     #[allow(dead_code)]
+     alternate: SocketAddr,
+@@ -152,7 +167,7 @@ impl ReroutePolicy {
+                 .entry(*dest_id)
+                 .and_modify(|existing| existing.alternate = alt_addr)
+                 .or_insert(SavedRoute {
+-                    next_hop: failed_addr,
++                    failed_node_id,
+                     alternate: alt_addr,
+                 });
+             self.routing_table.add_route(*dest_id, alt_addr);
+@@ -218,17 +233,29 @@ impl ReroutePolicy {
+     /// Restores original routes that were rerouted when this peer failed.
+     /// The direct path is typically better (fewer hops, lower latency)
+     /// than the alternate.
++    ///
++    /// BUG #117: filter is now `entry.failed_node_id ==
++    /// recovered_node_id` rather than `entry.next_hop ==
++    /// recovered_addr`. The pre-fix addr-based filter missed every
++    /// reroute when the peer reconnected from a different
++    /// SocketAddr (NAT rebind, mobile network change, reconnect on
++    /// different port) — `saved_routes` then accumulated
++    /// indefinitely across mobile / NAT-changing peers, and routes
++    /// stayed pinned to alternates after the peer had actually
++    /// recovered. Identity-based filter survives addr changes;
++    /// `recovered_addr` is re-resolved from `peer_addrs` at
++    /// recovery time so the restored route uses the current addr.
+     pub fn on_recovery(&self, recovered_node_id: u64) {
+         let recovered_addr = match self.peer_addrs.get(&recovered_node_id) {
+             Some(addr) => *addr,
+             None => return,
+         };
+ 
+-        // Find routes that were rerouted away from this peer
++        // Find routes that were rerouted away from this peer.
+         let to_restore: Vec<u64> = self
+             .saved_routes
+             .iter()
+-            .filter(|e| e.value().next_hop == recovered_addr)
++            .filter(|e| e.value().failed_node_id == recovered_node_id)
+             .map(|e| *e.key())
+             .collect();
+ 
+@@ -236,7 +263,9 @@ impl ReroutePolicy {
+             return;
+         }
+ 
+-        // Restore original routes
++        // Restore original routes — using the CURRENT addr, which
++        // may differ from the addr at on_failure time if the peer
++        // rebinds.
+         for dest_id in &to_restore {
+             self.routing_table.add_route(*dest_id, recovered_addr);
+             self.saved_routes.remove(dest_id);
+@@ -401,6 +430,102 @@ mod tests {
+         );
+     }
+ 
++    // ========================================================================
++    // BUG #117: on_recovery must match by node_id, not next_hop addr,
++    // so NAT rebinds / reconnects on different ports still restore.
++    // ========================================================================
++
++    /// A peer fails, then recovers from a DIFFERENT SocketAddr (NAT
++    /// rebind, reconnect on different port, mobile network change).
++    /// `on_recovery` must restore the saved routes to the new addr.
++    /// Pre-fix the filter `entry.next_hop == recovered_addr` missed
++    /// because the saved `next_hop` held the OLD addr while
++    /// `recovered_addr` was the NEW one — no routes restored, and
++    /// the saved entry leaked.
++    #[test]
++    fn on_recovery_restores_routes_after_nat_rebind() {
++        let rt = make_routing_table();
++        let peers = Arc::new(DashMap::new());
++
++        let addr_b_old: SocketAddr = "127.0.0.1:2000".parse().unwrap();
++        let addr_b_new: SocketAddr = "127.0.0.1:2999".parse().unwrap(); // post-rebind
++        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
++
++        peers.insert(0x2222u64, addr_b_old);
++        peers.insert(0x3333u64, addr_c);
++
++        // Route to 0x5555 originally goes through B.
++        rt.add_route(0x5555, addr_b_old);
++
++        let policy = ReroutePolicy::new(rt.clone(), peers.clone());
++
++        // B fails — route is rerouted to C.
++        policy.on_failure(0x2222);
++        assert_eq!(
++            rt.lookup(0x5555).unwrap(),
++            addr_c,
++            "reroute must pick the alternate after failure"
++        );
++        assert_eq!(policy.active_reroutes(), 1);
++
++        // B comes back from a different SocketAddr (NAT rebind):
++        // peer_addrs now reflects the new addr.
++        peers.insert(0x2222u64, addr_b_new);
++        policy.on_recovery(0x2222);
++
++        // Pre-fix: nothing happens (filter on next_hop addr fails).
++        // Post-fix: the route is restored to the NEW addr because
++        //  the filter is on node_id, and the addr is re-resolved
++        //  from peer_addrs.
++        assert_eq!(
++            rt.lookup(0x5555).unwrap(),
++            addr_b_new,
++            "BUG #117: recovery after NAT rebind must restore the route to the NEW addr"
++        );
++        assert_eq!(
++            policy.active_reroutes(),
++            0,
++            "saved_routes entry must be dropped after recovery (no leak)"
++        );
++    }
++
++    /// Variant: peer fails, several saved routes through it, then
++    /// reconnects from a different addr — ALL saved routes must
++    /// restore. Pre-fix the addr-based filter missed all of them
++    /// and `saved_routes` leaked entries linearly with the number
++    /// of dest_ids that were ever rerouted through a NAT-changing
++    /// peer.
++    #[test]
++    fn on_recovery_restores_multiple_routes_after_nat_rebind() {
++        let rt = make_routing_table();
++        let peers = Arc::new(DashMap::new());
++
++        let addr_b_old: SocketAddr = "127.0.0.1:2000".parse().unwrap();
++        let addr_b_new: SocketAddr = "127.0.0.1:9999".parse().unwrap();
++        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
++
++        peers.insert(0x2222u64, addr_b_old);
++        peers.insert(0x3333u64, addr_c);
++
++        rt.add_route(0x4444, addr_b_old);
++        rt.add_route(0x5555, addr_b_old);
++
++        let policy = ReroutePolicy::new(rt.clone(), peers.clone());
++        policy.on_failure(0x2222);
++        assert_eq!(policy.active_reroutes(), 2);
++
++        peers.insert(0x2222u64, addr_b_new);
++        policy.on_recovery(0x2222);
++
++        assert_eq!(rt.lookup(0x4444).unwrap(), addr_b_new);
++        assert_eq!(rt.lookup(0x5555).unwrap(), addr_b_new);
++        assert_eq!(
++            policy.active_reroutes(),
++            0,
++            "all saved_routes entries must be dropped after recovery",
++        );
++    }
++
+     #[test]
+     fn test_multiple_routes_through_failed_peer() {
+         let rt = make_routing_table();
+diff --git a/net/crates/net/src/adapter/net/route.rs b/net/crates/net/src/adapter/net/route.rs
+index 3076cb0..dc1b6c3 100644
+--- a/net/crates/net/src/adapter/net/route.rs
++++ b/net/crates/net/src/adapter/net/route.rs
+@@ -383,6 +383,27 @@ impl RouteEntry {
+     }
+ }
+ 
++/// Soft cap on `RoutingTable::stream_stats` size.
++///
++/// Closes BUG #89: `record_in` (and friends) insert into
++/// `stream_stats` keyed by `stream_id` extracted from raw packet
++/// bytes BEFORE AEAD verification, since the router is upstream
++/// of session keys. A malicious peer could spam routed packets
++/// with random `stream_id`s to exhaust router memory between
++/// `cleanup_idle_streams` ticks. The cap turns that into a
++/// bounded memory footprint:
++/// - Below the cap: tracking proceeds normally.
++/// - At or above the cap: new keys are NOT inserted (existing
++///   keys still record); `cleanup_idle_streams` reclaims slots
++///   for legitimate streams that have idled out, after which new
++///   keys may be admitted again.
++///
++/// Sized to keep the DashMap's worst-case memory bounded
++/// (~16 MB at ~256 B per entry) while leaving headroom for
++/// real workloads — peer mesh sizes ≤ a few thousand nodes
++/// rarely exceed a few thousand concurrent stream IDs.
++pub const MAX_STREAM_STATS: usize = 65_536;
++
+ /// Routing table for stream-to-destination mapping
+ pub struct RoutingTable {
+     /// Node ID -> next hop address
+@@ -563,8 +584,26 @@ impl RoutingTable {
+         self.stream_stats.entry(stream_id).or_default().downgrade()
+     }
+ 
++    /// Returns true if this stream id may be inserted into
++    /// `stream_stats`. Existing entries always proceed; new
++    /// entries are admitted only if the map is below
++    /// [`MAX_STREAM_STATS`] (BUG #89). The check has a TOCTOU
++    /// race against concurrent inserters but is intentionally
++    /// soft — we only need to bound growth, not enforce a strict
++    /// upper bound.
++    #[inline]
++    fn may_admit_stream(&self, stream_id: u64) -> bool {
++        if self.stream_stats.contains_key(&stream_id) {
++            return true;
++        }
++        self.stream_stats.len() < MAX_STREAM_STATS
++    }
++
+     /// Record incoming packet for stream
+     pub fn record_in(&self, stream_id: u64, bytes: u64) {
++        if !self.may_admit_stream(stream_id) {
++            return;
++        }
+         self.stream_stats
+             .entry(stream_id)
+             .or_default()
+@@ -573,6 +612,9 @@ impl RoutingTable {
+ 
+     /// Record outgoing packet for stream
+     pub fn record_out(&self, stream_id: u64, bytes: u64) {
++        if !self.may_admit_stream(stream_id) {
++            return;
++        }
+         self.stream_stats
+             .entry(stream_id)
+             .or_default()
+@@ -581,6 +623,9 @@ impl RoutingTable {
+ 
+     /// Record dropped packet for stream
+     pub fn record_drop(&self, stream_id: u64) {
++        if !self.may_admit_stream(stream_id) {
++            return;
++        }
+         self.stream_stats
+             .entry(stream_id)
+             .or_default()
+@@ -1140,4 +1185,84 @@ mod tests {
+         let entry = table.routes.get(&dest).unwrap();
+         assert_eq!(entry.metric, 1, "metric must still be 1 (direct)");
+     }
++
++    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #89: the
++    /// router extracts `stream_id` from raw packet bytes BEFORE
++    /// any AEAD verification (the router is upstream of session
++    /// keys). Pre-fix, every distinct `stream_id` seen on a routed
++    /// packet would insert a fresh `SchedulerStreamStats` entry
++    /// into `stream_stats`, with no upper bound — a malicious
++    /// peer could exhaust router memory by sending packets with
++    /// random `stream_id` values between `cleanup_idle_streams`
++    /// ticks. The fix soft-caps `stream_stats` at
++    /// [`MAX_STREAM_STATS`]; new IDs above the cap are dropped
++    /// (existing entries continue to record so legitimate streams
++    /// aren't kicked out mid-flight).
++    #[test]
++    fn record_in_stops_admitting_new_streams_at_cap() {
++        let table = RoutingTable::new(0xCAFE);
++
++        // Use a tighter "virtual cap" so the test is fast: insert
++        // up to MAX_STREAM_STATS entries directly via the public
++        // API, then verify subsequent novel inserts are rejected.
++        // This walks the real cap path (no mocking).
++        for i in 0..MAX_STREAM_STATS as u64 {
++            table.record_in(i, 1);
++        }
++        assert_eq!(
++            table.stream_count(),
++            MAX_STREAM_STATS,
++            "all initial entries must be admitted (we're at the cap)"
++        );
++
++        // Try to admit one more novel stream — must be rejected.
++        let novel = MAX_STREAM_STATS as u64 + 1;
++        table.record_in(novel, 1);
++        assert!(
++            !table.stream_stats.contains_key(&novel),
++            "novel stream_id at cap must NOT be admitted (BUG #89 \
++             would have inserted unconditionally and grown the map \
++             unboundedly)"
++        );
++        assert_eq!(
++            table.stream_count(),
++            MAX_STREAM_STATS,
++            "stream_count must not grow past the cap"
++        );
++
++        // Existing entries must still record activity.
++        table.record_in(0, 100);
++        let stats = table.stream_stats.get(&0).unwrap();
++        assert!(
++            stats.get_packets_in() >= 2,
++            "existing entry must continue to record despite the \
++             cap — BUG #89 fix is admit-side only"
++        );
++    }
++
++    /// After `cleanup_idle_streams` reclaims slots, the cap
++    /// admits new IDs again. Pins that the fix is "soft cap"
++    /// rather than "hard ceiling forever".
++    #[test]
++    fn cap_admits_new_streams_after_cleanup_reclaims_slots() {
++        let table = RoutingTable::new(0xCAFE);
++        for i in 0..MAX_STREAM_STATS as u64 {
++            table.record_in(i, 1);
++        }
++
++        // Sweep with idle window=0 so every entry counts as idle
++        // (no real time has passed, but `is_idle` compares
++        // last-activity to now).
++        let removed = table.cleanup_idle_streams(0);
++        assert!(removed > 0, "cleanup must reclaim some entries");
++
++        // Now a fresh ID should be admitted.
++        let fresh: u64 = 0xDEAD_BEEF_CAFE_F00D;
++        table.record_in(fresh, 1);
++        assert!(
++            table.stream_stats.contains_key(&fresh),
++            "after cleanup_idle_streams reclaims slots, novel \
++             stream_ids must be admissible again"
++        );
++    }
+ }
+diff --git a/net/crates/net/src/adapter/net/router.rs b/net/crates/net/src/adapter/net/router.rs
+index cc9daa8..f21d294 100644
+--- a/net/crates/net/src/adapter/net/router.rs
++++ b/net/crates/net/src/adapter/net/router.rs
+@@ -510,6 +510,18 @@ impl NetRouter {
+         let mut new_data = BytesMut::with_capacity(data.len());
+         let mut fwd_header = routing_header;
+         fwd_header.forward();
++        // BUG #119: pre-fix the post-forward expired check was
++        // missing — if `forward()` decremented TTL to 0, the
++        // packet was still queued and sent to next_hop, which
++        // would then drop it on its own `is_expired()` check.
++        // Wasted one forward + bandwidth + queue slot per
++        // last-hop packet. Drop locally here so the next hop
++        // never sees the doomed packet.
++        if fwd_header.is_expired() {
++            self.packets_dropped.fetch_add(1, Ordering::Relaxed);
++            self.routing_table.record_drop(stream_id);
++            return Err(RouterError::TtlExpired);
++        }
+         fwd_header.write_to(&mut new_data);
+         new_data.extend_from_slice(&data[ROUTING_HEADER_SIZE..]);
+ 
+@@ -848,6 +860,93 @@ mod tests {
+         );
+     }
+ 
++    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #119: pre-fix
++    /// `route_packet` decremented TTL via `forward()` and queued
++    /// the packet for the next hop without checking whether the
++    /// post-decrement TTL was 0. The next hop received a TTL=0
++    /// packet and dropped it on its own `is_expired()` check —
++    /// wasting one forward + bandwidth + queue slot per
++    /// last-hop packet. Post-fix the router drops here with
++    /// `TtlExpired` if `forward()` made the TTL 0.
++    #[tokio::test]
++    async fn route_packet_drops_when_forward_makes_ttl_zero() {
++        let local_id = 0x1234u64;
++        let dest_id = 0x9999u64;
++        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
++
++        let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
++        let router = NetRouter::new(config).await.unwrap();
++        router.routing_table().add_route(dest_id, dest_addr);
++
++        // TTL = 1 — `forward()` will decrement to 0. Pre-fix
++        // this would still queue the packet (RouteAction::Forwarded);
++        // post-fix it's dropped with TtlExpired.
++        let routing = RoutingHeader::new(dest_id, 0x5678, 1);
++        let routing_bytes = routing.to_bytes();
++
++        let net = NetHeader::new(
++            0xAAAA,
++            0xBEEF,
++            1,
++            [0u8; 12],
++            0,
++            0,
++            super::super::protocol::PacketFlags::NONE,
++        );
++        let net_bytes = net.to_bytes();
++
++        let mut packet = BytesMut::with_capacity(ROUTING_HEADER_SIZE + HEADER_SIZE);
++        packet.extend_from_slice(&routing_bytes);
++        packet.extend_from_slice(&net_bytes);
++
++        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
++        let result = router.route_packet(packet.freeze(), from);
++
++        match result {
++            Err(RouterError::TtlExpired) => {} // expected
++            Ok(action) => panic!(
++                "post-fix must drop with TtlExpired, not forward (got {:?})",
++                action
++            ),
++            Err(e) => panic!("unexpected error: {:?}", e),
++        }
++    }
++
++    /// Sanity: a TTL=2 packet should still forward (decrements
++    /// to 1 — non-zero, next hop accepts).
++    #[tokio::test]
++    async fn route_packet_forwards_when_ttl_remains_positive_after_decrement() {
++        let local_id = 0x1234u64;
++        let dest_id = 0x9999u64;
++        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
++
++        let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
++        let router = NetRouter::new(config).await.unwrap();
++        router.routing_table().add_route(dest_id, dest_addr);
++
++        let routing = RoutingHeader::new(dest_id, 0x5678, 2);
++        let routing_bytes = routing.to_bytes();
++        let net = NetHeader::new(
++            0xAAAA,
++            0xBEEF,
++            1,
++            [0u8; 12],
++            0,
++            0,
++            super::super::protocol::PacketFlags::NONE,
++        );
++        let net_bytes = net.to_bytes();
++        let mut packet = BytesMut::with_capacity(ROUTING_HEADER_SIZE + HEADER_SIZE);
++        packet.extend_from_slice(&routing_bytes);
++        packet.extend_from_slice(&net_bytes);
++        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
++        let result = router.route_packet(packet.freeze(), from);
++        match result {
++            Ok(RouteAction::Forwarded(addr)) => assert_eq!(addr, dest_addr),
++            other => panic!("expected Forwarded, got {:?}", other),
++        }
++    }
++
+     #[test]
+     fn test_regression_fair_scheduler_cleanup_called() {
+         // Regression: FairScheduler never removed empty stream queues from its

@@ -136,6 +136,22 @@ impl HeapSegment {
         self.base_offset = base;
     }
 
+    /// Reset `base_offset` to zero without touching the buffer.
+    ///
+    /// Used by `RedexFile::sweep_retention` after a successful
+    /// `disk.compact_to`: the on-disk dat is now rewritten to start
+    /// at byte 0, so the in-memory segment must follow the same
+    /// renormalization or subsequent appends will compute absolute
+    /// offsets that index past the end of the new on-disk dat (BUG
+    /// #92). Caller is responsible for renormalizing any external
+    /// offsets (e.g. `RedexEntry::payload_offset` values stored in
+    /// the index) by the prior `base_offset` value before calling
+    /// this — otherwise reads through `read_at` will misalign.
+    #[cfg(feature = "redex-disk")]
+    pub(super) fn rebase_to_zero(&mut self) {
+        self.base_offset = 0;
+    }
+
     /// Test-only: mutable access to the underlying byte buffer.
     /// Used by checksum-on-read regression tests to simulate
     /// on-disk corruption without going through a real I/O path.

@@ -246,13 +246,29 @@ impl CorrelatedFailureDetector {
         let threshold =
             (with_subnet as f32 * self.config.subnet_correlation_threshold).ceil() as usize;
 
-        let mut best_subnet = None;
-        let mut best_depth = 0u8;
+        // Iterate a sorted snapshot so ties resolve deterministically:
+        // higher `depth` wins; on equal depth, the lower `SubnetId`
+        // wins (the inner `u32` comparison is a stable total order
+        // without semantic hierarchy meaning — see `SubnetId`'s
+        // `Ord` rustdoc). Iterating a `HashMap` directly with `>=` on
+        // depth as the tiebreaker would let hash iteration order
+        // (randomized per process) pick the winner, and downstream
+        // `partition.rs::detect` would brand the partition record
+        // with a subnet that flips between runs given identical
+        // inputs.
+        let mut entries: Vec<(SubnetId, usize)> =
+            subnet_counts.iter().map(|(&s, &c)| (s, c)).collect();
+        entries.sort_by(|a, b| b.0.depth().cmp(&a.0.depth()).then_with(|| a.0.cmp(&b.0)));
 
-        for (&subnet, &count) in &subnet_counts {
-            if count >= threshold && subnet.depth() >= best_depth {
+        // Sort (above) guarantees the entries are visited deepest-
+        // first within the threshold-meeting set, so the first hit
+        // is the deterministic winner. We `break` immediately on
+        // the first hit; no `best_depth` tracking needed.
+        let mut best_subnet = None;
+        for (subnet, count) in entries {
+            if count >= threshold {
                 best_subnet = Some(subnet);
-                best_depth = subnet.depth();
+                break;
             }
         }
 
@@ -368,6 +384,87 @@ mod tests {
         } = &verdict
         {
             assert_eq!(*suspected_cause, FailureCause::BroadOutage);
+        }
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #91: previously
+    /// `analyze_subnet_correlation` iterated `subnet_counts` (a
+    /// `HashMap`) directly with `>=` on depth as the tiebreaker.
+    /// On tied `best_depth`, the chosen subnet depended on hash
+    /// iteration order, which `std::collections::HashMap` randomizes
+    /// per process — recovery scope flipped between runs given
+    /// identical inputs.
+    ///
+    /// We pin the deterministic-tiebreak fix by:
+    ///   1. Building a scenario with two equally-deep subnets
+    ///      that both meet the correlation threshold and have
+    ///      equal failure counts (the pre-fix nondeterminism
+    ///      window).
+    ///   2. Running the analysis many times back-to-back. The
+    ///      same `CorrelatedFailureDetector` is rebuilt each
+    ///      iteration to maximize the chance the underlying
+    ///      hasher state shifts.
+    ///   3. Asserting every run picks the same subnet — the
+    ///      lower `SubnetId` wins on ties (per the new sort).
+    ///
+    /// Pre-fix this would intermittently return `SubnetId::new(&[1, 2])`
+    /// instead of `SubnetId::new(&[1, 1])`.
+    #[test]
+    fn ties_resolve_deterministically_across_runs() {
+        for _attempt in 0..32 {
+            // Two sibling subnets at depth 2, each with 3 nodes.
+            // Threshold of 0.30 means a subnet needs count ≥
+            // ceil(6 * 0.30) = 2 to qualify. Both [1,1] and [1,2]
+            // hit count=3 — the tied case the pre-fix code
+            // resolved nondeterministically. (The default
+            // `subnet_correlation_threshold` of 0.80 would put
+            // the threshold at 5 and select only the parent
+            // rollup, so we override it explicitly.)
+            let mut det = CorrelatedFailureDetector::new(CorrelatedFailureConfig {
+                mass_failure_threshold: 0.30,
+                subnet_correlation_threshold: 0.30,
+                ..Default::default()
+            });
+            for i in 0..3 {
+                det.register_node(i, SubnetId::new(&[1, 1]));
+            }
+            for i in 3..6 {
+                det.register_node(i, SubnetId::new(&[1, 2]));
+            }
+            for i in 6..10 {
+                det.register_node(i, SubnetId::new(&[2, (i as u8)]));
+            }
+
+            // Fail all 6 nodes in [1,1] + [1,2]. with_subnet=6.
+            // Both [1,1] and [1,2] hit count=3 ≥ 2 at depth 2;
+            // [1] hits count=6 at depth 1. Pre-fix the loop
+            // would pick whichever depth-2 child the HashMap
+            // visited last in iteration order.
+            let verdict = det.record_failures(&[0, 1, 2, 3, 4, 5], 20);
+            assert!(verdict.is_mass_failure());
+            if let CorrelationVerdict::MassFailure {
+                suspected_cause, ..
+            } = &verdict
+            {
+                match suspected_cause {
+                    FailureCause::SubnetFailure { subnet, .. } => {
+                        // Deterministic tiebreak: lower id wins
+                        // on equal depth. `SubnetId::new(&[1, 1])`
+                        // < `SubnetId::new(&[1, 2])` under the
+                        // derived `Ord` on the inner u32.
+                        assert_eq!(
+                            *subnet,
+                            SubnetId::new(&[1, 1]),
+                            "tied subnets at the same depth must \
+                             resolve to the lower SubnetId every \
+                             run — pre-fix this flipped between \
+                             [1,1] and [1,2] depending on hash \
+                             iteration order"
+                        );
+                    }
+                    other => panic!("expected SubnetFailure, got {:?}", other),
+                }
+            }
         }
     }
 

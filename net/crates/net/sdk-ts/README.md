@@ -110,6 +110,93 @@ await NetNode.create({
 });
 ```
 
+### Persistent producer nonce (cross-restart dedup)
+
+JetStream and Redis adapters key dedup on `(producer_nonce, shard,
+sequence_start, i)`. Without persistence the nonce is fresh per
+process — a producer that crashes mid-batch and restarts gets a
+new nonce, retransmits look fresh, and the backend persists the
+partial half twice. Configure
+`producerNoncePath` to make the nonce durable:
+
+```typescript
+await NetNode.create({
+  shards: 4,
+  transport: { type: 'redis', url: 'redis://localhost:6379' },
+  producerNoncePath: '/var/lib/myapp/producer.nonce',
+});
+```
+
+The bus loads (or creates on first run) a u64 nonce at this
+path. JetStream gets cross-restart dedup automatically;
+Redis Streams ships the same id as a `dedup_id` field on every
+XADD, filterable via the helper below.
+
+## Redis Streams consumer-side dedup helper
+
+The Redis adapter writes a stable `dedup_id` field on every XADD
+entry (`{producer_nonce:hex}:{shard_id}:{sequence_start}:{i}`).
+Combined with `producerNoncePath` above, the id is stable across
+both retries and process restart, so the `MULTI/EXEC` timeout
+race becomes filterable consumer-side.
+
+`RedisStreamDedup` is exposed on the underlying `@ai2070/net`
+NAPI module:
+
+```typescript
+import { RedisStreamDedup } from '@ai2070/net';
+import { createClient } from 'redis';
+
+// Sizing: ~10k events/sec * 1 min dedup window → ~600,000.
+const dedup = new RedisStreamDedup(600_000);
+
+const r = createClient();
+await r.connect();
+
+let cursor = '0';
+while (true) {
+  // XRANGE bounds are INCLUSIVE on both ends. After the first
+  // page we must use the exclusive form `(<id>` so we don't
+  // re-read the entry the cursor points at — a vanilla
+  // `xRange(stream, cursor, '+')` loop spins forever once the
+  // cursor reaches the tail and the same entry is returned every
+  // iteration.
+  const start = cursor === '0' ? cursor : `(${cursor}`;
+  const entries = await r.xRange('net:shard:0', start, '+', { COUNT: 100 });
+  if (entries.length === 0) break;
+  for (const entry of entries) {
+    const dedupId = entry.message.dedup_id;
+    if (!dedupId) {
+      // Older entries / non-Net producers: skip dedup.
+      await process(entry);
+      continue;
+    }
+    if (!dedup.isDuplicate(dedupId)) {
+      await process(entry);
+    }
+    cursor = entry.id;
+  }
+}
+```
+
+Surface (NAPI class):
+
+```typescript
+new RedisStreamDedup(capacity?: number)   // defaults to 4096
+dedup.isDuplicate(id: string): boolean
+dedup.len: number       // readonly
+dedup.capacity: number  // readonly
+dedup.isEmpty: boolean  // readonly
+dedup.clear(): void
+```
+
+The helper is transport-agnostic — bring your own `redis` /
+`ioredis` / equivalent client; it just answers the dedup
+question against an in-memory LRU. Concurrency: the underlying
+handle wraps a Rust mutex, so concurrent calls from worker
+threads serialize but are safe. Production-shape is one helper
+per consumer worker.
+
 ## NAT Traversal (optimization, not correctness)
 
 Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it; it's never required for connectivity. The TS SDK doesn't yet wrap this surface — it's a planned follow-up. For now, construct a `NetMesh` from `@ai2070/net` directly to access the NAPI methods:

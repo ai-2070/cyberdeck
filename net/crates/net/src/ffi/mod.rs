@@ -83,6 +83,13 @@ pub mod cortex;
 #[allow(missing_docs)]
 pub mod mesh;
 
+/// C FFI for the Redis Streams consumer-side dedup helper. Mirrors
+/// the Rust `net::adapter::RedisStreamDedup` surface for Go / C / Zig
+/// consumers. See `ffi::redis_dedup` module docs for the wire
+/// shape and the dedup contract.
+#[cfg(feature = "redis")]
+pub mod redis_dedup;
+
 #[cfg(feature = "net")]
 use crate::adapter::net::{NetAdapterConfig, ReliabilityConfig, StaticKeypair};
 #[cfg(any(feature = "redis", feature = "jetstream", feature = "net"))]
@@ -269,33 +276,43 @@ fn enter_ffi_op(handle: &NetHandle) -> Result<FfiOpGuard<'_>, c_int> {
 /// ```
 #[unsafe(no_mangle)]
 pub extern "C" fn net_init(config_json: *const c_char) -> *mut NetHandle {
-    // Create runtime
+    // Parse and validate the config BEFORE constructing the tokio
+    // runtime. Building the runtime first would let any subsequent
+    // early-return path (`CStr::to_str` Err, `parse_config_json`
+    // returning None, `EventBus::new` returning Err) drop the
+    // local `Runtime` on function return. Dropping a multi-thread
+    // tokio runtime from inside ANOTHER tokio runtime's worker
+    // thread panics with "Cannot drop a runtime in a context where
+    // blocking is not allowed", unwinding across this `extern "C"`
+    // boundary into a Python / Go-cgo / NAPI / PyO3 caller —
+    // undefined behaviour. By validating inputs first, the runtime
+    // is only built once we know it will be installed into the
+    // `NetHandle` and survive the call.
+    let config = if config_json.is_null() {
+        EventBusConfig::default()
+    } else {
+        let config_str = match unsafe { CStr::from_ptr(config_json) }.to_str() {
+            Ok("") => EventBusConfig::default(),
+            Ok(s) => match parse_config_json(s) {
+                Some(cfg) => cfg,
+                None => return ptr::null_mut(),
+            },
+            Err(_) => return ptr::null_mut(),
+        };
+        config_str
+    };
+
+    // Now construct the runtime — its lifetime is tied to the
+    // returned `NetHandle` (via `create_with_config`), so the only
+    // remaining drop is on `net_shutdown`, which already handles
+    // it via `runtime.block_on(...)` (see #74) outside any other
+    // tokio context.
     let runtime = match Runtime::new() {
         Ok(rt) => rt,
         Err(_) => return ptr::null_mut(),
     };
 
-    // Parse config
-    let config = if config_json.is_null() {
-        EventBusConfig::default()
-    } else {
-        let config_str = match unsafe { CStr::from_ptr(config_json) }.to_str() {
-            Ok("") => return create_with_default(runtime),
-            Ok(s) => s,
-            Err(_) => return ptr::null_mut(),
-        };
-
-        match parse_config_json(config_str) {
-            Some(cfg) => cfg,
-            None => return ptr::null_mut(),
-        }
-    };
-
     create_with_config(runtime, config)
-}
-
-fn create_with_default(runtime: Runtime) -> *mut NetHandle {
-    create_with_config(runtime, EventBusConfig::default())
 }
 
 /// Parse JSON configuration into EventBusConfig.
@@ -460,7 +477,21 @@ fn parse_config_json(json_str: &str) -> Option<EventBusConfig> {
 fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut NetHandle {
     let bus = match runtime.block_on(EventBus::new(config)) {
         Ok(bus) => bus,
-        Err(_) => return ptr::null_mut(),
+        Err(_) => {
+            // Send the runtime off to a fresh OS thread for
+            // dropping. Dropping a multi-thread tokio `Runtime`
+            // from inside another tokio runtime's worker thread
+            // panics ("Cannot drop a runtime in a context where
+            // blocking is not allowed"); a panic here would unwind
+            // across this `extern "C"` frame. The fresh thread
+            // guarantees a non-tokio context, so the drop is sound
+            // regardless of the caller's runtime environment. We
+            // don't `join()` the thread — the drop completes on
+            // its own and the caller has already been told
+            // `net_init` failed (returning null).
+            std::thread::spawn(move || drop(runtime));
+            return ptr::null_mut();
+        }
     };
 
     let handle = Box::new(NetHandle {
@@ -786,9 +817,15 @@ pub extern "C" fn net_poll(
         *out_buffer.add(response_json.len()) = 0; // Null terminate
     }
 
+    // Data was already copied into the caller's buffer; a
+    // `c_int` overflow here means the byte count exceeds c_int's
+    // range, NOT that the buffer was too small. Returning
+    // `BufferTooSmall` would tell the caller to "resize and retry"
+    // when retrying can't fix the actual condition. `IntOverflow`
+    // is the documented variant for this case.
     match c_int::try_from(response_json.len()) {
         Ok(n) => n,
-        Err(_) => NetError::BufferTooSmall.into(),
+        Err(_) => NetError::IntOverflow.into(),
     }
 }
 
@@ -846,9 +883,11 @@ pub extern "C" fn net_stats(
         *out_buffer.add(stats_json.len()) = 0;
     }
 
+    // See net_poll above — the data was already copied, so an
+    // overflowing length is `IntOverflow`, not `BufferTooSmall`.
     match c_int::try_from(stats_json.len()) {
         Ok(n) => n,
-        Err(_) => NetError::BufferTooSmall.into(),
+        Err(_) => NetError::IntOverflow.into(),
     }
 }
 
@@ -905,70 +944,83 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
         return NetError::NullPointer.into();
     }
 
-    // SAFETY: The C contract guarantees `handle` is valid here and that
-    // `net_shutdown` is not called concurrently with itself. Future
-    // dereferences of the box from concurrent FFI ops on other threads
-    // are also sound because we never free the box (see below).
-    let handle_ref = unsafe { &*handle };
+    // Scope the `&NetHandle` borrow into an inner block so it is
+    // verifiably out of scope before the
+    // `ManuallyDrop::take(&mut (*handle).bus)` calls below.
+    // Holding an `&NetHandle` in scope for the whole function
+    // while taking a raw `&mut (*handle).bus` later would rely on
+    // NLL ending the immutable borrow before the mutable take —
+    // a pattern fragile under stacked/tree borrow models. The
+    // block-scoped borrow makes the lifetime constraint explicit
+    // and obvious to both the compiler and any future maintainer.
+    let drained_and_taken = {
+        // SAFETY: The C contract guarantees `handle` is valid here and that
+        // `net_shutdown` is not called concurrently with itself. Future
+        // dereferences of the box from concurrent FFI ops on other threads
+        // are also sound because we never free the box (see below).
+        let handle_ref = unsafe { &*handle };
 
-    // Signal shutdown so concurrent FFI calls bail before touching
-    // `bus`/`runtime`. SeqCst pairs with `FfiOpGuard::try_enter`.
-    handle_ref
-        .shutting_down
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Signal shutdown so concurrent FFI calls bail before touching
+        // `bus`/`runtime`. SeqCst pairs with `FfiOpGuard::try_enter`.
+        handle_ref
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    // Bounded wait for in-flight ops to drain. Without a deadline, a
-    // hung concurrent operation (e.g. `net_flush` against a stalled
-    // adapter) would pin a CPU at 100% inside this loop forever.
-    //
-    // `std::hint::spin_loop()` is a CPU pause hint, not a yield. On
-    // a single-threaded executor (or any configuration where the FFI
-    // caller's thread is the same one that needs to make progress on
-    // the in-flight async work) the tight spin starves the very tokio
-    // worker we're waiting for, *causing* the deadline to expire when
-    // it otherwise wouldn't. `thread::yield_now` lets the OS schedule
-    // whatever's blocked, and a 1ms `thread::sleep` between yields
-    // prevents the loop from saturating a CPU on platforms where
-    // `yield_now` is a
-    // near-no-op under low contention. The drain we expect to take
-    // milliseconds, so a millisecond-granularity poll is fine.
-    let deadline = std::time::Instant::now() + FFI_SHUTDOWN_DEADLINE;
-    let mut drained = false;
-    loop {
+        // Bounded wait for in-flight ops to drain. Without a deadline, a
+        // hung concurrent operation (e.g. `net_flush` against a stalled
+        // adapter) would pin a CPU at 100% inside this loop forever.
+        //
+        // `std::hint::spin_loop()` is a CPU pause hint, not a yield. On
+        // a single-threaded executor (or any configuration where the FFI
+        // caller's thread is the same one that needs to make progress on
+        // the in-flight async work) the tight spin starves the very tokio
+        // worker we're waiting for, *causing* the deadline to expire when
+        // it otherwise wouldn't. `thread::yield_now` lets the OS schedule
+        // whatever's blocked, and a 1ms `thread::sleep` between yields
+        // prevents the loop from saturating a CPU on platforms where
+        // `yield_now` is a
+        // near-no-op under low contention. The drain we expect to take
+        // milliseconds, so a millisecond-granularity poll is fine.
+        let deadline = std::time::Instant::now() + FFI_SHUTDOWN_DEADLINE;
+        let mut drained = false;
+        loop {
+            if handle_ref
+                .active_ops
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                drained = true;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        if !drained {
+            // In-flight ops may still be reading `bus`/`runtime`; reading
+            // them out via `ManuallyDrop::take` would race those readers.
+            // Leak both fields along with the box. Future ops still see
+            // `shutting_down=true` and bail before touching either field,
+            // so the leaked memory is never read again.
+            return NetError::Unknown.into();
+        }
+
+        // Idempotent shutdown: if a previous `net_shutdown` already moved
+        // out the bus/runtime, do not call `ManuallyDrop::take` a second
+        // time (that would be UB). The first call has already done the
+        // work; report success.
         if handle_ref
-            .active_ops
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == 0
+            .bus_taken
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            drained = true;
-            break;
+            return NetError::Success.into();
         }
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        std::thread::yield_now();
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-
-    if !drained {
-        // In-flight ops may still be reading `bus`/`runtime`; reading
-        // them out via `ManuallyDrop::take` would race those readers.
-        // Leak both fields along with the box. Future ops still see
-        // `shutting_down=true` and bail before touching either field,
-        // so the leaked memory is never read again.
-        return NetError::Unknown.into();
-    }
-
-    // Idempotent shutdown: if a previous `net_shutdown` already moved
-    // out the bus/runtime, do not call `ManuallyDrop::take` a second
-    // time (that would be UB). The first call has already done the
-    // work; report success.
-    if handle_ref
-        .bus_taken
-        .swap(true, std::sync::atomic::Ordering::SeqCst)
-    {
-        return NetError::Success.into();
-    }
+        drained
+    };
+    let _ = drained_and_taken;
 
     // SAFETY: `active_ops` reached zero with `shutting_down=true`, so:
     //   - Every FFI op that started before shutdown has fully
@@ -976,7 +1028,10 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
     //   - Any future FFI op will observe `shutting_down=true` and
     //     bail in `try_enter` before touching `bus` / `runtime`.
     // Plus, `bus_taken` was just CAS'd from false → true, so no other
-    // shutdown is concurrently moving the same fields out.
+    // shutdown is concurrently moving the same fields out. The
+    // immutable `handle_ref` borrow above has been dropped (block
+    // scope ended), so the `&mut`-via-raw-pointer below is the
+    // only live access — no stacked/tree-borrow race.
     //
     // We deliberately do NOT call `Box::from_raw` here. The box's
     // `shutting_down` / `active_ops` / `bus_taken` atomics must remain
@@ -1030,7 +1085,7 @@ pub extern "C" fn net_num_shards(handle: *mut NetHandle) -> u16 {
 /// Version string (static, do not free).
 #[unsafe(no_mangle)]
 pub extern "C" fn net_version() -> *const c_char {
-    static VERSION: &[u8] = b"0.1.0\0";
+    static VERSION: &[u8] = b"0.8.0\0";
     VERSION.as_ptr() as *const c_char
 }
 
@@ -1482,5 +1537,97 @@ mod tests {
         // 2^33 — fits in u64, but exceeds usize::MAX on a 32-bit build.
         let err = parse_poll_request_json(r#"{"limit": 8589934592}"#).unwrap_err();
         assert_eq!(err, c_int::from(NetError::InvalidJson));
+    }
+
+    /// CR-22: pin parity between the Rust-side `NetError` enum and
+    /// the two C-header copies (`include/net.h` and
+    /// `bindings/go/net/net.h`). The Rust enum is the source of
+    /// truth; C / Go consumers `errors.Is` against the named codes.
+    /// Pre-CR-22 the headers were missing `-9` (IntOverflow) and
+    /// `-10` (MismatchedHandles); a consumer receiving those values
+    /// would fall into the unknown-code branch and lose actionable
+    /// distinction.
+    ///
+    /// We extract every integer literal that appears as the
+    /// right-hand side of an `= ` token in the file and check
+    /// that each Rust-side value is present in BOTH headers. The
+    /// test does NOT verify symbolic names; the sealing
+    /// constraint is the numeric value alone.
+    #[test]
+    fn cr22_c_header_parity_with_rust_neterror() {
+        let primary = include_str!("../../include/net.h");
+        let go_copy = include_str!("../../bindings/go/net/net.h");
+
+        // The Rust enum's full set of values (mirrors `pub enum
+        // NetError` above). When a new variant is added in the
+        // Rust source, this list — AND both headers — must be
+        // updated together. The asserts that follow then catch a
+        // missing header update at the next CI run.
+        let rust_values: &[i32] = &[0, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -99];
+
+        // Pull every numeric literal that looks like an enum-value
+        // assignment (`= <number>` followed by `,` or whitespace).
+        // Whitespace-tolerant: skips `= 0`, `=  0`, `= -10`, etc.
+        fn extract_assigned_values(src: &str) -> Vec<i32> {
+            let mut out = Vec::new();
+            let mut chars = src.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '=' {
+                    continue;
+                }
+                // Skip whitespace.
+                while let Some(&peek) = chars.peek() {
+                    if peek == ' ' || peek == '\t' {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Optional sign.
+                let mut buf = String::new();
+                if let Some(&peek) = chars.peek() {
+                    if peek == '-' || peek == '+' {
+                        buf.push(peek);
+                        chars.next();
+                    }
+                }
+                // Digits.
+                let mut had_digit = false;
+                while let Some(&peek) = chars.peek() {
+                    if peek.is_ascii_digit() {
+                        buf.push(peek);
+                        chars.next();
+                        had_digit = true;
+                    } else {
+                        break;
+                    }
+                }
+                if had_digit {
+                    if let Ok(v) = buf.parse::<i32>() {
+                        out.push(v);
+                    }
+                }
+            }
+            out
+        }
+
+        let primary_vals = extract_assigned_values(primary);
+        let go_vals = extract_assigned_values(go_copy);
+
+        for &v in rust_values {
+            assert!(
+                primary_vals.contains(&v),
+                "CR-22 regression: include/net.h is missing the value {} \
+                 (Rust NetError defines it). Add the matching `NET_ERR_*` \
+                 enumerator before merging.",
+                v
+            );
+            assert!(
+                go_vals.contains(&v),
+                "CR-22 regression: bindings/go/net/net.h is missing the value {} \
+                 (Rust NetError defines it).",
+                v
+            );
+        }
     }
 }

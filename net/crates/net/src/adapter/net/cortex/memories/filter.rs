@@ -27,13 +27,13 @@ pub struct MemoriesFilter {
     pub all_tags: Option<Vec<String>>,
     /// Restrict to pinned (`Some(true)`) or unpinned (`Some(false)`).
     pub pinned: Option<bool>,
-    /// `created_ns > ns`.
+    /// `created_ns >= ns` (inclusive).
     pub created_after_ns: Option<u64>,
-    /// `created_ns < ns`.
+    /// `created_ns <= ns` (inclusive).
     pub created_before_ns: Option<u64>,
-    /// `updated_ns > ns`.
+    /// `updated_ns >= ns` (inclusive).
     pub updated_after_ns: Option<u64>,
-    /// `updated_ns < ns`.
+    /// `updated_ns <= ns` (inclusive).
     pub updated_before_ns: Option<u64>,
     /// Result ordering.
     pub order_by: Option<OrderBy>,

@@ -18,7 +18,13 @@ extern "C" {
 /* Opaque handle to the event bus */
 typedef void* net_handle_t;
 
-/* Error codes */
+/*
+ * Error codes.
+ *
+ * Kept in sync with the Rust-side `NetError` enum and the
+ * canonical `include/net.h`. The library has a regression test
+ * that scans both headers to detect drift.
+ */
 typedef enum {
     NET_SUCCESS = 0,
     NET_ERR_NULL_POINTER = -1,
@@ -29,6 +35,10 @@ typedef enum {
     NET_ERR_POLL_FAILED = -6,
     NET_ERR_BUFFER_TOO_SMALL = -7,
     NET_ERR_SHUTTING_DOWN = -8,
+    /* Response byte count exceeds c_int::MAX. */
+    NET_ERR_INT_OVERFLOW = -9,
+    /* Stream handle does not belong to the supplied node. */
+    NET_ERR_MISMATCHED_HANDLES = -10,
     NET_ERR_UNKNOWN = -99,
     /* CortEX / RedEX surface (compiled when the Rust cdylib has
      * `netdb` + `redex-disk` features on). Codes below -99 so they
@@ -325,6 +335,64 @@ int  net_memories_snapshot_and_watch(net_memories_adapter_t* handle,
 int  net_memories_watch_next(net_memories_watch_t* cursor, uint32_t timeout_ms,
                              char** out_json, size_t* out_len);
 void net_memories_watch_free(net_memories_watch_t* cursor);
+
+/* =========================================================================
+ * Redis Streams consumer-side dedup helper (`redis` feature).
+ *
+ * Mirrors `net::adapter::RedisStreamDedup` and the cross-language
+ * wrappers in the Node / Python SDKs. The Redis adapter writes a
+ * stable `dedup_id` field on every XADD entry
+ * (`"{producer_nonce:hex}:{shard_id}:{sequence_start}:{i}"`); this
+ * helper filters duplicates whose `dedup_id`s repeat — handling the
+ * producer-side `MULTI/EXEC`-timeout race that lands two stream
+ * entries for one logical event.
+ *
+ * Each handle wraps an LRU-bounded set of seen ids; the LRU is
+ * mutex-protected so concurrent calls from multiple goroutines /
+ * threads are safe but serialize. Production callers typically
+ * instantiate one helper per consumer goroutine and key on the
+ * `dedup_id` field they extract from each `XRANGE` / `XREAD`
+ * entry. See `bindings/go/README.md` and the Python / Node SDK
+ * READMEs for runnable examples.
+ * ========================================================================= */
+
+typedef struct net_redis_dedup_s net_redis_dedup_t;
+
+/* Create a new dedup helper. `capacity == 0` selects the default
+ * (4096); production callers should size to their dedup window
+ * (consumer at ~10k events/sec with a 1 min window: ~600,000).
+ * Never returns NULL. Free with `net_redis_dedup_free`.
+ */
+net_redis_dedup_t* net_redis_dedup_new(size_t capacity);
+
+/* Free a helper handle. NULL is a no-op. */
+void net_redis_dedup_free(net_redis_dedup_t* handle);
+
+/* Test-and-insert. Returns:
+ *    1 — duplicate (caller should skip the entry)
+ *    0 — new       (caller should process AND we've now marked it seen)
+ *   -1 — NULL handle or NULL dedup_id
+ *   -2 — invalid UTF-8 in dedup_id
+ */
+int net_redis_dedup_is_duplicate(net_redis_dedup_t* handle, const char* dedup_id);
+
+/* Number of distinct ids currently tracked. Returns 0 on NULL
+ * handle (mirrors the "no ids" semantic).
+ */
+size_t net_redis_dedup_len(net_redis_dedup_t* handle);
+
+/* Configured maximum capacity. Returns 0 on NULL handle. */
+size_t net_redis_dedup_capacity(net_redis_dedup_t* handle);
+
+/* Returns 1 if no ids are tracked, 0 if the helper has at least
+ * one id, -1 on NULL handle.
+ */
+int net_redis_dedup_is_empty(net_redis_dedup_t* handle);
+
+/* Clear all tracked ids. Use after a consumer-group rebalance.
+ * NULL is a no-op.
+ */
+void net_redis_dedup_clear(net_redis_dedup_t* handle);
 
 /* =========================================================================
  * Mesh transport (`net` feature).

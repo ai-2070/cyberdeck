@@ -89,23 +89,27 @@ impl MemoriesFilterSpec {
                 return false;
             }
         }
+        // Inclusive bounds. Strict `>` / `<` bounds would drop
+        // events at the cutoff, breaking pagination using "last
+        // sync ns" and dropping one of two events written in the
+        // same ns. See `cortex/tasks/query.rs` for context.
         if let Some(ns) = self.created_after_ns {
-            if m.created_ns <= ns {
+            if m.created_ns < ns {
                 return false;
             }
         }
         if let Some(ns) = self.created_before_ns {
-            if m.created_ns >= ns {
+            if m.created_ns > ns {
                 return false;
             }
         }
         if let Some(ns) = self.updated_after_ns {
-            if m.updated_ns <= ns {
+            if m.updated_ns < ns {
                 return false;
             }
         }
         if let Some(ns) = self.updated_before_ns {
-            if m.updated_ns >= ns {
+            if m.updated_ns > ns {
                 return false;
             }
         }
@@ -189,25 +193,25 @@ impl<'a> MemoriesQuery<'a> {
         self
     }
 
-    /// Restrict to `created_ns > ns`.
+    /// Restrict to `created_ns >= ns` (inclusive).
     pub fn created_after(mut self, ns: u64) -> Self {
         self.spec.created_after_ns = Some(ns);
         self
     }
 
-    /// Restrict to `created_ns < ns`.
+    /// Restrict to `created_ns <= ns` (inclusive).
     pub fn created_before(mut self, ns: u64) -> Self {
         self.spec.created_before_ns = Some(ns);
         self
     }
 
-    /// Restrict to `updated_ns > ns`.
+    /// Restrict to `updated_ns >= ns` (inclusive).
     pub fn updated_after(mut self, ns: u64) -> Self {
         self.spec.updated_after_ns = Some(ns);
         self
     }
 
-    /// Restrict to `updated_ns < ns`.
+    /// Restrict to `updated_ns <= ns` (inclusive).
     pub fn updated_before(mut self, ns: u64) -> Self {
         self.spec.updated_before_ns = Some(ns);
         self

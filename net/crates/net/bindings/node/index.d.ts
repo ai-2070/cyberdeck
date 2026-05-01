@@ -893,6 +893,44 @@ export declare class RedexTailIter {
   close(): void
 }
 
+/**
+ * Consumer-side dedup helper for the Redis Streams adapter.
+ *
+ * See `net::adapter::redis` module docs for the producer-side
+ * contract that produces the `dedup_id` field this helper filters
+ * on.
+ */
+export declare class RedisStreamDedup {
+  /**
+   * Create a helper with the given LRU capacity. Defaults to
+   * 4096 if omitted. `0` is clamped to 1.
+   *
+   * Sizing: a consumer at ~10k events/sec with a 1 min
+   * dedup window should pick ~600k.
+   */
+  constructor(capacity?: number | undefined | null)
+  /**
+   * Test-and-insert: returns `true` if the caller should treat
+   * the entry as a DUPLICATE (skip it), `false` if it's the
+   * first time we've seen this `dedupId`.
+   *
+   * Matches the Rust `is_duplicate(&mut self, &str) -> bool`.
+   */
+  isDuplicate(dedupId: string): boolean
+  /** Number of distinct ids currently tracked. */
+  get len(): number
+  /** Configured maximum capacity. */
+  get capacity(): number
+  /** True if no ids are tracked yet. */
+  get isEmpty(): boolean
+  /**
+   * Clear all tracked ids. Use after a consumer-group
+   * rebalance to reset the dedup window without losing the
+   * helper instance.
+   */
+  clear(): void
+}
+
 export declare class ReplicaGroup {
   /**
    * Resolve `ctx` to the best-available replica's `origin_hash`.

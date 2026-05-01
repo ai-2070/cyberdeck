@@ -92,14 +92,25 @@ impl NetDb {
     /// stay open on the manager — reopening via another NetDb
     /// against the same `Redex` instance replays or snapshots them.
     /// Idempotent.
+    ///
+    /// Both closes are attempted regardless of failure and the FIRST
+    /// error is surfaced; the second error (if any) is dropped
+    /// silently — `close` is best-effort teardown and the dominant
+    /// failure mode is "underlying redex already closed," which
+    /// produces the same error from both adapters and is
+    /// uninteresting to disambiguate.
     pub fn close(&self) -> Result<(), NetDbError> {
-        if let Some(t) = &self.tasks {
-            t.close()?;
+        let tasks_result = self.tasks.as_ref().map(|t| t.close()).unwrap_or(Ok(()));
+        let memories_result = self.memories.as_ref().map(|m| m.close()).unwrap_or(Ok(()));
+
+        // Surface the first error; if both errored, the tasks one
+        // wins by convention (matches the pre-fix shape where tasks
+        // ran first).
+        match (tasks_result, memories_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), _) => Err(e.into()),
+            (Ok(()), Err(e)) => Err(e.into()),
         }
-        if let Some(m) = &self.memories {
-            m.close()?;
-        }
-        Ok(())
     }
 
     /// Capture a snapshot of every enabled model. Each model is
@@ -185,21 +196,17 @@ impl NetDbBuilder {
     /// truth. Integration tests exercise the observable error path
     /// but cannot directly observe the closed first-adapter after
     /// the Redex has been dropped.
-    pub fn build(self) -> Result<NetDb, NetDbError> {
+    pub async fn build(self) -> Result<NetDb, NetDbError> {
         let cfg = self.redex_config();
 
         let tasks = if self.want_tasks {
-            Some(TasksAdapter::open_with_config(
-                &self.redex,
-                self.origin_hash,
-                cfg,
-            )?)
+            Some(TasksAdapter::open_with_config(&self.redex, self.origin_hash, cfg).await?)
         } else {
             None
         };
 
         let memories = if self.want_memories {
-            match MemoriesAdapter::open_with_config(&self.redex, self.origin_hash, cfg) {
+            match MemoriesAdapter::open_with_config(&self.redex, self.origin_hash, cfg).await {
                 Ok(m) => Some(m),
                 Err(e) => {
                     if let Some(t) = &tasks {
@@ -229,40 +236,40 @@ impl NetDbBuilder {
     /// second-adapter failure closes the first before the error
     /// propagates. See `build`'s docs for the caveat that the
     /// failing Redex is dropped with the builder.
-    pub fn build_from_snapshot(self, snapshot: &NetDbSnapshot) -> Result<NetDb, NetDbError> {
+    pub async fn build_from_snapshot(self, snapshot: &NetDbSnapshot) -> Result<NetDb, NetDbError> {
         let cfg = self.redex_config();
 
         let tasks = match (self.want_tasks, &snapshot.tasks) {
-            (true, Some((bytes, last_seq))) => Some(TasksAdapter::open_from_snapshot_with_config(
-                &self.redex,
-                self.origin_hash,
-                cfg,
-                bytes,
-                *last_seq,
-            )?),
-            (true, None) => Some(TasksAdapter::open_with_config(
-                &self.redex,
-                self.origin_hash,
-                cfg,
-            )?),
-            (false, _) => None,
-        };
-
-        let memories_result = match (self.want_memories, &snapshot.memories) {
-            (true, Some((bytes, last_seq))) => {
-                Some(MemoriesAdapter::open_from_snapshot_with_config(
+            (true, Some((bytes, last_seq))) => Some(
+                TasksAdapter::open_from_snapshot_with_config(
                     &self.redex,
                     self.origin_hash,
                     cfg,
                     bytes,
                     *last_seq,
-                ))
+                )
+                .await?,
+            ),
+            (true, None) => {
+                Some(TasksAdapter::open_with_config(&self.redex, self.origin_hash, cfg).await?)
             }
-            (true, None) => Some(MemoriesAdapter::open_with_config(
-                &self.redex,
-                self.origin_hash,
-                cfg,
-            )),
+            (false, _) => None,
+        };
+
+        let memories_result = match (self.want_memories, &snapshot.memories) {
+            (true, Some((bytes, last_seq))) => Some(
+                MemoriesAdapter::open_from_snapshot_with_config(
+                    &self.redex,
+                    self.origin_hash,
+                    cfg,
+                    bytes,
+                    *last_seq,
+                )
+                .await,
+            ),
+            (true, None) => {
+                Some(MemoriesAdapter::open_with_config(&self.redex, self.origin_hash, cfg).await)
+            }
             (false, _) => None,
         };
         let memories = match memories_result {

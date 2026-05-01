@@ -533,9 +533,9 @@ impl PyTasksAdapter {
         let redex_inner = redex.inner.clone();
         let cfg = cfg_from_persistent(persistent);
         let inner = runtime
-            .block_on(
-                async move { InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg) },
-            )
+            .block_on(async move {
+                InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+            })
             .map_err(|e| CortexError::new_err(format!("TasksAdapter open failed: {}", e)))?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -567,6 +567,7 @@ impl PyTasksAdapter {
                     &bytes,
                     last_seq,
                 )
+                .await
             })
             .map_err(|e| {
                 CortexError::new_err(format!("TasksAdapter open_from_snapshot failed: {}", e))
@@ -995,7 +996,7 @@ impl PyMemoriesAdapter {
         let cfg = cfg_from_persistent(persistent);
         let inner = runtime
             .block_on(async move {
-                InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg)
+                InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
             })
             .map_err(|e| CortexError::new_err(format!("MemoriesAdapter open failed: {}", e)))?;
         Ok(Self {
@@ -1027,6 +1028,7 @@ impl PyMemoriesAdapter {
                     &bytes,
                     last_seq,
                 )
+                .await
             })
             .map_err(|e| {
                 CortexError::new_err(format!("MemoriesAdapter open_from_snapshot failed: {}", e))

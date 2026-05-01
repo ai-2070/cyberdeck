@@ -1,5 +1,6 @@
 //! Configuration types for the Net event bus.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Top-level configuration for the event bus.
@@ -41,6 +42,22 @@ pub struct EventBusConfig {
     /// 0 = no retries (drop immediately on failure, default).
     /// Retries use a fixed 100ms delay between attempts.
     pub adapter_batch_retries: u32,
+
+    /// File path for the persistent producer nonce. When
+    /// `Some`, the bus loads (or creates on first run) the u64
+    /// nonce at this path on startup and stamps it on every
+    /// outgoing batch. Adapters that key dedup on
+    /// `(producer_nonce, shard, sequence_start, i)` then dedup
+    /// retransmits across process restart — JetStream's
+    /// `Nats-Msg-Id` is the canonical example.
+    ///
+    /// When `None` (default), the bus uses a per-process nonce
+    /// sampled fresh at every startup (today's behavior). That's
+    /// fine for in-memory adapters and for any deployment where
+    /// "at-most-once across process restart" is acceptable;
+    /// production JetStream / Redis deployments should set this
+    /// to a stable path on local persistent storage.
+    pub producer_nonce_path: Option<PathBuf>,
 }
 
 impl Default for EventBusConfig {
@@ -55,6 +72,7 @@ impl Default for EventBusConfig {
             scaling: Some(ScalingPolicy::default_for_cpus(cpus)),
             adapter_timeout: Duration::from_secs(30),
             adapter_batch_retries: 0,
+            producer_nonce_path: None,
         }
     }
 }
@@ -144,6 +162,7 @@ pub struct EventBusConfigBuilder {
     scaling: Option<ScalingConfig>,
     adapter_timeout: Option<Duration>,
     adapter_batch_retries: Option<u32>,
+    producer_nonce_path: Option<PathBuf>,
 }
 
 impl EventBusConfigBuilder {
@@ -209,6 +228,16 @@ impl EventBusConfigBuilder {
         self
     }
 
+    /// Persist the producer nonce at `path` so it survives process
+    /// restart. Recommended for any deployment using
+    /// JetStream / Redis adapters where retries-after-crash should
+    /// dedup against the prior incarnation. See
+    /// `EventBusConfig::producer_nonce_path` for the full doc.
+    pub fn producer_nonce_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.producer_nonce_path = Some(path.into());
+        self
+    }
+
     /// Build the configuration, validating all settings.
     pub fn build(self) -> Result<EventBusConfig, ConfigError> {
         let num_shards = self.num_shards.unwrap_or_else(num_cpus);
@@ -230,6 +259,7 @@ impl EventBusConfigBuilder {
             scaling,
             adapter_timeout: self.adapter_timeout.unwrap_or(Duration::from_secs(30)),
             adapter_batch_retries: self.adapter_batch_retries.unwrap_or(0),
+            producer_nonce_path: self.producer_nonce_path,
         };
         config.validate()?;
         Ok(config)
@@ -593,6 +623,29 @@ impl JetStreamAdapterConfig {
                 "jetstream replicas must be >= 1".into(),
             ));
         }
+        // NATS rejects negative `max_messages` / `max_bytes` at
+        // stream-create time, surfacing as a runtime adapter error
+        // instead of at startup `validate()` (the documented
+        // purpose of this method). The fields are typed `i64` for
+        // wire-compat with the NATS API but only non-negative
+        // values make sense — a builder's `with_max_messages(-1)`
+        // would happily store the negative and explode minutes
+        // later. Reject at validation time so the misconfig is
+        // caught before any connection attempt.
+        if let Some(n) = self.max_messages {
+            if n < 0 {
+                return Err(ConfigError::InvalidValue(format!(
+                    "jetstream max_messages must be non-negative (got {n})"
+                )));
+            }
+        }
+        if let Some(n) = self.max_bytes {
+            if n < 0 {
+                return Err(ConfigError::InvalidValue(format!(
+                    "jetstream max_bytes must be non-negative (got {n})"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -727,10 +780,31 @@ impl ScalingPolicy {
     }
 
     /// Validate the policy.
+    ///
+    /// `is_finite()` guards reject NaN and ±∞ explicitly before
+    /// the range check runs. NaN thresholds slip past raw `<=` /
+    /// `>` comparisons (every comparison against `f64::NaN`
+    /// returns `false`), so a config deserialized from
+    /// `0.0/0.0`-style arithmetic or an unfortunate
+    /// environment-templated string would "validate" successfully
+    /// and then sit inert at runtime — `mapper.rs:560` does
+    /// `m.fill_ratio > self.policy.fill_ratio_threshold`, which is
+    /// always `false` against NaN, so the scaler would never fire
+    /// (mirror hazard for scale-down).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.fill_ratio_threshold.is_finite() {
+            return Err(ConfigError::InvalidValue(
+                "fill_ratio_threshold must be finite (NaN/±inf rejected)".into(),
+            ));
+        }
         if self.fill_ratio_threshold <= 0.0 || self.fill_ratio_threshold > 1.0 {
             return Err(ConfigError::InvalidValue(
                 "fill_ratio_threshold must be in (0.0, 1.0]".into(),
+            ));
+        }
+        if !self.underutilized_threshold.is_finite() {
+            return Err(ConfigError::InvalidValue(
+                "underutilized_threshold must be finite (NaN/±inf rejected)".into(),
             ));
         }
         if self.underutilized_threshold < 0.0 || self.underutilized_threshold > 1.0 {
@@ -914,6 +988,77 @@ mod tests {
         assert!(policy.validate().is_err());
     }
 
+    // ========================================================================
+    // BUG #63: validate() must reject NaN / ±inf thresholds
+    // ========================================================================
+
+    /// `validate()` rejects `f64::NaN` for both threshold fields.
+    /// Pre-fix the raw `<=` / `>` range checks accepted NaN
+    /// because every comparison with NaN returns `false`; the
+    /// "validated" config then sat inert at runtime since the
+    /// scaler's `m.fill_ratio > policy.fill_ratio_threshold` was
+    /// always false against NaN.
+    #[test]
+    fn validate_rejects_nan_fill_ratio_threshold() {
+        let policy = ScalingPolicy {
+            fill_ratio_threshold: f64::NAN,
+            ..Default::default()
+        };
+        assert!(
+            policy.validate().is_err(),
+            "NaN fill_ratio_threshold must be rejected (BUG #63)",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nan_underutilized_threshold() {
+        let policy = ScalingPolicy {
+            underutilized_threshold: f64::NAN,
+            ..Default::default()
+        };
+        assert!(
+            policy.validate().is_err(),
+            "NaN underutilized_threshold must be rejected (BUG #63)",
+        );
+    }
+
+    /// `validate()` also rejects `±inf` for both threshold fields.
+    /// A config that arithmetic'd to infinity (e.g. divide-by-tiny)
+    /// would have slipped through the `> 1.0` check on positive
+    /// infinity (which IS rejected) but not on a negative infinity
+    /// against the lower bound for `fill_ratio_threshold` —
+    /// `-inf <= 0.0` is true, so it would have been rejected
+    /// already; for `underutilized_threshold` the lower bound
+    /// `-inf < 0.0` is also true. The explicit `is_finite()` guard
+    /// pins these edge cases regardless of which bound check would
+    /// have fired.
+    #[test]
+    fn validate_rejects_infinity_thresholds() {
+        let p1 = ScalingPolicy {
+            fill_ratio_threshold: f64::INFINITY,
+            ..Default::default()
+        };
+        assert!(p1.validate().is_err());
+
+        let p2 = ScalingPolicy {
+            fill_ratio_threshold: f64::NEG_INFINITY,
+            ..Default::default()
+        };
+        assert!(p2.validate().is_err());
+
+        let p3 = ScalingPolicy {
+            underutilized_threshold: f64::INFINITY,
+            ..Default::default()
+        };
+        assert!(p3.validate().is_err());
+
+        let p4 = ScalingPolicy {
+            underutilized_threshold: f64::NEG_INFINITY,
+            ..Default::default()
+        };
+        assert!(p4.validate().is_err());
+    }
+
     #[test]
     fn test_config_validates_scaling_policy() {
         // Invalid scaling policy should cause config build to fail
@@ -1044,5 +1189,44 @@ mod tests {
             .adapter(AdapterConfig::JetStream(js))
             .build();
         assert!(result.is_err(), "jetstream replicas == 0 must reject");
+    }
+
+    /// BUG #68: `JetStreamAdapterConfig::validate` rejects negative
+    /// `max_messages` / `max_bytes`. NATS rejects negatives at
+    /// stream-create time, so without validate-time enforcement the
+    /// misconfig surfaces as a runtime adapter error minutes later.
+    #[cfg(feature = "jetstream")]
+    #[test]
+    fn validate_rejects_negative_max_messages() {
+        let js = JetStreamAdapterConfig::new("nats://localhost:4222").with_max_messages(-1);
+        let err = js
+            .validate()
+            .expect_err("negative max_messages must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("max_messages"),
+            "error must mention the field, got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "jetstream")]
+    #[test]
+    fn validate_rejects_negative_max_bytes() {
+        let js = JetStreamAdapterConfig::new("nats://localhost:4222").with_max_bytes(-100);
+        let err = js.validate().expect_err("negative max_bytes must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("max_bytes"),
+            "error must mention the field, got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "jetstream")]
+    #[test]
+    fn validate_accepts_zero_and_positive_max_messages() {
+        let js = JetStreamAdapterConfig::new("nats://localhost:4222").with_max_messages(0);
+        assert!(js.validate().is_ok(), "zero must be accepted");
+        let js = JetStreamAdapterConfig::new("nats://localhost:4222").with_max_messages(1_000_000);
+        assert!(js.validate().is_ok(), "positive must be accepted");
     }
 }

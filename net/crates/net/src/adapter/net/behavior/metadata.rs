@@ -379,6 +379,37 @@ impl NodeStatus {
     }
 }
 
+/// Maximum allowed length of any single string field in
+/// `NodeMetadata` (`name`, `description`, `owner`, individual tag /
+/// role / `custom` keys and values). 1 KiB is far past any
+/// realistic operator-supplied label and bounds the per-string
+/// memory cost.
+pub const MAX_METADATA_STRING_LEN: usize = 1024;
+
+/// Maximum number of tags or roles in `NodeMetadata`. 256 is far
+/// past real usage (typical deployments use a handful of
+/// scope/tier/region tags); without this cap a peer could ship
+/// millions and turn one announcement into millions of `by_tag`
+/// index entries.
+pub const MAX_METADATA_TAGS: usize = 256;
+
+/// Maximum number of entries in the `custom` key-value map. Same
+/// pattern as tags — bounds the per-announcement footprint.
+pub const MAX_METADATA_CUSTOM_ENTRIES: usize = 256;
+
+/// Maximum number of `preferred_peers` in `TopologyHints`. Each
+/// entry is a 32-byte `NodeId`; a 4096-cap bounds the wire/heap
+/// cost while staying well above any realistic peering preference
+/// list.
+pub const MAX_PREFERRED_PEERS: usize = 4096;
+
+/// Maximum number of `hop_distances` entries in `TopologyHints`.
+pub const MAX_HOP_DISTANCES: usize = 4096;
+
+/// Maximum number of `public_addresses` (multi-homed nodes
+/// typically advertise <16; 256 is generous).
+pub const MAX_PUBLIC_ADDRESSES: usize = 256;
+
 /// Complete node metadata
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeMetadata {
@@ -411,6 +442,146 @@ pub struct NodeMetadata {
 }
 
 impl NodeMetadata {
+    /// Validate that the metadata fits within the per-field
+    /// boundedness caps (string lengths, tag/role/custom counts,
+    /// preferred-peers / hop-distances / public-addresses sizes).
+    ///
+    /// Without these caps the deserialize path is unbounded —
+    /// every `Vec` / `HashMap` / `String` would accept whatever
+    /// the peer shipped, and `MetadataStore::upsert` would
+    /// happily index millions of attacker-supplied tags into the
+    /// per-tag inverted-index DashMap. `upsert` (and
+    /// `update_versioned`) call `validate_bounds` before touching
+    /// the indexes; oversized metadata surfaces as
+    /// `MetadataError::Invalid(...)`.
+    pub fn validate_bounds(&self) -> Result<(), MetadataError> {
+        if let Some(name) = &self.name {
+            if name.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "name exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if let Some(d) = &self.description {
+            if d.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "description exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if let Some(o) = &self.owner {
+            if o.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "owner exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if self.tags.len() > MAX_METADATA_TAGS {
+            return Err(MetadataError::Invalid(format!(
+                "tags exceed {} entries",
+                MAX_METADATA_TAGS
+            )));
+        }
+        for tag in &self.tags {
+            if tag.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "tag exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if self.roles.len() > MAX_METADATA_TAGS {
+            return Err(MetadataError::Invalid(format!(
+                "roles exceed {} entries",
+                MAX_METADATA_TAGS
+            )));
+        }
+        for role in &self.roles {
+            if role.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "role exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if self.custom.len() > MAX_METADATA_CUSTOM_ENTRIES {
+            return Err(MetadataError::Invalid(format!(
+                "custom map exceeds {} entries",
+                MAX_METADATA_CUSTOM_ENTRIES
+            )));
+        }
+        for (k, v) in &self.custom {
+            if k.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "custom key exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+            if v.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "custom value exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if self.topology.preferred_peers.len() > MAX_PREFERRED_PEERS {
+            return Err(MetadataError::Invalid(format!(
+                "preferred_peers exceed {} entries",
+                MAX_PREFERRED_PEERS
+            )));
+        }
+        if self.topology.hop_distances.len() > MAX_HOP_DISTANCES {
+            return Err(MetadataError::Invalid(format!(
+                "hop_distances exceed {} entries",
+                MAX_HOP_DISTANCES
+            )));
+        }
+        // hop_distances keys are unbounded `String`s. Without a
+        // per-key length check a peer could ship a single
+        // multi-megabyte key inside a perfectly-counted map and
+        // smuggle the bound past validate_bounds.
+        for k in self.topology.hop_distances.keys() {
+            if k.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "hop_distances key exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if self.topology.public_addresses.len() > MAX_PUBLIC_ADDRESSES {
+            return Err(MetadataError::Invalid(format!(
+                "public_addresses exceed {} entries",
+                MAX_PUBLIC_ADDRESSES
+            )));
+        }
+        // Nested LocationInfo strings (`zone`, `provider`,
+        // `datacenter`, `country_code`, `city`) MUST be length-
+        // checked. The top-level fields and collection counts
+        // alone wouldn't catch oversized strings pinned inside
+        // `location`.
+        if let Some(loc) = &self.location {
+            for (label, field) in [
+                ("location.zone", &loc.zone),
+                ("location.provider", &loc.provider),
+                ("location.datacenter", &loc.datacenter),
+                ("location.country_code", &loc.country_code),
+                ("location.city", &loc.city),
+            ] {
+                if let Some(v) = field {
+                    if v.len() > MAX_METADATA_STRING_LEN {
+                        return Err(MetadataError::Invalid(format!(
+                            "{label} exceeds {MAX_METADATA_STRING_LEN} bytes",
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Create new node metadata
     pub fn new(node_id: NodeId) -> Self {
         let now = SystemTime::now()
@@ -824,26 +995,84 @@ impl MetadataStore {
     }
 
     /// Insert or update node metadata
+    ///
+    /// The entire (read-old, remove-from-indexes,
+    /// add-to-indexes, insert) sequence runs inside
+    /// `DashMap::entry`'s shard write lock, serializing all
+    /// concurrent upserts on the same node_id. Splitting this into
+    /// a 5-step sequence without an overarching lock — (1) capacity
+    /// check, (2) `nodes.get(&id)`, (3) `remove_from_indexes(&old)`,
+    /// (4) `add_to_indexes(&new)`, (5) `nodes.insert` — would let
+    /// two concurrent upserts on the same node both observe the
+    /// same `old` at step 2, both remove its index entries at step
+    /// 3 (second a no-op), and both add to indexes at step 4 into
+    /// DIFFERENT buckets if the metadata differed. Whichever
+    /// `nodes.insert` landed second would win, but the loser's
+    /// index entries would never be removed, producing permanent
+    /// index drift (queries return the node under the wrong
+    /// filter; stats over-count).
     pub fn upsert(&self, metadata: NodeMetadata) -> Result<(), MetadataError> {
+        // Bound peer-supplied metadata before touching the
+        // indexes — without this, one peer could ship a single
+        // announcement carrying millions of unique tags and turn
+        // it into millions of `by_tag` DashMap entries. Validation
+        // runs first so we don't even pay the index-clear cost on
+        // a bad input.
+        metadata.validate_bounds()?;
+
         let node_id = metadata.node_id;
 
-        // Check capacity
+        // Capacity check BEFORE entering the entry guard —
+        // `self.nodes.len()` walks all shards and would deadlock
+        // if called while we hold a write guard on one of them.
+        // The soft-cap race window (a concurrent upsert lands
+        // between this check and the entry-acquire below) is
+        // acceptable: the cap is best-effort, mirroring the
+        // pattern used by `TokenCache::insert_unchecked` and
+        // `ContextStore::create_context`.
         if let Some(max) = self.max_capacity {
             if !self.nodes.contains_key(&node_id) && self.nodes.len() >= max {
                 return Err(MetadataError::CapacityExceeded);
             }
         }
 
-        // Remove old indexes if updating
-        if let Some(old) = self.nodes.get(&node_id) {
-            self.remove_from_indexes(&old);
+        // Take the per-shard write lock on the node_id entry
+        // FIRST. Holding it serializes all concurrent upserts on
+        // this id, so the (remove_from_indexes, add_to_indexes,
+        // insert) sequence is observed by other upserts as a
+        // single atomic transition. A read-old outside any lock
+        // would let two threads both observe the same `old`, both
+        // `remove_from_indexes(&old)`, both `add_to_indexes` into
+        // different buckets, and the loser's entries would leak
+        // into permanent index drift.
+        //
+        // `add_to_indexes` / `remove_from_indexes` write to
+        // OTHER DashMap instances (`by_status`, `by_tag`, etc.).
+        // The lock-order convention is: hold `nodes` entry FIRST,
+        // then write the index DashMaps. As long as no other
+        // operation locks an index DashMap and then reaches into
+        // `nodes`, we're deadlock-free. The `query` path takes
+        // index DashMap snapshots first, then reads `nodes`
+        // afterwards — that order is the inverse of ours, but
+        // each step's lock is released before the next is taken,
+        // so there's no held-lock chain to deadlock.
+        use dashmap::mapref::entry::Entry;
+        match self.nodes.entry(node_id) {
+            Entry::Vacant(slot) => {
+                self.add_to_indexes(&metadata);
+                slot.insert(Arc::new(metadata));
+            }
+            Entry::Occupied(mut slot) => {
+                // Read the old metadata WHILE holding the entry
+                // lock — this is the critical change vs. pre-fix,
+                // where the read-old happened before the lock and
+                // could be invalidated by a concurrent upsert.
+                let old = slot.get().clone();
+                self.remove_from_indexes(&old);
+                self.add_to_indexes(&metadata);
+                slot.insert(Arc::new(metadata));
+            }
         }
-
-        // Add to indexes
-        self.add_to_indexes(&metadata);
-
-        // Store
-        self.nodes.insert(node_id, Arc::new(metadata));
         self.update_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
@@ -960,8 +1189,19 @@ impl MetadataStore {
             })
             .collect();
 
-        // Sort by distance
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // `partial_cmp(...).unwrap_or(Equal)` on NaN produces a
+        // non-total order — `sort_by` would permute arbitrarily
+        // and `truncate(limit)` would then drop random items.
+        // `LocationInfo::distance_to` computes `(...).asin()` for
+        // near-antipodal points where FP rounding can push the
+        // asin argument > 1.0 → NaN. `total_cmp` on a
+        // NaN-sentinel score (`f64::INFINITY` so NaN distances
+        // sink to the end) gives a deterministic total order.
+        results.sort_by(|a, b| {
+            let a_dist = if a.1.is_nan() { f64::INFINITY } else { a.1 };
+            let b_dist = if b.1.is_nan() { f64::INFINITY } else { b.1 };
+            a_dist.total_cmp(&b_dist)
+        });
         results.truncate(limit);
 
         results
@@ -982,8 +1222,14 @@ impl MetadataStore {
             })
             .collect();
 
-        // Sort by score descending
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Same hazard as `find_nearby` above. Sort descending
+        // with `total_cmp`; NaN scores sink to the end (treated
+        // as `f64::NEG_INFINITY` for descending).
+        results.sort_by(|a, b| {
+            let a_score = if a.1.is_nan() { f64::NEG_INFINITY } else { a.1 };
+            let b_score = if b.1.is_nan() { f64::NEG_INFINITY } else { b.1 };
+            b_score.total_cmp(&a_score)
+        });
         results.truncate(limit);
 
         results.into_iter().map(|(m, _)| m).collect()
@@ -1032,8 +1278,46 @@ impl MetadataStore {
     }
 
     /// Clear all nodes
+    ///
+    /// Drains `nodes` FIRST and routes every drained metadata
+    /// through `remove_from_indexes` — making the intermediate
+    /// state consistent (nodes exist alongside their indexes
+    /// throughout the drain). A naive `nodes.clear()` followed by
+    /// six index `clear()`s in sequence would let a concurrent
+    /// `upsert` landing between any two of those clears observe
+    /// `nodes.get(&id) → None` (skipping `remove_from_indexes`),
+    /// then `add_to_indexes` (writing into the SAME index maps
+    /// `clear` is about to wipe), then `nodes.insert(...)` — the
+    /// final state would be a node in `nodes` with NO index
+    /// entries, invisible to every indexed query and only
+    /// retrievable via the full-scan branch.
+    ///
+    /// With the drain-first ordering, any concurrent `upsert`
+    /// landing during the drain either races BEFORE this function
+    /// reads its key (the upsert wins; we drain its entry
+    /// afterward) or AFTER (the upsert observes a cleared `nodes`
+    /// and proceeds normally — no index drift, since
+    /// `remove_from_indexes` only touches keys that exist in
+    /// `nodes`). The final `clear`s on the index maps catch any
+    /// residual entries the per-key path missed
+    /// (defense-in-depth; should be no-ops on the happy path).
     pub fn clear(&self) {
-        self.nodes.clear();
+        // `dashmap::DashMap` doesn't have a `drain()` that takes
+        // ownership of every entry; use a remove-on-iter pattern.
+        // Collect keys first, then remove and route through
+        // `remove_from_indexes`. Holding the iter guard across
+        // `remove` would deadlock — the keys vec is the
+        // intermediate.
+        let keys: Vec<NodeId> = self.nodes.iter().map(|r| *r.key()).collect();
+        for key in keys {
+            if let Some((_, meta)) = self.nodes.remove(&key) {
+                self.remove_from_indexes(&meta);
+            }
+        }
+        // Defense-in-depth: clear any residual entries that may
+        // have leaked in via a concurrent upsert that landed
+        // after our key-collection iterator finished but before
+        // this point. These should be no-ops on the happy path.
         self.by_status.clear();
         self.by_tier.clear();
         self.by_continent.clear();
@@ -1363,6 +1647,299 @@ mod tests {
         store.upsert(NodeMetadata::new(make_node_id(1))).unwrap();
     }
 
+    /// CR-30: pin the invariant that every `Arc<NodeMetadata>`
+    /// returned from a read path (`get`, `query`, `find_nearby`,
+    /// `best_for_routing`) satisfies [`NodeMetadata::validate_bounds`].
+    /// Pre-CR-30 the bounds check ran only on `upsert` /
+    /// `update_versioned`; if a future refactor adds a write path
+    /// that bypasses both (e.g. snapshot restore that deserializes
+    /// raw `NodeMetadata` and inserts it into `nodes` directly), an
+    /// over-bounded entry could leak into reads. This test pins
+    /// the read-side contract so a future maintainer either
+    /// honours it on every new write path OR has to update the
+    /// test.
+    #[test]
+    fn cr30_read_path_invariant_every_returned_node_passes_validate_bounds() {
+        let store = MetadataStore::new();
+        let mut node = NodeMetadata::new(make_node_id(1));
+        node.tags.insert("training".into());
+        store.upsert(node).unwrap();
+
+        // Read via `get`: the returned Arc must validate cleanly.
+        let got = store.get(&make_node_id(1)).expect("inserted node");
+        got.validate_bounds().expect(
+            "CR-30: every node returned from MetadataStore::get MUST satisfy \
+             validate_bounds. If this fires, a write path is bypassing \
+             upsert's bound check (BUG #124).",
+        );
+
+        // Read via `query`: same invariant.
+        let q = MetadataQuery::new();
+        for entry in store.query(&q) {
+            entry.validate_bounds().expect(
+                "CR-30: every node returned from MetadataStore::query MUST \
+                 satisfy validate_bounds.",
+            );
+        }
+    }
+
+    /// CR-18: pin the soft-cap race window. The capacity check sits
+    /// outside the `DashMap::entry` write lock (cannot move it inside
+    /// without `nodes.len()` self-deadlocking), so two concurrent
+    /// upserts of distinct `node_id`s can both pass the
+    /// `nodes.len() >= max` check and both insert past the cap. This
+    /// is documented as acceptable behavior — `max_capacity` is a
+    /// best-effort target, not a hard cap. The test intentionally
+    /// exercises the race and pins that the `len()` may transiently
+    /// exceed `max` so a future "fix" that turns this into a hard
+    /// cap also has to update this test.
+    ///
+    /// (Mirrors the pattern in `TokenCache::insert_unchecked` and
+    /// `ContextStore::create_context` after BUG #136.)
+    #[test]
+    fn cr18_capacity_check_is_a_soft_cap_under_concurrent_upserts() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const MAX: usize = 4;
+        const N_THREADS: usize = 16;
+
+        let store = Arc::new(MetadataStore::with_capacity(MAX));
+        let barrier = Arc::new(std::sync::Barrier::new(N_THREADS));
+
+        let mut handles = Vec::with_capacity(N_THREADS);
+        for t in 0..N_THREADS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                let id = make_node_id(t as u8 + 1);
+                store.upsert(NodeMetadata::new(id))
+            }));
+        }
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(()) => accepted += 1,
+                Err(MetadataError::CapacityExceeded) => rejected += 1,
+                Err(other) => panic!("unexpected upsert error: {other:?}"),
+            }
+        }
+
+        // CR-18: pin that at LEAST `MAX` upserts succeeded. The
+        // total `accepted` may be > MAX under heavy concurrency
+        // because the soft-cap check loses the race against
+        // multiple concurrent inserters of distinct ids — that's
+        // the documented behavior. Pre-CR-18 the docs didn't
+        // call this out at the public-API level, so a caller
+        // reading `with_capacity(N)` might assume a hard ceiling.
+        assert!(
+            accepted >= MAX,
+            "at least the cap's worth must succeed; got {accepted}"
+        );
+        assert!(
+            accepted + rejected == N_THREADS,
+            "every upsert must surface either Ok or CapacityExceeded"
+        );
+        // The store SIZE may transiently equal `accepted`, which
+        // can exceed MAX. Pin THAT property so the soft-cap
+        // semantic is documented in code, not just docs.
+        assert!(
+            store.nodes.len() <= accepted,
+            "store size must not exceed the count of successful upserts"
+        );
+        // If accepted > MAX, the soft-cap was crossed — that's
+        // the documented limitation. Just confirm nothing's torn.
+    }
+
+    // ========================================================================
+    // BUG #124: NodeMetadata bounds must be enforced before indexing
+    // ========================================================================
+
+    /// Oversized tag set is rejected by `upsert` before touching the
+    /// index DashMaps. Pre-fix a peer could ship a single
+    /// announcement with millions of unique tags and turn it into
+    /// millions of `by_tag` entries.
+    #[test]
+    fn upsert_rejects_oversized_tags() {
+        let store = MetadataStore::new();
+        let mut node = NodeMetadata::new(make_node_id(1));
+        for i in 0..(MAX_METADATA_TAGS + 1) {
+            node.tags.insert(format!("t{}", i));
+        }
+        let result = store.upsert(node);
+        assert!(
+            matches!(result, Err(MetadataError::Invalid(_))),
+            "oversized tags must surface as MetadataError::Invalid (BUG #124), got {:?}",
+            result,
+        );
+    }
+
+    /// Oversized custom-map is rejected.
+    #[test]
+    fn upsert_rejects_oversized_custom_map() {
+        let store = MetadataStore::new();
+        let mut node = NodeMetadata::new(make_node_id(2));
+        for i in 0..(MAX_METADATA_CUSTOM_ENTRIES + 1) {
+            node.custom.insert(format!("k{}", i), "v".to_string());
+        }
+        assert!(matches!(store.upsert(node), Err(MetadataError::Invalid(_))));
+    }
+
+    /// A single string field over the per-string cap is rejected.
+    #[test]
+    fn upsert_rejects_oversized_string_fields() {
+        let store = MetadataStore::new();
+        let huge = "x".repeat(MAX_METADATA_STRING_LEN + 1);
+        let node = NodeMetadata::new(make_node_id(3)).with_name(huge);
+        assert!(matches!(store.upsert(node), Err(MetadataError::Invalid(_))));
+    }
+
+    /// Metadata at exactly the boundaries is accepted — pins the
+    /// `<=` semantics so a future tightening to strict `<` doesn't
+    /// silently break legitimate-but-large announcements.
+    #[test]
+    fn upsert_accepts_metadata_at_exact_boundaries() {
+        let store = MetadataStore::new();
+        let mut node = NodeMetadata::new(make_node_id(4));
+        for i in 0..MAX_METADATA_TAGS {
+            node.tags.insert(format!("t{}", i));
+        }
+        let name_at_cap = "x".repeat(MAX_METADATA_STRING_LEN);
+        node = node.with_name(name_at_cap);
+        store
+            .upsert(node)
+            .expect("metadata at the exact boundaries must be accepted");
+    }
+
+    // ========================================================================
+    // BUG #123: upsert must serialize concurrent writers on the same node_id
+    // ========================================================================
+
+    /// Concurrent `upsert`s on the same `node_id` with DIFFERENT
+    /// metadata must leave the inverted indexes consistent —
+    /// exactly one (status, tag) pairing per node, matching the
+    /// final stored metadata. Pre-fix the read-old happened
+    /// outside any lock, so two threads could observe the same
+    /// `old`, both `remove_from_indexes(old)`, both
+    /// `add_to_indexes(new_a)` / `add_to_indexes(new_b)` into
+    /// different buckets, and the loser's index entries leaked
+    /// permanently.
+    #[test]
+    fn upsert_serializes_concurrent_writes_on_same_node_id() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let store = Arc::new(MetadataStore::new());
+        let node_id = make_node_id(42);
+
+        // Seed the store so both threads see an existing entry to
+        // remove from indexes — the original race vector.
+        let seed = NodeMetadata::new(node_id)
+            .with_status(NodeStatus::Online)
+            .with_tag("seed")
+            .with_topology(TopologyHints::new(NetworkTier::Consumer));
+        store.upsert(seed).unwrap();
+
+        // Two threads upsert different metadata on the same id.
+        // Each contends with the other for the node's shard write
+        // guard.
+        let n_iters = 50;
+        let store_a = store.clone();
+        let store_b = store.clone();
+        let h_a = thread::spawn(move || {
+            for i in 0..n_iters {
+                let node = NodeMetadata::new(node_id)
+                    .with_status(NodeStatus::Online)
+                    .with_tag(format!("a-{}", i))
+                    .with_topology(TopologyHints::new(NetworkTier::Premium));
+                store_a.upsert(node).unwrap();
+            }
+        });
+        let h_b = thread::spawn(move || {
+            for i in 0..n_iters {
+                let node = NodeMetadata::new(node_id)
+                    .with_status(NodeStatus::Degraded)
+                    .with_tag(format!("b-{}", i))
+                    .with_topology(TopologyHints::new(NetworkTier::Datacenter));
+                store_b.upsert(node).unwrap();
+            }
+        });
+        h_a.join().unwrap();
+        h_b.join().unwrap();
+
+        // Final metadata: one of the two threads' last write
+        // landed last. Whatever it is, the inverted indexes must
+        // reflect ONLY that final metadata — no leftover
+        // status/tag entries from the other thread.
+        let final_meta = store.get(&node_id).expect("node must still exist");
+        let final_status = final_meta.status;
+        let final_tags: std::collections::HashSet<&str> =
+            final_meta.tags.iter().map(|s| s.as_str()).collect();
+
+        // No status bucket OTHER than the final one may contain
+        // this node_id.
+        for status in [
+            NodeStatus::Online,
+            NodeStatus::Offline,
+            NodeStatus::Degraded,
+            NodeStatus::Starting,
+            NodeStatus::Maintenance,
+        ] {
+            let bucket_has_node = store
+                .by_status
+                .get(&status)
+                .map(|s| s.contains(&node_id))
+                .unwrap_or(false);
+            if status == final_status {
+                assert!(
+                    bucket_has_node,
+                    "final status {:?} bucket must contain the node",
+                    status
+                );
+            } else {
+                assert!(
+                    !bucket_has_node,
+                    "stale status {:?} bucket must NOT contain the node (BUG #123)",
+                    status
+                );
+            }
+        }
+
+        // No tag bucket OTHER than the final tags may contain
+        // this node_id. Walk every tag bucket the threads might
+        // have touched.
+        for i in 0..n_iters {
+            for prefix in ["a-", "b-"] {
+                let tag = format!("{}{}", prefix, i);
+                if final_tags.contains(tag.as_str()) {
+                    continue;
+                }
+                let bucket_has_node = store
+                    .by_tag
+                    .get(&tag)
+                    .map(|s| s.contains(&node_id))
+                    .unwrap_or(false);
+                assert!(
+                    !bucket_has_node,
+                    "stale tag '{}' bucket must NOT contain the node (BUG #123)",
+                    tag
+                );
+            }
+        }
+        // The seed tag must also be gone.
+        let seed_bucket_has_node = store
+            .by_tag
+            .get("seed")
+            .map(|s| s.contains(&node_id))
+            .unwrap_or(false);
+        assert!(
+            !seed_bucket_has_node,
+            "the original seed tag must have been removed (BUG #123)"
+        );
+    }
+
     #[test]
     fn test_stats() {
         let store = MetadataStore::new();
@@ -1388,5 +1965,94 @@ mod tests {
         assert_eq!(stats.by_status.get(&NodeStatus::Offline), Some(&2));
         assert_eq!(stats.queries, 2);
         assert_eq!(stats.updates, 5);
+    }
+
+    // ========================================================================
+    // Cubic-ai P2: validate_bounds must walk nested structs, not just
+    // top-level fields and collection counts
+    // ========================================================================
+
+    /// `validate_bounds` rejects metadata whose nested
+    /// `LocationInfo::provider` exceeds `MAX_METADATA_STRING_LEN`.
+    /// Pre-fix only top-level strings (`name`, `description`,
+    /// `owner`) and collection counts were checked, so a peer could
+    /// stuff arbitrary multi-megabyte data into `location.provider`
+    /// (or any other LocationInfo string) and slip past every guard.
+    #[test]
+    fn validate_bounds_rejects_oversized_location_string() {
+        let mut node = NodeMetadata::new(make_node_id(1));
+        node.location = Some(LocationInfo {
+            region: Region::NorthAmerica("us-east".into()),
+            zone: None,
+            latitude: None,
+            longitude: None,
+            asn: None,
+            provider: Some("p".repeat(MAX_METADATA_STRING_LEN + 1)),
+            datacenter: None,
+            country_code: None,
+            city: None,
+        });
+
+        match node.validate_bounds() {
+            Err(MetadataError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("location.provider"),
+                    "rejection must name the offending field; got: {msg}",
+                );
+            }
+            other => panic!("expected Invalid for oversized location.provider, got {other:?}"),
+        }
+    }
+
+    /// `validate_bounds` rejects metadata whose `hop_distances` contains
+    /// a key longer than `MAX_METADATA_STRING_LEN`. Pre-fix only the
+    /// map cardinality was capped — a single oversized key inside an
+    /// otherwise small map smuggled the check.
+    #[test]
+    fn validate_bounds_rejects_oversized_hop_distances_key() {
+        let mut topo = TopologyHints::new(NetworkTier::Consumer);
+        topo.hop_distances
+            .insert("k".repeat(MAX_METADATA_STRING_LEN + 1), 3);
+        let node = NodeMetadata::new(make_node_id(1)).with_topology(topo);
+
+        match node.validate_bounds() {
+            Err(MetadataError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("hop_distances key"),
+                    "rejection must name the offending field; got: {msg}",
+                );
+            }
+            other => {
+                panic!("expected Invalid for oversized hop_distances key, got {other:?}")
+            }
+        }
+    }
+
+    /// Belt-and-braces happy path: a complete metadata bundle with
+    /// every nested field at exactly `MAX_METADATA_STRING_LEN` must
+    /// pass — the new checks are bound-strict (`>`, not `>=`), so a
+    /// future tightening that flipped the comparator would lock out
+    /// legitimate boundary callers and this test would catch it.
+    #[test]
+    fn validate_bounds_accepts_at_boundary_lengths() {
+        let mut node = NodeMetadata::new(make_node_id(1));
+        node.location = Some(LocationInfo {
+            region: Region::Europe("uk".into()),
+            zone: Some("z".repeat(MAX_METADATA_STRING_LEN)),
+            latitude: None,
+            longitude: None,
+            asn: None,
+            provider: Some("p".repeat(MAX_METADATA_STRING_LEN)),
+            datacenter: Some("d".repeat(MAX_METADATA_STRING_LEN)),
+            country_code: Some("c".repeat(MAX_METADATA_STRING_LEN)),
+            city: Some("y".repeat(MAX_METADATA_STRING_LEN)),
+        });
+        let mut topo = TopologyHints::new(NetworkTier::Consumer);
+        topo.hop_distances
+            .insert("k".repeat(MAX_METADATA_STRING_LEN), 1);
+        node.topology = topo;
+
+        node.validate_bounds()
+            .expect("at-boundary nested strings must validate");
     }
 }

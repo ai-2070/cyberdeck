@@ -12,6 +12,7 @@
 //! {"0": "1702123456789-0", "1": "1702123456790-0", ...}
 //! ```
 
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -22,6 +23,46 @@ use crate::adapter::{Adapter, ShardPollResult};
 use crate::consumer::filter::Filter;
 use crate::error::{AdapterError, ConsumerError};
 use crate::event::StoredEvent;
+
+/// Compare two adapter-emitted stream ids using numeric semantics for
+/// the formats both built-in adapters produce, with a lex fallback for
+/// already-lex-comparable opaque ids (ULID, UUIDv7, fixed-width hex).
+///
+/// A raw `str::cmp` would invert ordering on the unpadded numeric
+/// ids the JetStream adapter emits (`seq.to_string()`) and the
+/// Redis Streams server-side `{ms}-{seq}` format — `"9" > "10"`
+/// lexicographically would wedge the cursor at every decade
+/// boundary. The structured comparator below handles both formats
+/// numerically. Mixed-padding comparisons across upgrades still
+/// compare correctly because parse-then-compare ignores leading
+/// zeros.
+///
+/// Order of attempts:
+/// 1. Both ids parse as `<u64>-<u64>` (Redis Streams).
+/// 2. Both ids parse as `<u128>` (raw numeric, padded or unpadded).
+/// 3. Lex compare (ULID, UUID, hex digests, etc.).
+///
+/// We deliberately do not try to mix formats — if one side is `123`
+/// and the other is `456-0`, the lex fallback kicks in. In practice
+/// a single adapter emits a single format, so this only matters for
+/// pathological mixed-source streams.
+pub(crate) fn compare_stream_ids(a: &str, b: &str) -> CmpOrdering {
+    // Redis Streams `<ms>-<seq>`.
+    if let (Some((a_ms, a_seq)), Some((b_ms, b_seq))) = (split_redis_id(a), split_redis_id(b)) {
+        return (a_ms, a_seq).cmp(&(b_ms, b_seq));
+    }
+    // Plain numeric (JetStream `seq.to_string()` or future zero-padded form).
+    if let (Ok(an), Ok(bn)) = (a.parse::<u128>(), b.parse::<u128>()) {
+        return an.cmp(&bn);
+    }
+    // Opaque id — assumed already lex-comparable.
+    a.cmp(b)
+}
+
+fn split_redis_id(s: &str) -> Option<(u64, u64)> {
+    let (ms, seq) = s.split_once('-')?;
+    Some((ms.parse().ok()?, seq.parse().ok()?))
+}
 
 /// Backing type for per-shard cursor positions. `Arc<str>` makes
 /// cursor clones (and internal copies during poll merging) cheap by
@@ -90,10 +131,30 @@ impl CompositeCursor {
     }
 
     /// Update positions from consumed events.
+    ///
+    /// Per-shard CAS routed through `compare_stream_ids`, which
+    /// understands the Redis (`<ms>-<seq>`) and JetStream (`<u64>`)
+    /// formats numerically and falls back to lex for opaque ids
+    /// (ULID, UUIDv7, hex digests). The cursor cannot regress and
+    /// decade-rollovers cannot freeze it. Unconditional inserts
+    /// would let whichever event for a given `shard_id` appeared
+    /// *last* in the slice win regardless of stream order; a plain
+    /// `str::cmp` CAS would wedge on the unpadded numeric ids both
+    /// built-in adapters emit (`"9" > "10"` lexicographically).
     pub fn update_from_events(&mut self, events: &[StoredEvent]) {
         for event in events {
-            self.positions
-                .insert(event.shard_id, Arc::from(event.id.as_str()));
+            let new_id = event.id.as_str();
+            match self.positions.get(&event.shard_id) {
+                Some(existing)
+                    if compare_stream_ids(existing.as_ref(), new_id) != CmpOrdering::Less =>
+                {
+                    // Don't regress (existing is >= new_id under the
+                    // structured comparator).
+                }
+                _ => {
+                    self.positions.insert(event.shard_id, Arc::from(new_id));
+                }
+            }
         }
     }
 }
@@ -353,11 +414,23 @@ impl PollMerger {
                 // tiebreakers. `id` is the storage backend's
                 // identifier and is unique within a shard, so the
                 // composite is a strict total order.
+                //
+                // The id tiebreak routes through
+                // `compare_stream_ids`, which understands the
+                // unpadded numeric formats both built-in adapters
+                // emit (Redis `<ms>-<seq>`, JetStream `<u64>`) and
+                // falls back to lex for opaque ids (ULID, UUIDv7,
+                // hex digests). The `(insertion_ts, shard_id)`
+                // chain resolves the common cases first; when two
+                // events from the same shard land at the same
+                // `insertion_ts` (rare but legal at millisecond
+                // granularity), the structured id compare is
+                // correct on every adapter format.
                 all_events.sort_by(|a, b| {
                     a.insertion_ts
                         .cmp(&b.insertion_ts)
                         .then(a.shard_id.cmp(&b.shard_id))
-                        .then(a.id.cmp(&b.id))
+                        .then(compare_stream_ids(&a.id, &b.id))
                 });
             }
         }
@@ -402,7 +475,13 @@ impl PollMerger {
             None => cursor.clone(),
         };
 
-        // Step 1: rollback for shards with truncated matches.
+        // Step 1: rollback for shards with truncated matches. We
+        // track which shards we rolled back here so Step 2 only
+        // overrides those shards (rather than every shard with a
+        // returned event, which would throw away the adapter's
+        // `next_id` advance for shards that returned all their
+        // matches).
+        let mut rolled_back: std::collections::HashSet<u16> = std::collections::HashSet::new();
         if request.filter.is_some() && had_extra {
             let mut returned_per_shard: std::collections::HashMap<u16, usize> =
                 std::collections::HashMap::new();
@@ -423,6 +502,7 @@ impl PollMerger {
                             final_cursor.positions.remove(shard_id);
                         }
                     }
+                    rolled_back.insert(*shard_id);
                 }
             }
         }
@@ -432,11 +512,38 @@ impl PollMerger {
         // cursor, so iterate in reverse and skip shards already seen.
         // This reduces id clones from O(all_events.len()) to
         // O(shards.len()).
+        //
+        // When the filter path is active, Step 1 has already
+        // populated `final_cursor` with the adapter's `next_id`
+        // (a position past the last *fetched* event for each
+        // shard). A blanket Step 2 override here would move the
+        // cursor back to the last *matched* event id, which is
+        // BEHIND the last fetched event for any shard with
+        // non-matched events — subsequent polls would re-fetch and
+        // re-filter those non-matches, wasting work proportional
+        // to `over_fetch_factor` on low-match-rate streams. So we
+        // only Step 2-override for shards that were actually
+        // rolled back in Step 1 (those need a forward push past
+        // the last *returned* match), OR when the filter path
+        // wasn't used at all (filter is None).
+        //
+        // For filter=None, the previous Step-2 behavior was correct
+        // — `final_cursor` started as `cursor.clone()` (no
+        // `new_cursor` advance) and the only progress signal is
+        // the last returned event id.
         let mut seen_shards: std::collections::HashSet<u16> =
             std::collections::HashSet::with_capacity(shards.len());
         for event in all_events.iter().rev() {
             if seen_shards.insert(event.shard_id) {
-                final_cursor.set(event.shard_id, event.id.clone());
+                let should_override =
+                    request.filter.is_none() || rolled_back.contains(&event.shard_id);
+                if should_override {
+                    final_cursor.set(event.shard_id, event.id.clone());
+                }
+                // Else: the adapter's `next_id` (already in
+                // `final_cursor` via the `new_cursor` initial
+                // value) is more advanced than the last matched
+                // event — preserve it.
             }
         }
 
@@ -511,14 +618,197 @@ mod tests {
         let events = vec![
             StoredEvent::from_value("100-0".to_string(), json!({}), 100, 0),
             StoredEvent::from_value("200-0".to_string(), json!({}), 200, 1),
-            StoredEvent::from_value("150-0".to_string(), json!({}), 150, 0), // Later event in shard 0
+            // BUG #66: this used to be "later event in shard 0" by
+            // virtue of being LAST in the input slice, but its id
+            // (150-0) is stream-order BEFORE 200-0 — wait, this is
+            // for shard 0 not shard 1. shard 0 only had 100-0
+            // before this; 150-0 > 100-0, so it advances normally.
+            StoredEvent::from_value("150-0".to_string(), json!({}), 150, 0),
         ];
 
         cursor.update_from_events(&events);
 
-        // Should have the last position for each shard
-        assert_eq!(cursor.get(0), Some("150-0")); // Updated to later event
+        // Should have the highest id seen for each shard.
+        assert_eq!(cursor.get(0), Some("150-0"));
         assert_eq!(cursor.get(1), Some("200-0"));
+    }
+
+    /// BUG #66: cursor must NOT regress when events arrive in a
+    /// non-ascending order for the same shard. Pre-fix the cursor
+    /// for shard 0 would land on `100-0` (the last item in the
+    /// slice), regressing past `200-0`.
+    #[test]
+    fn cursor_does_not_regress_on_unsorted_per_shard_events() {
+        let mut cursor = CompositeCursor::new();
+        // For shard 0: stream-order 100-0 → 200-0, but the slice
+        // has them reversed (consumer received 200-0 first,
+        // then 100-0 because of merge ordering).
+        let events = vec![
+            StoredEvent::from_value("200-0".to_string(), json!({}), 200, 0),
+            StoredEvent::from_value("100-0".to_string(), json!({}), 100, 0),
+        ];
+        cursor.update_from_events(&events);
+        assert_eq!(
+            cursor.get(0),
+            Some("200-0"),
+            "cursor must hold the highest id, not the last-in-slice id (BUG #66)",
+        );
+    }
+
+    /// BUG #66: a partial overlap (advance for one shard, regression
+    /// attempt for another shard) must keep both cursors at their
+    /// respective max.
+    #[test]
+    fn cursor_compare_and_set_is_per_shard() {
+        let mut cursor = CompositeCursor::new();
+        cursor.update_from_events(&[
+            StoredEvent::from_value("500-0".to_string(), json!({}), 500, 0),
+            StoredEvent::from_value("500-0".to_string(), json!({}), 500, 1),
+        ]);
+        // Now "advance" with one regress attempt for shard 0 + a
+        // legitimate advance for shard 1.
+        cursor.update_from_events(&[
+            StoredEvent::from_value("100-0".to_string(), json!({}), 100, 0), // regress
+            StoredEvent::from_value("700-0".to_string(), json!({}), 700, 1), // advance
+        ]);
+        assert_eq!(cursor.get(0), Some("500-0"), "shard 0 must not regress");
+        assert_eq!(cursor.get(1), Some("700-0"), "shard 1 must advance");
+    }
+
+    /// CR-1: pre-fix the cursor used `str::cmp` which inverts at
+    /// every decade rollover for unpadded numeric ids. JetStream
+    /// emits `seq.to_string()` (unpadded) — once seq=10 lands, lex
+    /// compare says `"10" < "9"` and the cursor freezes at "9".
+    #[test]
+    fn cursor_does_not_wedge_on_jetstream_decade_rollover() {
+        let mut cursor = CompositeCursor::new();
+        for seq in 1u64..=20 {
+            let ev = StoredEvent::from_value(seq.to_string(), json!({}), seq, 0);
+            cursor.update_from_events(&[ev]);
+        }
+        assert_eq!(
+            cursor.get(0),
+            Some("20"),
+            "cursor must reach 20; lex compare would wedge at \"9\""
+        );
+    }
+
+    /// CR-1: same hazard for Redis's `<ms>-<seq>` format when seq
+    /// rolls past a decade within a single ms.
+    #[test]
+    fn cursor_does_not_wedge_on_redis_seq_decade_rollover() {
+        let mut cursor = CompositeCursor::new();
+        // All within one ms — Redis collides on seq when many events
+        // hit in the same millisecond.
+        for seq in 1u64..=20 {
+            let id = format!("1700000000000-{}", seq);
+            let ev = StoredEvent::from_value(id, json!({}), 1700000000000, 0);
+            cursor.update_from_events(&[ev]);
+        }
+        assert_eq!(
+            cursor.get(0),
+            Some("1700000000000-20"),
+            "cursor must reach -20; lex compare would wedge at -9"
+        );
+    }
+
+    /// CR-1: cross-decade compare on JetStream-style ids.
+    #[test]
+    fn cursor_advances_from_unpadded_9_to_unpadded_10() {
+        let mut cursor = CompositeCursor::new();
+        cursor.update_from_events(&[StoredEvent::from_value("9".to_string(), json!({}), 9, 0)]);
+        cursor.update_from_events(&[StoredEvent::from_value("10".to_string(), json!({}), 10, 0)]);
+        assert_eq!(cursor.get(0), Some("10"));
+    }
+
+    /// CR-1: ULID / opaque ids must still work via lex fallback.
+    /// ULIDs are designed to be lex-sortable and we should NOT route
+    /// them through the numeric parsers.
+    #[test]
+    fn cursor_advances_on_ulid_ids_via_lex_fallback() {
+        let mut cursor = CompositeCursor::new();
+        // Two real ULIDs in ascending stream order. Different
+        // timestamp prefixes ensure lex order matches stream order.
+        let earlier = "01HZ0000000000000000000000";
+        let later = "01HZ0000010000000000000000";
+        cursor.update_from_events(&[StoredEvent::from_value(
+            earlier.to_string(),
+            json!({}),
+            1,
+            0,
+        )]);
+        cursor.update_from_events(&[StoredEvent::from_value(later.to_string(), json!({}), 2, 0)]);
+        assert_eq!(cursor.get(0), Some(later));
+        // Now feed the earlier id again — must NOT regress.
+        cursor.update_from_events(&[StoredEvent::from_value(
+            earlier.to_string(),
+            json!({}),
+            1,
+            0,
+        )]);
+        assert_eq!(cursor.get(0), Some(later));
+    }
+
+    /// CR-1: direct `compare_stream_ids` unit coverage.
+    #[test]
+    fn compare_stream_ids_handles_known_formats() {
+        // JetStream-style: numeric compare, padded-or-not.
+        assert_eq!(compare_stream_ids("9", "10"), CmpOrdering::Less);
+        assert_eq!(compare_stream_ids("10", "9"), CmpOrdering::Greater);
+        assert_eq!(compare_stream_ids("100", "100"), CmpOrdering::Equal);
+        // Padding-insensitive: leading zeros do not change numeric value.
+        assert_eq!(compare_stream_ids("00000010", "9"), CmpOrdering::Greater);
+
+        // Redis-style: tuple compare on (ms, seq).
+        assert_eq!(
+            compare_stream_ids("1700-9", "1700-10"),
+            CmpOrdering::Less,
+            "seq must compare numerically, not lex"
+        );
+        assert_eq!(
+            compare_stream_ids("1700-9", "1701-0"),
+            CmpOrdering::Less,
+            "ms wins over seq"
+        );
+        assert_eq!(
+            compare_stream_ids("1700-100", "1700-9"),
+            CmpOrdering::Greater
+        );
+
+        // ULID-shaped ids fall through to lex compare.
+        let ulid_a = "01HZ0000000000000000000000";
+        let ulid_b = "01HZ0000010000000000000000";
+        assert_eq!(compare_stream_ids(ulid_a, ulid_b), CmpOrdering::Less);
+
+        // Mixed format (one Redis, one numeric) — neither structured
+        // path applies, falls through to lex. Documented limitation.
+        // (Adapters emit a single format, so this is pathological.)
+        let _ = compare_stream_ids("1700-0", "9999");
+    }
+
+    /// CR-1: in `Ordering::InsertionTs` mode, two events from the
+    /// same shard with the same `insertion_ts` and unpadded numeric
+    /// ids must sort by numeric id, not lex id.
+    #[test]
+    fn insertion_ts_sort_breaks_tie_on_id_numerically() {
+        // Same shard, same ts — only the id tiebreak fires.
+        let mut events = [
+            StoredEvent::from_value("10".to_string(), json!({}), 1000, 0),
+            StoredEvent::from_value("9".to_string(), json!({}), 1000, 0),
+            StoredEvent::from_value("11".to_string(), json!({}), 1000, 0),
+        ];
+        events.sort_by(|a, b| {
+            a.insertion_ts
+                .cmp(&b.insertion_ts)
+                .then(a.shard_id.cmp(&b.shard_id))
+                .then(compare_stream_ids(&a.id, &b.id))
+        });
+        let ordered: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ordered,
+            vec!["9", "10", "11"],
+            "id tiebreak must be numeric, not lex"
+        );
     }
 
     #[test]

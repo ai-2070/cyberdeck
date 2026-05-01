@@ -10,17 +10,17 @@ Example:
     >>> node.shutdown()
 """
 
-from net_sdk.node import NetNode
-from net_sdk.stream import EventStream, TypedEventStream
 from net_sdk.channel import TypedChannel
 from net_sdk.mesh import (
+    BackpressureError,
     MeshNode,
     MeshStream,
-    StreamStats,
-    Reliability,
-    BackpressureError,
     NotConnectedError,
+    Reliability,
+    StreamStats,
 )
+from net_sdk.node import NetNode
+from net_sdk.stream import EventStream, TypedEventStream
 
 __all__ = [
     "NetNode",
@@ -35,4 +35,4 @@ __all__ = [
     "NotConnectedError",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.8.0"

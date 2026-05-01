@@ -33,6 +33,25 @@ pub struct CortexAdapter<State> {
 /// gets a `Lagged` signal and should re-read state fresh.
 const CHANGES_BROADCAST_CAP: usize = 64;
 
+/// Item type yielded by [`CortexAdapter::changes_with_lag`].
+///
+/// The plain `changes()` stream uses `filter_map(|r| r.ok())`
+/// which silently drops `BroadcastStream::Lagged(n)` errors —
+/// downstream telemetry consumers have no way to surface "you
+/// missed N changes." This enum exposes both shapes; subscribers
+/// who need only the latest sequence can stay on
+/// [`CortexAdapter::changes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeEvent {
+    /// A successful fold apply produced this RedEX sequence.
+    Seq(u64),
+    /// The subscriber fell `n` events behind the broadcast channel
+    /// and `n` change notifications were dropped. By the time the
+    /// subscriber sees this, `state()` already reflects past those
+    /// events — the lag value is purely observability.
+    Lagged(u64),
+}
+
 struct AdapterInner<State> {
     file: RedexFile,
     state: Arc<RwLock<State>>,
@@ -147,13 +166,39 @@ impl<State> CortexAdapter<State> {
     /// drops intermediate events. This implementation filters lag
     /// errors out silently — by the time the subscriber catches up,
     /// `state()` reflects the latest applied events regardless of
-    /// how many signals were missed.
+    /// how many signals were missed. Subscribers that need to
+    /// observe lag (e.g. for telemetry or reactive-backpressure)
+    /// should use [`Self::changes_with_lag`] instead.
     ///
     /// The stream ends when all adapter handles have been dropped
     /// and the fold task has exited.
     pub fn changes(&self) -> impl Stream<Item = u64> + Send + 'static {
         BroadcastStream::new(self.inner.changes_tx.subscribe())
             .filter_map(|r| async move { r.ok() })
+    }
+
+    /// Stream of changes that surfaces broadcast-channel lag as a
+    /// `Lagged(n)` event interleaved with the sequence emissions.
+    ///
+    /// The yielded items are [`ChangeEvent`]s — `Seq(u64)` for a
+    /// successful fold-apply notification, and `Lagged(n)` when the
+    /// subscriber fell `n` events behind the broadcast channel
+    /// (capacity 64). Pre-fix [`Self::changes`] silently dropped
+    /// `Lagged` errors via `filter_map(|r| r.ok())`; downstream
+    /// telemetry consumers had no way to surface "you missed N
+    /// changes." This method is the lossless counterpart — by the
+    /// time a subscriber sees `Lagged(n)`, `state()` already
+    /// reflects past those n events, so the subscriber can react
+    /// (re-read state, log lag, apply backpressure) without
+    /// missing data.
+    pub fn changes_with_lag(&self) -> impl Stream<Item = ChangeEvent> + Send + 'static {
+        use futures::StreamExt;
+        BroadcastStream::new(self.inner.changes_tx.subscribe()).map(|r| match r {
+            Ok(seq) => ChangeEvent::Seq(seq),
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                ChangeEvent::Lagged(n)
+            }
+        })
     }
 
     /// Append an envelope. Projects to `(EventMeta, tail)`, builds the
@@ -179,6 +224,50 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
     /// spawns a background task that tails the file and drives
     /// `fold`, and returns the handle.
     pub fn open<F>(
+        redex: &Redex,
+        name: &ChannelName,
+        redex_config: RedexFileConfig,
+        adapter_config: CortexAdapterConfig,
+        fold: F,
+        initial_state: State,
+    ) -> Result<Self, CortexAdapterError>
+    where
+        F: RedexFold<State> + Send + 'static,
+    {
+        // Positions that skip a non-empty event prefix require
+        // externally-rehydrated state — the watermark would
+        // otherwise advance past events the adapter never saw,
+        // making `wait_for_seq(k)` return immediately for skipped
+        // k while `state` has never observed those events.
+        // Callers using these positions must use
+        // `open_from_snapshot` (which carries the matching
+        // `last_seq` + serialized state) and routes through
+        // `open_unchecked` below.
+        match adapter_config.start {
+            StartPosition::FromBeginning => {}
+            StartPosition::LiveOnly => {
+                return Err(CortexAdapterError::InvalidStartPosition("LiveOnly"));
+            }
+            StartPosition::FromSeq(n) if n > 0 => {
+                return Err(CortexAdapterError::InvalidStartPosition("FromSeq(n>0)"));
+            }
+            StartPosition::FromSeq(_) => {} // FromSeq(0) is equivalent to FromBeginning
+        }
+        Self::open_unchecked(
+            redex,
+            name,
+            redex_config,
+            adapter_config,
+            fold,
+            initial_state,
+        )
+    }
+
+    /// Internal open path that bypasses the start-position
+    /// guard. Used by `open_from_snapshot`, where the externally-
+    /// rehydrated state is the legitimate reason to skip the
+    /// event prefix.
+    fn open_unchecked<F>(
         redex: &Redex,
         name: &ChannelName,
         redex_config: RedexFileConfig,
@@ -343,7 +432,9 @@ where
             start,
             on_fold_error: adapter_config.on_fold_error,
         };
-        Self::open(redex, name, redex_config, config, fold, initial_state)
+        // Route through `open_unchecked` so the externally-
+        // rehydrated state can skip its event prefix.
+        Self::open_unchecked(redex, name, redex_config, config, fold, initial_state)
     }
 }
 
@@ -386,10 +477,23 @@ where
     let result = {
         let mut state = inner.state.write();
         let r = fold.apply(event, &mut state);
+        // Under `Stop` policy, a per-event recoverable decode
+        // failure (postcard error, EventMeta shape mismatch —
+        // anything `RedexError::is_recoverable_decode` flags) is
+        // treated as skip-and-continue rather than halting. Halting
+        // on every such failure would let a single bad event (disk
+        // corruption past the 32-bit checksum, or a
+        // deliberately-crafted matching-collision tail) wedge the
+        // fold task permanently — a DoS vector against multi-tenant
+        // cortex instances via one bad event. Stream-level errors
+        // (`Io`, `Closed`, `Lagged`) and authorization /
+        // configuration errors still halt under `Stop` as
+        // documented.
+        let recoverable_decode = matches!(&r, Err(e) if e.is_recoverable_decode());
         let advance = matches!(
             (&r, policy),
             (Ok(()), _) | (Err(_), FoldErrorPolicy::LogAndContinue)
-        );
+        ) || recoverable_decode;
         if advance {
             inner.folded_through_seq.store(seq, Ordering::Release);
         }
@@ -405,9 +509,13 @@ where
         Err(err) => {
             inner.fold_errors.fetch_add(1, Ordering::AcqRel);
             tracing::warn!(seq = seq, error = %err, "cortex fold error");
+            // Per-event decode errors always skip-and-continue;
+            // only stream-level / configuration errors halt under
+            // `Stop`.
+            let recoverable_decode = err.is_recoverable_decode();
             match policy {
-                FoldErrorPolicy::Stop => true,
-                FoldErrorPolicy::LogAndContinue => {
+                FoldErrorPolicy::Stop if !recoverable_decode => true,
+                FoldErrorPolicy::Stop | FoldErrorPolicy::LogAndContinue => {
                     // Watermark was already advanced inside the lock
                     // above; just notify waiters.
                     inner.notify.notify_waiters();
@@ -533,6 +641,268 @@ mod tests {
         assert_eq!(adapter.fold_errors(), 1);
         // Seqs 0..=2 folded; seq 3 errored; seqs 4..=9 never folded.
         assert_eq!(*adapter.state().read(), 3);
+    }
+
+    // ========================================================================
+    // BUG #134: open must reject FromSeq(n>0) / LiveOnly
+    // ========================================================================
+
+    /// `open` rejects `StartPosition::FromSeq(n)` for n > 0
+    /// because the watermark would advance past events the adapter
+    /// never folded, leaving `wait_for_seq` lying about applied
+    /// state. Callers that intentionally skip a prefix must use
+    /// `open_from_snapshot`.
+    #[test]
+    fn open_rejects_from_seq_n_greater_than_zero() {
+        let redex = Redex::new();
+        let cfg = CortexAdapterConfig::new().with_start(StartPosition::FromSeq(5));
+        let result = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/from-seq-guard"),
+            RedexFileConfig::default(),
+            cfg,
+            CountFold,
+            0u64,
+        );
+        assert!(
+            matches!(result, Err(CortexAdapterError::InvalidStartPosition(_))),
+            "open must reject FromSeq(n>0) (BUG #134), got {:?}",
+            result.map(|_| "Ok"),
+        );
+    }
+
+    /// `open` rejects `StartPosition::LiveOnly` for the same
+    /// reason — the start_seq is `file.next_seq()`, so any prior
+    /// events go un-folded but the watermark advances past them.
+    #[test]
+    fn open_rejects_live_only_start_position() {
+        let redex = Redex::new();
+        let cfg = CortexAdapterConfig::new().with_start(StartPosition::LiveOnly);
+        let result = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/live-only-guard"),
+            RedexFileConfig::default(),
+            cfg,
+            CountFold,
+            0u64,
+        );
+        assert!(
+            matches!(result, Err(CortexAdapterError::InvalidStartPosition(_))),
+            "open must reject LiveOnly (BUG #134), got {:?}",
+            result.map(|_| "Ok"),
+        );
+    }
+
+    // ========================================================================
+    // BUG #141: Stop policy must skip-and-continue on per-event Decode errors
+    // ========================================================================
+
+    struct FailDecodeAtSeq(u64);
+    impl RedexFold<u64> for FailDecodeAtSeq {
+        fn apply(&mut self, ev: &RedexEvent, state: &mut u64) -> Result<(), RedexError> {
+            if ev.entry.seq == self.0 {
+                // Decode-class error: simulates a corrupt postcard
+                // tail / EventMeta shape mismatch / checksum miss
+                // — exactly what the cortex fold paths surface as
+                // RedexError::Decode after BUG #141.
+                Err(RedexError::Decode(format!(
+                    "deliberate decode failure at seq {}",
+                    ev.entry.seq
+                )))
+            } else {
+                *state += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Under `Stop` policy, a `RedexError::Decode` MUST NOT halt
+    /// the fold task — it's a per-event recoverable failure
+    /// (corrupt event payload past the 32-bit checksum, or an
+    /// attacker-crafted matching collision). Pre-fix this hung
+    /// the task on the first bad event, DoSing the cortex via one
+    /// payload. Post-fix: the bad event is logged + skipped, the
+    /// watermark advances, and subsequent events still fold.
+    #[tokio::test]
+    async fn stop_policy_skips_recoverable_decode_error() {
+        let redex = Redex::new();
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/decode-skip"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(), // Stop is default
+            FailDecodeAtSeq(3),
+            0u64,
+        )
+        .unwrap();
+
+        for i in 0..10u64 {
+            let meta = EventMeta::new(0, 0, 0, i, 0);
+            let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+            let seq = adapter.ingest(env).unwrap();
+            adapter.wait_for_seq(seq).await;
+        }
+
+        // Fold task is still running — the decode error didn't
+        // halt it. fold_errors counts the one bad event.
+        assert!(
+            adapter.is_running(),
+            "Stop policy must NOT halt on RedexError::Decode (BUG #141)"
+        );
+        assert_eq!(adapter.fold_errors(), 1);
+        // Seqs 0,1,2,4,5,6,7,8,9 folded; seq 3 skipped.
+        assert_eq!(*adapter.state().read(), 9);
+    }
+
+    /// `Encode` errors (storage / user-fold-level) STILL halt
+    /// under `Stop` — pins the conservative boundary so the BUG
+    /// #141 carve-out is strictly limited to per-event decode
+    /// failures. The pre-existing `test_stop_policy_halts_on_first_error`
+    /// already exercises this with `RedexError::Encode`, but we
+    /// pin the contract explicitly here so a future expansion of
+    /// `is_recoverable_decode` (e.g. accidentally including
+    /// `Encode`) is caught.
+    #[test]
+    fn redex_error_recoverable_decode_classification_is_decode_only() {
+        assert!(RedexError::Decode("x".into()).is_recoverable_decode());
+        assert!(!RedexError::Encode("x".into()).is_recoverable_decode());
+        assert!(!RedexError::Closed.is_recoverable_decode());
+        assert!(!RedexError::Io("x".into()).is_recoverable_decode());
+        assert!(!RedexError::Lagged.is_recoverable_decode());
+        assert!(!RedexError::Unauthorized.is_recoverable_decode());
+    }
+
+    /// `FromSeq(0)` is equivalent to `FromBeginning` (no events
+    /// skipped) and must still be accepted — pins the boundary so
+    /// the BUG #134 guard doesn't accidentally lock out the
+    /// degenerate-but-valid `FromSeq(0)` form.
+    #[tokio::test]
+    async fn open_accepts_from_seq_zero() {
+        let redex = Redex::new();
+        let cfg = CortexAdapterConfig::new().with_start(StartPosition::FromSeq(0));
+        CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/from-seq-zero"),
+            RedexFileConfig::default(),
+            cfg,
+            CountFold,
+            0u64,
+        )
+        .expect("FromSeq(0) is equivalent to FromBeginning and must be accepted");
+    }
+
+    // ========================================================================
+    // BUG #144: changes_with_lag must surface BroadcastStream::Lagged
+    // ========================================================================
+
+    /// `changes_with_lag` yields a `ChangeEvent::Lagged(n)` when a
+    /// subscriber falls behind the broadcast channel capacity. Pre-
+    /// fix `changes()` silently dropped these events via
+    /// `filter_map(|r| r.ok())`; downstream telemetry consumers had
+    /// no way to detect or count missed change notifications.
+    ///
+    /// Setup: subscribe, then ingest more than CHANGES_BROADCAST_CAP
+    /// (64) events without polling the stream. The broadcast channel
+    /// drops the oldest, and the next stream poll surfaces a
+    /// `Lagged(n)` for the dropped count.
+    #[tokio::test]
+    async fn changes_with_lag_yields_lagged_when_subscriber_falls_behind() {
+        let redex = Redex::new();
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/lag"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            CountFold,
+            0u64,
+        )
+        .unwrap();
+
+        let stream = adapter.changes_with_lag();
+        tokio::pin!(stream);
+
+        // Ingest CHANGES_BROADCAST_CAP + 16 events without polling
+        // the stream. The broadcast channel will drop the oldest 16
+        // (or thereabouts — the exact count depends on broadcast
+        // semantics; we just need at least one Lagged emission).
+        let total = (CHANGES_BROADCAST_CAP + 16) as u64;
+        for i in 0..total {
+            let meta = EventMeta::new(0, 0, 0, i, 0);
+            let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+            let seq = adapter.ingest(env).unwrap();
+            adapter.wait_for_seq(seq).await;
+        }
+
+        // First poll should see a Lagged event (the broadcast channel
+        // has overflowed). Drain the stream up to a reasonable cap and
+        // assert at least one Lagged event was observed.
+        let mut saw_lagged = false;
+        let mut saw_seq = false;
+        for _ in 0..(total as usize + 4) {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await {
+                Ok(Some(ChangeEvent::Lagged(n))) => {
+                    saw_lagged = true;
+                    assert!(n > 0, "Lagged count must be positive");
+                }
+                Ok(Some(ChangeEvent::Seq(_))) => {
+                    saw_seq = true;
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            saw_lagged,
+            "subscriber that fell behind {} events must observe Lagged (BUG #144)",
+            CHANGES_BROADCAST_CAP + 16,
+        );
+        assert!(
+            saw_seq,
+            "the stream should still emit Seq events after the lag",
+        );
+    }
+
+    /// `changes()` continues to silently drop lag (the documented
+    /// best-effort behavior) — pins the contract so a future
+    /// refactor doesn't accidentally surface `Lagged` through the
+    /// simple stream and break consumers that don't want it.
+    #[tokio::test]
+    async fn changes_filters_out_lag_silently() {
+        let redex = Redex::new();
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/lag-silent"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(),
+            CountFold,
+            0u64,
+        )
+        .unwrap();
+
+        let stream = adapter.changes();
+        tokio::pin!(stream);
+
+        // Same overflow setup.
+        let total = (CHANGES_BROADCAST_CAP + 16) as u64;
+        for i in 0..total {
+            let meta = EventMeta::new(0, 0, 0, i, 0);
+            let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+            let seq = adapter.ingest(env).unwrap();
+            adapter.wait_for_seq(seq).await;
+        }
+
+        // Drain everything we can from the stream. Item type is `u64`
+        // (not Result), so we can't observe Lagged in any form. Just
+        // verify the stream still produces some seqs without errors.
+        let mut got_seq = false;
+        for _ in 0..(total as usize + 4) {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await {
+                Ok(Some(_seq)) => {
+                    got_seq = true;
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(got_seq, "changes() must still emit seqs after lag");
     }
 
     #[tokio::test]

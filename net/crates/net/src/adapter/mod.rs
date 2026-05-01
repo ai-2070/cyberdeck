@@ -20,7 +20,14 @@
 //! - `JetStreamAdapter`: NATS JetStream backend (requires `jetstream` feature)
 //! - `NetAdapter`: High-performance UDP transport (requires `net` feature)
 
+mod dedup_state;
 mod noop;
+#[cfg(feature = "redis")]
+mod redis_dedup;
+
+pub use dedup_state::PersistentProducerNonce;
+#[cfg(feature = "redis")]
+pub use redis_dedup::RedisStreamDedup;
 
 #[cfg(feature = "redis")]
 mod redis;

@@ -18,7 +18,7 @@ const ORIGIN: u32 = 0x0BAD_F00D;
 #[tokio::test]
 async fn test_full_memory_lifecycle() {
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     memories
         .store(
@@ -67,7 +67,7 @@ async fn test_full_memory_lifecycle() {
 #[tokio::test]
 async fn test_pin_and_unpin_toggle() {
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     memories
         .store(1, "toggle me", Vec::<String>::new(), "tester", 100)
@@ -85,7 +85,7 @@ async fn test_pin_and_unpin_toggle() {
 #[tokio::test]
 async fn test_delete_removes_memory() {
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     memories
         .store(1, "temp", Vec::<String>::new(), "alice", 100)
@@ -101,7 +101,7 @@ async fn test_delete_removes_memory() {
 #[tokio::test]
 async fn test_retag_on_unknown_id_is_noop() {
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let seq = memories.retag(999, vec!["ghost".into()], 100).unwrap();
     memories.wait_for_seq(seq).await;
@@ -114,7 +114,7 @@ async fn test_retag_on_unknown_id_is_noop() {
 #[tokio::test]
 async fn test_tag_queries_through_live_adapter() {
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     memories
         .store(
@@ -238,7 +238,7 @@ async fn test_tag_queries_through_live_adapter() {
 async fn test_replay_after_close_reconstructs_state() {
     let redex = Redex::new();
     {
-        let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+        let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
         memories
             .store(1, "alpha", vec!["x".into()], "alice", 100)
             .unwrap();
@@ -254,7 +254,7 @@ async fn test_replay_after_close_reconstructs_state() {
     }
 
     // Fresh adapter, same file — state replays from log.
-    let memories2 = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories2 = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
     memories2.wait_for_seq(3).await;
 
     let state = memories2.state();
@@ -273,7 +273,7 @@ async fn test_replay_after_close_reconstructs_state() {
 #[tokio::test]
 async fn test_watch_initial_emission() {
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     // Pre-populate with one pinned + one unpinned.
     memories
@@ -301,7 +301,7 @@ async fn test_watch_initial_emission() {
 #[tokio::test]
 async fn test_watch_emits_on_tag_change() {
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     // Watch memories tagged "urgent".
     let mut stream = Box::pin(
@@ -354,7 +354,7 @@ async fn test_watch_emits_on_tag_change() {
 #[tokio::test]
 async fn test_watch_dedupes_unchanged_results() {
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     // Seed one memory tagged "work" + one tagged "home".
     memories
@@ -394,7 +394,7 @@ async fn test_watch_dedupes_unchanged_results() {
 #[tokio::test]
 async fn test_watch_multiple_subscribers_independent() {
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let mut pinned_stream = Box::pin(memories.watch().where_pinned(true).stream());
     let mut tagged_stream = Box::pin(memories.watch().where_tag("flagged").stream());
@@ -423,7 +423,7 @@ async fn test_watch_multiple_subscribers_independent() {
 #[tokio::test]
 async fn test_watch_with_limit_and_order() {
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let mut stream = Box::pin(
         memories
@@ -470,7 +470,7 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
     // into the snapshot payload and restores it so per-origin
     // monotonicity is preserved.
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     memories
         .store(1, "alpha", vec!["x".into()], "alice", 100)
@@ -487,8 +487,9 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
     memories.close().unwrap();
 
     let redex2 = Redex::new();
-    let memories2 =
-        MemoriesAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, last_seq).unwrap();
+    let memories2 = MemoriesAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, last_seq)
+        .await
+        .unwrap();
 
     let new_seq = memories2
         .store(4, "delta", vec!["w".into()], "alice", 400)
@@ -511,6 +512,179 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
 }
 
 #[tokio::test]
+async fn test_open_returns_with_state_already_caught_up() {
+    // BUG #148 fix: `MemoriesAdapter::open[_with_config]` awaits the
+    // inner fold task's catch-up before returning. State is fully
+    // visible synchronously — no `wait_for_seq` required.
+    let redex = Redex::new();
+    {
+        let a = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+        a.store(1, "first", vec!["a".into()], "src", 100).unwrap();
+        a.store(2, "second", vec!["b".into()], "src", 200).unwrap();
+        let seq = a.store(3, "third", vec!["c".into()], "src", 300).unwrap();
+        a.wait_for_seq(seq).await;
+        a.close().unwrap();
+    }
+
+    let b = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+    let state = b.state();
+    let guard = state.read();
+    assert_eq!(
+        guard.len(),
+        3,
+        "post-open state must be fully caught up — saw {} memories, expected 3",
+        guard.len(),
+    );
+}
+
+#[tokio::test]
+async fn test_open_on_empty_redex_does_not_block() {
+    // Edge case: `open` on a fresh empty Redex must not block on
+    // `wait_for_seq`. Wrap in a 2s timeout so a regression that
+    // awaits an unreachable seq surfaces as a test failure, not a
+    // hung run.
+    let redex = Redex::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        MemoriesAdapter::open(&redex, ORIGIN),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Ok(_))),
+        "open() on an empty Redex must complete promptly; got {result:?}",
+    );
+}
+
+#[tokio::test]
+async fn test_open_from_snapshot_with_empty_replay_tail_keeps_snapshot_app_seq() {
+    // When the snapshot's `last_seq` already covers every event in
+    // the file, the wrapper sees nothing during catch-up and the
+    // snapshot's persisted `app_seq` survives. The first post-restore
+    // ingest stamps `seq_or_ts = persisted_app_seq`.
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+    memories
+        .store(1, "a", vec!["x".into()], "src", 100)
+        .unwrap();
+    memories
+        .store(2, "b", vec!["y".into()], "src", 200)
+        .unwrap();
+    let seq = memories
+        .store(3, "c", vec!["z".into()], "src", 300)
+        .unwrap();
+    memories.wait_for_seq(seq).await;
+
+    let (state_bytes, last_seq) = memories.snapshot().unwrap();
+    memories.close().unwrap();
+
+    let redex2 = Redex::new();
+    let restored = MemoriesAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, last_seq)
+        .await
+        .unwrap();
+
+    let new_seq = restored
+        .store(4, "d", vec!["w".into()], "src", 400)
+        .unwrap();
+    restored.wait_for_seq(new_seq).await;
+
+    let file = redex2
+        .open_file(
+            &ChannelName::new(MEMORIES_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(new_seq, new_seq + 1);
+    let meta = EventMeta::from_bytes(&events[0].payload[..EVENT_META_SIZE]).unwrap();
+    assert_eq!(
+        meta.seq_or_ts, 3,
+        "post-restore counter must continue from snapshot's persisted app_seq (got {}, expected 3)",
+        meta.seq_or_ts,
+    );
+}
+
+#[tokio::test]
+async fn test_regression_open_advances_app_seq_past_existing_same_origin_events() {
+    // Regression for BUG #148 secondary-fix: pre-fix
+    // `MemoriesAdapter::open` set `app_seq = AtomicU64::new(0)`
+    // unconditionally, so reopening against a Redex with existing
+    // same-origin events caused the next ingest to stamp
+    // `EventMeta::seq_or_ts = 0`, colliding with the pre-existing
+    // event's `seq_or_ts = 0`. Same fix as `TasksAdapter`: a
+    // `WatermarkingFold` wrapper advances `app_seq` via fetch_max
+    // during replay; the constructor awaits catch-up before
+    // returning.
+    let redex = Redex::new();
+
+    {
+        let a = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+        a.store(1, "first", vec!["a".into()], "src", 100).unwrap();
+        a.store(2, "second", vec!["b".into()], "src", 200).unwrap();
+        let seq = a.store(3, "third", vec!["c".into()], "src", 300).unwrap();
+        a.wait_for_seq(seq).await;
+        a.close().unwrap();
+    }
+
+    let b = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+    let new_seq = b.store(4, "fourth", vec!["d".into()], "src", 400).unwrap();
+    b.wait_for_seq(new_seq).await;
+
+    let file = redex
+        .open_file(
+            &ChannelName::new(MEMORIES_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(new_seq, new_seq + 1);
+    assert_eq!(events.len(), 1);
+    let meta = EventMeta::from_bytes(&events[0].payload[..EVENT_META_SIZE]).unwrap();
+    assert_eq!(
+        meta.seq_or_ts, 3,
+        "first ingest after reopen must continue past replayed events' seq_or_ts \
+         (got {}, expected 3)",
+        meta.seq_or_ts,
+    );
+}
+
+#[tokio::test]
+async fn test_regression_open_ignores_other_origins_when_advancing_app_seq() {
+    // The watermarking-fold wrapper only advances `app_seq` for
+    // events whose `origin_hash` matches the adapter's; cross-origin
+    // events sharing the channel must not pollute our counter.
+    let redex = Redex::new();
+    const ORIGIN_A: u32 = 0x0000_AABB;
+    const ORIGIN_B: u32 = 0x0000_CCDD;
+
+    {
+        let b = MemoriesAdapter::open(&redex, ORIGIN_B).await.unwrap();
+        b.store(10, "b1", vec!["x".into()], "src", 100).unwrap();
+        b.store(11, "b2", vec!["y".into()], "src", 200).unwrap();
+        let seq = b.store(12, "b3", vec!["z".into()], "src", 300).unwrap();
+        b.wait_for_seq(seq).await;
+        b.close().unwrap();
+    }
+
+    let a = MemoriesAdapter::open(&redex, ORIGIN_A).await.unwrap();
+    let new_seq = a.store(20, "a1", vec!["q".into()], "src", 400).unwrap();
+    a.wait_for_seq(new_seq).await;
+
+    let file = redex
+        .open_file(
+            &ChannelName::new(MEMORIES_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(new_seq, new_seq + 1);
+    let meta = EventMeta::from_bytes(&events[0].payload[..EVENT_META_SIZE]).unwrap();
+    assert_eq!(
+        meta.seq_or_ts, 0,
+        "origin A's first ingest must not be polluted by origin B's seq_or_ts values \
+         (got {}, expected 0)",
+        meta.seq_or_ts,
+    );
+    assert_eq!(meta.origin_hash, ORIGIN_A);
+}
+
+#[tokio::test]
 async fn test_regression_checksum_is_computed_not_zero() {
     // Regression: `EventMeta::checksum` used to be hardcoded to 0 in
     // the memories adapter's `ingest_typed`. The documented contract
@@ -518,7 +692,7 @@ async fn test_regression_checksum_is_computed_not_zero() {
     // the payload tail. Verify the on-disk event's meta.checksum
     // matches `compute_checksum(tail)`.
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let seq = memories
         .store(
@@ -565,7 +739,7 @@ async fn test_regression_watch_without_order_by_is_stable() {
     // Seed enough memories that hash iteration order is demonstrably
     // non-ascending, then assert the watch output is IdAsc.
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
     const N: u64 = 64;
     let mut last = 0;
     for id in 1..=N {
@@ -594,7 +768,7 @@ async fn test_regression_watch_without_order_by_is_stable() {
 #[tokio::test]
 async fn test_snapshot_and_restore_round_trip() {
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     memories
         .store(1, "alpha", vec!["x".into()], "alice", 100)
@@ -614,7 +788,9 @@ async fn test_snapshot_and_restore_round_trip() {
 
     // Restore on a fresh Redex.
     let redex2 = Redex::new();
-    let memories2 = MemoriesAdapter::open_from_snapshot(&redex2, ORIGIN, &bytes, last_seq).unwrap();
+    let memories2 = MemoriesAdapter::open_from_snapshot(&redex2, ORIGIN, &bytes, last_seq)
+        .await
+        .unwrap();
     let state = memories2.state();
     let guard = state.read();
     assert_eq!(guard.len(), 2);
@@ -627,7 +803,7 @@ async fn test_snapshot_and_restore_round_trip() {
 #[tokio::test]
 async fn test_ingest_after_close_errors() {
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
     memories
         .store(1, "before close", Vec::<String>::new(), "alice", 100)
         .unwrap();
@@ -647,8 +823,8 @@ async fn test_memories_and_tasks_coexist_on_same_redex() {
     use net::adapter::net::cortex::tasks::{TaskStatus, TasksAdapter};
 
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
 
     // Drive both in parallel.
     memories
@@ -685,7 +861,7 @@ async fn test_snapshot_and_watch_delivers_post_call_updates() {
     // race — both implementations pass it — but guards against any
     // future change that accidentally over-filters legitimate deltas.
     let redex = Redex::new();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
     let seq = memories
         .store(1, "seed", vec!["t".into()], "alice", 100)
         .unwrap();
@@ -732,7 +908,7 @@ async fn test_regression_snapshot_and_watch_forwards_divergent_stream_initial() 
     // state, so no subsequent emission differs from it.
     for trial in 0..20 {
         let redex = Redex::new();
-        let memories = std::sync::Arc::new(MemoriesAdapter::open(&redex, ORIGIN).unwrap());
+        let memories = std::sync::Arc::new(MemoriesAdapter::open(&redex, ORIGIN).await.unwrap());
         let seq = memories
             .store(1, "seed", vec!["t".into()], "alice", 100)
             .unwrap();
@@ -778,4 +954,59 @@ async fn test_regression_snapshot_and_watch_forwards_divergent_stream_initial() 
             trial
         );
     }
+}
+
+/// Regression for BUG_AUDIT_2026_04_30_CORE.md #115: pre-fix
+/// `MemoriesFold::DISPATCH_MEMORY_STORED` constructed a fresh
+/// `Memory { pinned: false, created_ns: now_ns, ... }` and
+/// `insert`ed it, silently replacing any existing entry. So
+/// `memories.store(42, "updated", ...)` after `memories.pin(42)`
+/// dropped the pin flag and overwrote the original
+/// creation timestamp — operator had no observable signal that
+/// the pin was lost.
+///
+/// Post-fix: re-storing an existing id treats it as a content
+/// update — `pinned` and `created_ns` are preserved; `content`,
+/// `tags`, `source`, and `updated_ns` are overwritten.
+#[tokio::test]
+async fn re_store_preserves_pinned_flag_and_created_ns() {
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+
+    // 1. Initial store at created_ns=100.
+    memories
+        .store(1, "first content", vec!["initial".into()], "alice", 100)
+        .unwrap();
+    let seq = memories.pin(1, 110).unwrap();
+    memories.wait_for_seq(seq).await;
+
+    {
+        let state = memories.state();
+        let guard = state.read();
+        let m = guard.get(1).unwrap();
+        assert!(m.pinned, "memory must be pinned after pin()");
+        assert_eq!(m.created_ns, 100);
+        assert_eq!(m.content, "first content");
+    }
+
+    // 2. Re-store with new content at now_ns=200.
+    let seq = memories
+        .store(1, "updated content", vec!["updated".into()], "bob", 200)
+        .unwrap();
+    memories.wait_for_seq(seq).await;
+
+    let state = memories.state();
+    let guard = state.read();
+    let m = guard.get(1).unwrap();
+    // Pre-fix: pinned would be false, created_ns would be 200.
+    assert!(m.pinned, "pinned flag must be preserved across re-store");
+    assert_eq!(
+        m.created_ns, 100,
+        "created_ns must be preserved across re-store"
+    );
+    // Updated fields:
+    assert_eq!(m.content, "updated content");
+    assert_eq!(m.tags, vec!["updated".to_string()]);
+    assert_eq!(m.source, "bob");
+    assert_eq!(m.updated_ns, 200);
 }

@@ -14,7 +14,8 @@ use super::super::adapter::CortexAdapter;
 use super::super::config::CortexAdapterConfig;
 use super::super::envelope::EventEnvelope;
 use super::super::error::CortexAdapterError;
-use super::super::meta::{compute_checksum, EventMeta, EVENT_META_SIZE};
+use super::super::meta::{compute_checksum, EventMeta};
+use super::super::watermark::WatermarkingFold;
 use super::dispatch::{
     DISPATCH_MEMORY_DELETED, DISPATCH_MEMORY_PINNED, DISPATCH_MEMORY_RETAGGED,
     DISPATCH_MEMORY_STORED, DISPATCH_MEMORY_UNPINNED, MEMORIES_CHANNEL,
@@ -61,7 +62,12 @@ pub struct MemoriesAdapter {
     /// Producer identity stamped on every `EventMeta`.
     origin_hash: u32,
     /// Monotonic per-origin counter for `EventMeta::seq_or_ts`.
-    app_seq: AtomicU64,
+    /// Shared with the inner `WatermarkingFold` wrapper around
+    /// [`MemoriesFold`]: the fold task advances this counter via
+    /// `fetch_max(seq_or_ts + 1)` for every replayed event whose
+    /// `origin_hash` matches ours, so `ingest_typed` after open
+    /// can never collide with an already-stored event.
+    app_seq: Arc<AtomicU64>,
 }
 
 impl MemoriesAdapter {
@@ -69,12 +75,19 @@ impl MemoriesAdapter {
     ///
     /// Uses [`MEMORIES_CHANNEL`] (`"cortex/memories"`). Replays the
     /// full history into state on open.
-    pub fn open(redex: &Redex, origin_hash: u32) -> Result<Self, CortexAdapterError> {
-        Self::open_with_config(redex, origin_hash, RedexFileConfig::default())
+    ///
+    /// `async` because the constructor awaits the fold task's
+    /// catch-up before returning: the inner `WatermarkingFold`
+    /// observes every replayed event's `EventMeta` and advances
+    /// `app_seq` past any pre-existing same-origin `seq_or_ts`,
+    /// so the first `ingest_typed` after `open` cannot collide
+    /// with an already-stored event.
+    pub async fn open(redex: &Redex, origin_hash: u32) -> Result<Self, CortexAdapterError> {
+        Self::open_with_config(redex, origin_hash, RedexFileConfig::default()).await
     }
 
     /// Like [`Self::open`] but with a caller-supplied `RedexFileConfig`.
-    pub fn open_with_config(
+    pub async fn open_with_config(
         redex: &Redex,
         origin_hash: u32,
         redex_config: RedexFileConfig,
@@ -84,18 +97,32 @@ impl MemoriesAdapter {
                 e.to_string(),
             ))
         })?;
+        let app_seq = Arc::new(AtomicU64::new(0));
+        let fold = WatermarkingFold::new(MemoriesFold, app_seq.clone(), origin_hash);
         let inner = CortexAdapter::open(
             redex,
             &name,
             redex_config,
             CortexAdapterConfig::default(),
-            MemoriesFold,
+            fold,
             MemoriesState::new(),
         )?;
+
+        // Wait for the fold task to catch up so the wrapper has
+        // observed every pre-existing event before any caller-driven
+        // ingest can race against it. `redex.open_file` is idempotent
+        // (returns the same handle the inner adapter already holds),
+        // so re-opening here is cheap.
+        let file = redex.open_file(&name, redex_config)?;
+        let next_seq = file.next_seq();
+        if next_seq > 0 {
+            inner.wait_for_seq(next_seq - 1).await;
+        }
+
         Ok(Self {
             inner,
             origin_hash,
-            app_seq: AtomicU64::new(0),
+            app_seq,
         })
     }
 
@@ -200,17 +227,22 @@ impl MemoriesAdapter {
             let guard = state.read();
             watcher.spec_for_snapshot().execute(&guard)
         };
-        // The watcher recomputes its own initial from live state in
-        // `stream()`. A plain `skip(1)` would silently drop that
-        // value, so if the state mutated between our snapshot and
-        // the watcher's read the caller would never learn about it.
-        // Instead, drop only while the stream still matches the
-        // snapshot we already returned — any diverging emission is
-        // forwarded.
+        // Skip ONLY the first emission if it still equals the
+        // snapshot, forward everything after that. A sticky
+        // `skip_while` would starve consumers under (A → B → A)
+        // state oscillations collapsed by the single-slot
+        // `tokio::sync::watch` — see
+        // `tasks/adapter.rs::snapshot_and_watch` for the full
+        // rationale.
         let initial_for_stream = initial.clone();
         let stream = watcher
             .stream()
-            .skip_while(move |current| futures::future::ready(current == &initial_for_stream))
+            .enumerate()
+            .filter(move |(i, current)| {
+                let drop_first = *i == 0 && current == &initial_for_stream;
+                futures::future::ready(!drop_first)
+            })
+            .map(|(_, current)| current)
             .boxed();
         (initial, stream)
     }
@@ -230,7 +262,9 @@ impl MemoriesAdapter {
     }
 
     /// Open the memories adapter from a snapshot.
-    pub fn open_from_snapshot(
+    ///
+    /// See [`Self::open`] for why this is `async`.
+    pub async fn open_from_snapshot(
         redex: &Redex,
         origin_hash: u32,
         state_bytes: &[u8],
@@ -243,11 +277,12 @@ impl MemoriesAdapter {
             state_bytes,
             last_seq,
         )
+        .await
     }
 
     /// Like [`Self::open_from_snapshot`] but with a caller-supplied
     /// `RedexFileConfig`.
-    pub fn open_from_snapshot_with_config(
+    pub async fn open_from_snapshot_with_config(
         redex: &Redex,
         origin_hash: u32,
         redex_config: RedexFileConfig,
@@ -262,46 +297,44 @@ impl MemoriesAdapter {
         })?;
         let name = ChannelName::new(MEMORIES_CHANNEL)
             .map_err(|e| CortexAdapterError::Redex(RedexError::Channel(e.to_string())))?;
+
+        // Pre-load the snapshot's persisted counter into the
+        // shared atomic. The wrapper fold then advances it via
+        // fetch_max as it catches up over the post-`last_seq`
+        // tail. A separate synchronous `read_range` walk would
+        // double startup IO/CPU on large logs.
+        let app_seq = Arc::new(AtomicU64::new(payload.app_seq));
+        let fold = WatermarkingFold::new(MemoriesFold, app_seq.clone(), origin_hash);
         let inner = CortexAdapter::open_from_snapshot(
             redex,
             &name,
             redex_config,
             CortexAdapterConfig::default(),
-            MemoriesFold,
+            fold,
             &payload.inner,
             last_seq,
         )?;
 
-        // Restore the app_seq counter; see `TasksAdapter`'s
-        // equivalent block for the replay-aware reasoning. Briefly:
-        // if events for our origin exist with seq > last_seq, their
-        // seq_or_ts values have already been assigned, so the counter
-        // must advance past them to avoid duplicates on the next
-        // ingest.
-        let mut app_seq = payload.app_seq;
-        let replay_start = last_seq.map(|s| s + 1).unwrap_or(0);
         let file = redex.open_file(&name, redex_config)?;
-        let replay_end = file.next_seq();
-        if replay_start < replay_end {
-            for ev in file.read_range(replay_start, replay_end) {
-                if ev.payload.len() < EVENT_META_SIZE {
-                    continue;
-                }
-                if let Some(meta) = EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE]) {
-                    if meta.origin_hash == origin_hash && meta.seq_or_ts >= app_seq {
-                        app_seq = meta.seq_or_ts + 1;
-                    }
-                }
-            }
+        let next_seq = file.next_seq();
+        if next_seq > 0 {
+            inner.wait_for_seq(next_seq - 1).await;
         }
 
         Ok(Self {
             inner,
             origin_hash,
-            app_seq: AtomicU64::new(app_seq),
+            app_seq,
         })
     }
 
+    /// See `tasks/adapter.rs::ingest_typed` for the full
+    /// rationale. Same shape as the tasks adapter: a single
+    /// `fetch_add` reserves the next `app_seq` atomically before
+    /// ingest; on `inner.ingest` failure we leave a small gap in
+    /// the per-origin sequence space, which is harmless because
+    /// `WatermarkingFold` advances via `fetch_max` against events
+    /// that actually landed in the log.
     fn ingest_typed<T: serde::Serialize>(
         &self,
         dispatch: u8,
@@ -312,10 +345,14 @@ impl MemoriesAdapter {
                 e.to_string(),
             ))
         })?;
-        let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
         let checksum = compute_checksum(&tail);
+        let payload_bytes = Bytes::from(tail);
+
+        // See `tasks/adapter.rs::ingest_typed` for the full
+        // fetch_add rationale.
+        let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
         let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
-        let env = EventEnvelope::new(meta, Bytes::from(tail));
+        let env = EventEnvelope::new(meta, payload_bytes);
         self.inner.ingest(env)
     }
 }

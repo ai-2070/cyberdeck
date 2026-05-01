@@ -427,6 +427,37 @@ impl EdgeInfo {
 /// Local view of the network graph.
 ///
 /// Maintains a k-hop neighborhood view of the network topology.
+/// Soft caps on `LocalGraph`'s DashMaps.
+///
+/// `on_pingwave` inserts into both `nodes` and `seen_pingwaves`,
+/// so without these caps a peer that completed the cheap mesh-
+/// handshake gate could flood pingwaves with random
+/// `origin_id` / `seq` combinations and grow both maps at
+/// line-rate; cleanup runs on a 30s/10s timer, so per-window
+/// growth would otherwise be bounded only by link bandwidth.
+/// The caps turn that into a bounded memory footprint:
+/// - Below the cap: insertion proceeds normally.
+/// - At or above the cap: novel keys are NOT inserted (existing
+///   keys still update); periodic eviction reclaims slots for
+///   legitimate nodes/pingwaves as they idle out.
+///
+/// Sized to keep the worst-case memory bounded while leaving
+/// headroom for real workloads — peer mesh sizes ≤ a few
+/// thousand nodes rarely populate more than a few thousand
+/// distinct origin_ids in the graph.
+pub const MAX_GRAPH_NODES: usize = 65_536;
+
+/// Soft cap on the `seen_pingwaves` dedup map.
+/// 4× `MAX_GRAPH_NODES` to absorb a typical multi-second pingwave
+/// burst per node before reaching the cap. Exceeding the cap
+/// drops novel `(origin_id, seq)` pairs at admission; legitimate
+/// peers still update existing entries.
+pub const MAX_SEEN_PINGWAVES: usize = 262_144;
+
+/// Local view of the swarm: known nodes, edges, and a dedup
+/// cache for incoming pingwaves. Holds the proximity-routing
+/// state — see `BehaviorContext::propagate` for the consumer
+/// side and `mesh.rs` pingwave dispatch for the producer side.
 pub struct LocalGraph {
     /// Local node ID
     my_id: u64,
@@ -486,6 +517,16 @@ impl LocalGraph {
     /// Process an incoming pingwave.
     ///
     /// Returns Some(pingwave) if it should be forwarded, None otherwise.
+    ///
+    /// `seen_pingwaves` and `nodes` are soft-capped via
+    /// [`MAX_SEEN_PINGWAVES`] / [`MAX_GRAPH_NODES`]: existing
+    /// entries continue to update, but novel keys are dropped
+    /// once the cap is reached. The next periodic
+    /// `evict_stale_*` sweep reclaims slots for legitimate
+    /// nodes/pingwaves so admission resumes once memory pressure
+    /// eases. Without the caps, a peer flooding pingwaves with
+    /// random `(origin_id, seq)` could grow both maps at
+    /// line-rate between the periodic eviction sweeps.
     pub fn on_pingwave(&self, mut pw: Pingwave, from: SocketAddr) -> Option<Pingwave> {
         // Ignore our own pingwaves
         if pw.origin_id == self.my_id {
@@ -498,19 +539,76 @@ impl LocalGraph {
             return None;
         }
 
+        // Gate `seen_pingwaves` insertion on the soft cap. If
+        // we're at the cap, drop the pingwave entirely (don't
+        // track it, don't forward) — better to lose a legitimate
+        // one than open the flood gate.
+        if self.seen_pingwaves.len() >= MAX_SEEN_PINGWAVES {
+            return None;
+        }
+
         // Mark as seen
         self.seen_pingwaves.insert(key, Instant::now());
 
-        // Update or create node info
-        let hops = pw.hop_count + 1;
+        // `pw.hop_count + 1` would panic in debug at u8::MAX and
+        // silently wrap to 0 in release. A peer can advertise
+        // `hop_count == 255` to either crash the receive loop
+        // (debug) or falsely promote itself to "0 hops away"
+        // (release) — proximity-routing poisoning vector.
+        // `saturating_add(1)` caps at 255.
+        let hops = pw.hop_count.saturating_add(1);
+        // Gate `nodes` insertion on the soft cap. Existing nodes
+        // keep updating regardless (so legitimate peers don't get
+        // kicked out mid-flight); only novel origin_ids are
+        // blocked. Combined with periodic eviction this bounds
+        // memory while preserving liveness for already-known
+        // peers.
+        if !self.nodes.contains_key(&pw.origin_id) && self.nodes.len() >= MAX_GRAPH_NODES {
+            return None;
+        }
         self.nodes
             .entry(pw.origin_id)
             .and_modify(|n| {
-                // Only update if this is a newer sequence or closer hop
-                if pw.seq > n.last_seq || hops < n.hops {
+                // Pingwaves are unauthenticated UDP, so we cannot
+                // trust an apparent seq regression (e.g. `pw.seq`
+                // far below `n.last_seq`) to reflect a legitimate
+                // peer restart. Refreshing only `n.touch()` on
+                // such a "likely restart" signal — without
+                // overwriting `addr`/`hops` and without lowering
+                // `last_seq` — is the safe shape:
+                //
+                //   * Liveness half: a real peer that has restarted
+                //     and is now sending fresh seq=1, 2, ... still
+                //     keeps the entry off the stale-eviction path.
+                //   * Authenticity half: any subsequent seq from
+                //     the legitimate restarted peer must climb
+                //     back above the pre-restart high-water mark
+                //     via strict-progress to earn an address
+                //     update.
+                //
+                // Otherwise an attacker with line-of-sight to the
+                // wire could spoof `(origin_id=Y, seq=1, hops=0)`
+                // from their own UDP source and repoint Y's
+                // recorded routing target. Even just *lowering*
+                // `last_seq` on a restart-only branch leaves a
+                // slow-rolling address-overwrite vector: spoof
+                // seq=1 to drop the high-water, then follow up
+                // with seq=2 which looks like strict-progress and
+                // DOES overwrite `n.addr`.
+                let likely_restart = n.last_seq > 1 && pw.seq < n.last_seq.saturating_div(2);
+                let strict_progress = pw.seq > n.last_seq || hops < n.hops;
+                if strict_progress {
                     n.last_seq = pw.seq;
                     n.hops = hops;
                     n.addr = from;
+                    n.touch();
+                } else if likely_restart {
+                    // Liveness-only refresh — DO NOT overwrite
+                    // addr/hops AND do NOT lower last_seq on an
+                    // unauthenticated seq-regression signal.
+                    // touch() alone keeps the entry off the
+                    // stale-eviction path until a strict-progress
+                    // pingwave arrives.
                     n.touch();
                 }
             })
@@ -781,6 +879,258 @@ mod tests {
         assert_eq!(caps.model_slots, parsed.model_slots);
         assert_eq!(caps.tools, parsed.tools);
         assert_eq!(caps.tags, parsed.tags);
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #100: pre-fix
+    /// `LocalGraph::on_pingwave` had no upper bound on
+    /// `seen_pingwaves` or `nodes`. A peer flooding pingwaves
+    /// with random `(origin_id, seq)` could grow both maps at
+    /// line-rate between the periodic eviction sweeps. Post-fix
+    /// both insertions are gated on soft caps:
+    /// `MAX_SEEN_PINGWAVES` and `MAX_GRAPH_NODES`. Existing
+    /// entries continue to update; only novel keys are dropped
+    /// when at the cap.
+    ///
+    /// We pin the soft-cap behaviour by:
+    ///   1. Pre-fill `seen_pingwaves` to the cap directly
+    ///      (bypasses the slow `on_pingwave` path).
+    ///   2. Send a novel pingwave — must be rejected (not
+    ///      forwarded, not added to either map).
+    ///   3. Send a pingwave with the SAME `(origin_id, seq)` as
+    ///      an already-seen entry — also rejected (idempotency
+    ///      preserved, regardless of cap).
+    ///   4. Repeat for the `nodes` cap by pre-filling and
+    ///      verifying novel `origin_id`s are dropped while
+    ///      already-known origins are still updated.
+    #[test]
+    fn on_pingwave_drops_novel_entries_when_seen_pingwaves_is_at_cap() {
+        let graph = LocalGraph::new(0x1, 8);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // Pre-fill seen_pingwaves to the cap with synthetic keys
+        // that won't collide with the test's input.
+        for i in 0..MAX_SEEN_PINGWAVES as u64 {
+            graph
+                .seen_pingwaves
+                .insert((0xDEAD_BEEF_0000 + i, 0), Instant::now());
+        }
+        assert_eq!(graph.seen_pingwaves.len(), MAX_SEEN_PINGWAVES);
+
+        // Send a novel pingwave → must be dropped.
+        let novel_pw = Pingwave::new(0xCAFE, 1, 3);
+        let result = graph.on_pingwave(novel_pw, from);
+        assert!(
+            result.is_none(),
+            "novel pingwave at cap must NOT be forwarded"
+        );
+        assert!(
+            !graph.seen_pingwaves.contains_key(&(0xCAFE, 1)),
+            "novel pingwave must NOT be inserted at cap"
+        );
+        assert!(
+            !graph.nodes.contains_key(&0xCAFE),
+            "novel origin must NOT be inserted at cap"
+        );
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #120: pre-fix
+    /// `on_pingwave` only updated `last_seq`/`last_seen` when
+    /// `pw.seq > n.last_seq`. After a peer restart its
+    /// `next_seq` resets to 1; with our `n.last_seq` still at
+    /// the old high-water mark, every post-restart pingwave was
+    /// dropped from updating. The node entered `is_stale` after
+    /// 30s and got removed by cleanup — capability lookups
+    /// against the stale entry returned outdated info in the
+    /// gap.
+    ///
+    /// Post-fix: a likely restart (`pw.seq <= n.last_seq / 2`
+    /// when `n.last_seq > 1`) accepts the seq regression so
+    /// `last_seq` advances forward and `last_seen` refreshes,
+    /// keeping the entry off the stale-cleanup path.
+    ///
+    /// CR-6 + Cubic P1 update: the LIVENESS half of BUG #120 is
+    /// preserved via `touch()` only — neither `last_seq` nor
+    /// `addr` updates on the unauthenticated restart-only path.
+    /// Pingwaves are unauthenticated UDP and the original fix
+    /// let any peer spoof a restart to repoint a victim's
+    /// address (CR-6); a follow-up Cubic P1 review noted that
+    /// merely lowering `last_seq` opens a slow-rolling vector
+    /// where a second spoofed pingwave at seq=2 looks like
+    /// strict progress (2 > 1) and DOES overwrite the address.
+    ///
+    /// The legitimate restarted peer's seq must climb back above
+    /// the recorded high-water mark via strict-progress
+    /// pingwaves (which the attacker can't beat without seeing
+    /// the actual peer's output) before any address update.
+    /// In the meantime, `touch()` keeps the entry alive so
+    /// stale-eviction doesn't fire.
+    #[test]
+    fn on_pingwave_likely_restart_only_touches_does_not_lower_last_seq() {
+        let graph = LocalGraph::new(0x1, 8);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // Bring the peer up to a high seq.
+        for seq in [100u64, 200, 500, 1000].iter() {
+            let pw = Pingwave::new(0xCAFE, *seq, 3);
+            graph.on_pingwave(pw, from);
+        }
+        let pre_restart_last_seq = graph.nodes.get(&0xCAFE).map(|n| n.last_seq).unwrap();
+        assert_eq!(pre_restart_last_seq, 1000);
+
+        // "Restart" pingwave (or, equivalently, an attacker spoof
+        // — we can't tell from the wire) at seq=1.
+        let restart_from: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let pw = Pingwave::new(0xCAFE, 1, 3);
+        graph.on_pingwave(pw, restart_from);
+
+        let (post_restart_last_seq, post_restart_addr) = graph
+            .nodes
+            .get(&0xCAFE)
+            .map(|n| (n.last_seq, n.addr))
+            .unwrap();
+        // Cubic P1: last_seq MUST stay at 1000 — lowering it
+        // would let a follow-up seq=2 spoof look like strict
+        // progress and overwrite the address.
+        assert_eq!(
+            post_restart_last_seq, 1000,
+            "Cubic P1: unauthenticated restart-only path must NOT lower \
+             last_seq; the high-water mark is the only credential blocking \
+             a spoofed seq=2 from looking like strict progress"
+        );
+        // CR-6: address stays at the pre-restart address.
+        assert_eq!(
+            post_restart_addr, from,
+            "CR-6: address must NOT auto-update on the restart-only path"
+        );
+
+        // The legitimate restarted peer's seq must climb back
+        // above 1000 before any address update fires. seq=1001
+        // from restart_from — strict progress.
+        let pw2 = Pingwave::new(0xCAFE, 1001, 3);
+        graph.on_pingwave(pw2, restart_from);
+        let (final_last_seq, final_addr) = graph
+            .nodes
+            .get(&0xCAFE)
+            .map(|n| (n.last_seq, n.addr))
+            .unwrap();
+        assert_eq!(final_last_seq, 1001);
+        assert_eq!(
+            final_addr, restart_from,
+            "strict-progress pingwave (seq > prior high-water) updates addr"
+        );
+    }
+
+    /// CR-6: pin the security invariant. An attacker who has
+    /// observed at least one pingwave for `origin_id` (so they
+    /// know it exists in the graph at some seq) can craft a
+    /// `(origin_id, seq=1, hops=0)` packet from their own UDP
+    /// source. Pre-CR-6 the `likely_restart` heuristic accepted
+    /// this and overwrote `n.addr = attacker_addr`, repointing
+    /// the victim's recorded routing target at the attacker.
+    /// Post-CR-6 + Cubic-P1 the address stays at the legitimately-
+    /// recorded value AND `last_seq` stays at the high-water mark
+    /// — only `last_seen` (touch) refreshes.
+    #[test]
+    fn on_pingwave_likely_restart_must_not_overwrite_addr() {
+        let graph = LocalGraph::new(0x1, 8);
+        let legit: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+
+        // Establish a high seq from the legitimate peer.
+        for seq in [100u64, 500, 1000].iter() {
+            let pw = Pingwave::new(0xBEEF, *seq, 3);
+            graph.on_pingwave(pw, legit);
+        }
+        assert_eq!(
+            graph.nodes.get(&0xBEEF).map(|n| n.addr).unwrap(),
+            legit,
+            "sanity: legit addr is recorded"
+        );
+
+        // Attacker spoofs a restart-shaped pingwave from THEIR
+        // address. Pre-CR-6 this overwrote n.addr.
+        let attacker: SocketAddr = "192.0.2.99:31337".parse().unwrap();
+        let spoof = Pingwave::new(0xBEEF, 1, 3);
+        graph.on_pingwave(spoof, attacker);
+
+        let (recorded_addr, recorded_last_seq) = graph
+            .nodes
+            .get(&0xBEEF)
+            .map(|n| (n.addr, n.last_seq))
+            .unwrap();
+        assert_eq!(
+            recorded_addr, legit,
+            "CR-6: spoofed restart MUST NOT repoint the recorded address \
+             to the attacker; got {:?}",
+            recorded_addr
+        );
+        // Cubic P1: last_seq must STAY at the pre-spoof high-water
+        // mark. If it lowered to 1, a follow-up spoofed seq=2
+        // would look like strict progress (2 > 1) and overwrite
+        // n.addr — the slow-rolling vector that motivated this
+        // tightening.
+        assert_eq!(
+            recorded_last_seq, 1000,
+            "Cubic P1: last_seq must STAY at the pre-spoof high-water mark; \
+             a lowered last_seq lets a follow-up seq=2 spoof masquerade as \
+             strict progress and overwrite n.addr"
+        );
+    }
+
+    /// Sanity: a small seq regression that is NOT below
+    /// `last_seq / 2` should still be ignored — protects against
+    /// out-of-order pingwaves on a non-restarted peer.
+    #[test]
+    fn on_pingwave_ignores_small_seq_regression_without_restart_signal() {
+        let graph = LocalGraph::new(0x1, 8);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        for seq in [10u64, 20].iter() {
+            let pw = Pingwave::new(0xCAFE, *seq, 3);
+            graph.on_pingwave(pw, from);
+        }
+
+        // seq=15 is below 20 but above 20/2=10 — out-of-order,
+        // not a restart. Don't update.
+        let pw = Pingwave::new(0xCAFE, 15, 3);
+        graph.on_pingwave(pw, from);
+        let last_seq = graph.nodes.get(&0xCAFE).map(|n| n.last_seq).unwrap();
+        assert_eq!(
+            last_seq, 20,
+            "small seq regression (out-of-order) must NOT update last_seq"
+        );
+    }
+
+    #[test]
+    fn on_pingwave_drops_novel_origin_when_nodes_is_at_cap() {
+        let graph = LocalGraph::new(0x1, 8);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // Pre-populate `nodes` to the cap with synthetic ids.
+        for i in 0..MAX_GRAPH_NODES as u64 {
+            let id = 0xDEAD_BEEF_0000 + i;
+            graph.nodes.insert(id, NodeInfo::new(id, from, 1));
+        }
+        assert_eq!(graph.nodes.len(), MAX_GRAPH_NODES);
+
+        // A pingwave from a novel origin must NOT be inserted.
+        let novel_pw = Pingwave::new(0xFACE, 1, 3);
+        graph.on_pingwave(novel_pw, from);
+        assert!(
+            !graph.nodes.contains_key(&0xFACE),
+            "novel origin at cap must NOT be inserted"
+        );
+
+        // BUT an existing origin should still update on a fresh
+        // pingwave (caps don't kick out legitimate peers).
+        let existing_id = 0xDEAD_BEEF_0000u64;
+        let existing_pw = Pingwave::new(existing_id, 99, 3);
+        let pre_seq = graph.nodes.get(&existing_id).unwrap().last_seq;
+        graph.on_pingwave(existing_pw, from);
+        let post_seq = graph.nodes.get(&existing_id).unwrap().last_seq;
+        assert!(
+            post_seq > pre_seq,
+            "already-known origin must keep updating despite cap"
+        );
     }
 
     #[test]

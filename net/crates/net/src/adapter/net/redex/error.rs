@@ -45,6 +45,15 @@ pub enum RedexError {
     #[error("encode failed: {0}")]
     Encode(String),
 
+    /// A decode helper (postcard, EventMeta shape, checksum) rejected
+    /// a per-event payload. Distinct from [`Self::Encode`] so the
+    /// fold-error-policy interpreter can treat per-event decode
+    /// failures as skip-and-continue even under the `Stop` policy
+    /// — otherwise a single corrupt or attacker-crafted event
+    /// could wedge the fold task forever.
+    #[error("decode failed: {0}")]
+    Decode(String),
+
     /// Caller is not authorized to append or tail this file.
     #[error("unauthorized")]
     Unauthorized,
@@ -69,5 +78,27 @@ impl RedexError {
     /// Construct from any `std::io::Error` with its message preserved.
     pub fn io(err: std::io::Error) -> Self {
         Self::Io(err.to_string())
+    }
+
+    /// Returns `true` when this error represents a per-event
+    /// recoverable failure (a single bad event, NOT an
+    /// underlying-storage failure that affects every subsequent
+    /// event). The cortex fold-error-policy interpreter treats
+    /// these as "always skip-and-continue" even under the `Stop`
+    /// policy — otherwise a single corrupt postcard tail (or a
+    /// 32-bit checksum collision) would wedge the fold task
+    /// permanently and DoS a multi-tenant cortex instance via one
+    /// bad event.
+    ///
+    /// Only `Decode` qualifies — it's stamped by the cortex fold
+    /// implementations specifically on postcard / EventMeta /
+    /// checksum failures. `Encode` is reserved for user-fold-level
+    /// errors and storage-side encode failures, which legitimately
+    /// halt under `Stop`. `Io` / `Closed` / `Lagged` are
+    /// stream-level. `PayloadTooLarge` / `SegmentOffsetOverflow` /
+    /// `SeqOutOfRange` / `Channel` / `Unauthorized` are
+    /// configuration / authorization issues.
+    pub fn is_recoverable_decode(&self) -> bool {
+        matches!(self, Self::Decode(_))
     }
 }

@@ -113,12 +113,21 @@ impl SubprotocolRegistry {
     ///
     /// Add these to the local node's `CapabilitySet` and re-broadcast
     /// via `CapabilityAd` so other nodes can discover support.
+    ///
+    /// Returned in ascending subprotocol-id order, matching
+    /// `SubprotocolManifest::from_registry`'s sort. Without this,
+    /// the two channels' byte streams diverge — fine today, but a
+    /// future digest-dedup optimisation that hashes either output
+    /// would silently disagree with the other side.
     pub fn capability_tags(&self) -> Vec<String> {
-        self.entries
+        let mut entries: Vec<_> = self
+            .entries
             .iter()
             .filter(|e| e.handler_present)
-            .map(|e| e.capability_tag())
-            .collect()
+            .map(|e| (e.id, e.capability_tag()))
+            .collect();
+        entries.sort_by_key(|(id, _)| *id);
+        entries.into_iter().map(|(_, tag)| tag).collect()
     }
 
     /// Enrich a `CapabilitySet` with tags for all handled subprotocols.

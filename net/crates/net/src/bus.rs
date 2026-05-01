@@ -98,7 +98,16 @@ pub struct EventBus {
     /// Configuration.
     config: EventBusConfig,
     /// Statistics.
-    stats: EventBusStats,
+    stats: Arc<EventBusStats>,
+    /// Producer nonce. Loaded from
+    /// `config.producer_nonce_path` on startup when the path is
+    /// configured; otherwise falls back to the per-process default
+    /// from `event::batch_process_nonce`. Stamped on every batch
+    /// the bus emits — the worker spawn copies this u64 into
+    /// `BatchWorkerParams::producer_nonce`, and
+    /// `remove_shard_internal`'s stranded-flush uses it via
+    /// `Batch::with_nonce`.
+    producer_nonce: u64,
     /// Scaling monitor task handle.
     scaling_monitor: parking_lot::Mutex<Option<JoinHandle<()>>>,
 }
@@ -110,6 +119,14 @@ pub struct EventBus {
 struct ShardWorkers {
     batch: JoinHandle<()>,
     drain: JoinHandle<()>,
+    /// Bus-owned mirror of the BatchWorker's `next_sequence`.
+    /// `remove_shard_internal` reads this AFTER awaiting `batch`
+    /// to learn the worker's final post-flush sequence, then uses
+    /// it as the `sequence_start` for the stranded-ring-buffer
+    /// flush so the stranded msg-ids fall strictly past every
+    /// msg-id the worker emitted — without this, JetStream dedup
+    /// would silently drop the stranded batch when both used 0.
+    next_sequence: Arc<AtomicU64>,
 }
 
 /// RAII guard for an in-flight ingest. Decrements
@@ -135,7 +152,23 @@ pub struct EventBusStats {
     /// Events dropped due to backpressure.
     pub events_dropped: AtomicU64,
     /// Batches dispatched to adapter.
+    ///
+    /// Pre-fix this field was declared but never incremented anywhere
+    /// — `flush()`'s Phase 2 progress probe (`bus.rs:815`) read it as
+    /// "did the BatchWorker make progress this `max_delay` window?",
+    /// observed `0 == 0`, and always early-broke after a single
+    /// window. On Windows-class timer resolution the race against the
+    /// BatchWorker's first `recv_timeout` tipped the wrong way for
+    /// `flush_is_a_delivery_barrier` regularly. Now incremented in
+    /// the BatchWorker spawn (after a successful `dispatch_batch`)
+    /// and in `remove_shard_internal`'s stranded-flush.
     pub batches_dispatched: AtomicU64,
+    /// Total events dispatched to the adapter (sum of batch lengths
+    /// from successful `on_batch` calls). Companion to
+    /// `batches_dispatched` — by the time `flush()` returns,
+    /// `events_dispatched + events_dropped == events_ingested`. FFI
+    /// consumers can also use this to monitor end-to-end delivery.
+    pub events_dispatched: AtomicU64,
 }
 
 impl EventBus {
@@ -208,6 +241,27 @@ impl EventBus {
         let shutdown = Arc::new(AtomicBool::new(false));
         let drain_finalize_ready = Arc::new(AtomicBool::new(false));
 
+        // Stats are shared with every BatchWorker spawn so successful
+        // dispatches increment `batches_dispatched` / `events_dispatched`
+        // — `flush()`'s Phase 2 progress probe gates on those.
+        let stats = Arc::new(EventBusStats::default());
+
+        // Producer nonce. Persistent path → load-or-create
+        // the durable u64 so cross-process retries dedup against the
+        // prior incarnation. No path → per-process default (today's
+        // at-most-once-across-restart behavior).
+        let producer_nonce = match &config.producer_nonce_path {
+            Some(path) => crate::adapter::PersistentProducerNonce::load_or_create(path)
+                .map_err(|e| {
+                    AdapterError::Fatal(format!(
+                        "failed to load/create producer-nonce file at {}: {e}",
+                        path.display(),
+                    ))
+                })?
+                .nonce(),
+            None => crate::event::batch_process_nonce(),
+        };
+
         // Create batch workers for each shard
         let mut batch_workers: std::collections::HashMap<u16, ShardWorkers> =
             std::collections::HashMap::with_capacity(config.num_shards as usize);
@@ -217,6 +271,8 @@ impl EventBus {
         for shard_id in 0..config.num_shards {
             let (tx, rx) = mpsc::channel::<Vec<crate::event::InternalEvent>>(1024);
 
+            let next_sequence = Arc::new(AtomicU64::new(0));
+
             let batch = spawn_batch_worker(BatchWorkerParams {
                 shard_id,
                 rx,
@@ -225,6 +281,9 @@ impl EventBus {
                 config: config.batch.clone(),
                 adapter_timeout: config.adapter_timeout,
                 batch_retries: config.adapter_batch_retries,
+                next_sequence: next_sequence.clone(),
+                stats: stats.clone(),
+                producer_nonce,
             });
 
             let drain = spawn_drain_worker_for_shard(
@@ -235,7 +294,14 @@ impl EventBus {
                 drain_finalize_ready.clone(),
             );
 
-            batch_workers.insert(shard_id, ShardWorkers { batch, drain });
+            batch_workers.insert(
+                shard_id,
+                ShardWorkers {
+                    batch,
+                    drain,
+                    next_sequence,
+                },
+            );
             batch_senders.insert(shard_id, tx);
         }
 
@@ -250,7 +316,8 @@ impl EventBus {
             in_flight_ingests: AtomicU32::new(0),
             shutdown_completed: AtomicBool::new(false),
             config,
-            stats: EventBusStats::default(),
+            stats,
+            producer_nonce,
             scaling_monitor: parking_lot::Mutex::new(None),
         };
 
@@ -278,12 +345,27 @@ impl EventBus {
             return;
         }
 
+        // Idempotency check: no-op when a monitor is already
+        // installed. Otherwise a second `start_scaling_monitor`
+        // call would overwrite the slot without aborting the
+        // previous `JoinHandle` — the displaced task would keep
+        // running, holding a `Weak<EventBus>`, only exiting when it
+        // next observed `shutdown` or failed to upgrade. Two
+        // concurrent monitors would briefly compete for
+        // `evaluate_scaling`'s lock, doubling the metrics-tick
+        // wakeup rate.
+        let mut slot = self.scaling_monitor.lock();
+        if slot.is_some() {
+            tracing::debug!("start_scaling_monitor: monitor already running, skipping");
+            return;
+        }
+
         let weak = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
             run_scaling_monitor_via_weak(weak).await;
         });
 
-        *self.scaling_monitor.lock() = Some(handle);
+        *slot = Some(handle);
     }
 
     /// Internal: Add a new shard with its workers.
@@ -314,6 +396,8 @@ impl EventBus {
         // Step 2: spawn workers and register the sender.
         let (tx, rx) = mpsc::channel::<Vec<crate::event::InternalEvent>>(1024);
 
+        let next_sequence = Arc::new(AtomicU64::new(0));
+
         let batch = spawn_batch_worker(BatchWorkerParams {
             shard_id: new_id,
             rx,
@@ -322,6 +406,9 @@ impl EventBus {
             config: self.config.batch.clone(),
             adapter_timeout: self.config.adapter_timeout,
             batch_retries: self.config.adapter_batch_retries,
+            next_sequence: next_sequence.clone(),
+            stats: self.stats.clone(),
+            producer_nonce: self.producer_nonce,
         });
 
         self.batch_senders.write().insert(new_id, tx.clone());
@@ -334,15 +421,52 @@ impl EventBus {
             self.drain_finalize_ready.clone(),
         );
 
-        self.batch_workers
-            .lock()
-            .insert(new_id, ShardWorkers { batch, drain });
+        self.batch_workers.lock().insert(
+            new_id,
+            ShardWorkers {
+                batch,
+                drain,
+                next_sequence,
+            },
+        );
 
         // Step 3: workers are live — flip the shard to Active so
         // `select_shard` will route to it.
-        self.shard_manager
-            .activate_shard(new_id)
-            .map_err(|e| AdapterError::Fatal(e.to_string()))?;
+        //
+        // On `activate_shard` failure we mirror
+        // `remove_shard_internal`'s teardown: drop the sender,
+        // abort both join handles, unmap the provisioning entry,
+        // then return. Returning immediately would leave the new
+        // sender in `batch_senders`, both `JoinHandle`s in
+        // `batch_workers`, and the `Provisioning` mapper entry
+        // behind. The drain worker would loop indefinitely on an
+        // empty ring buffer (`with_shard` still finds the entry;
+        // `select_shard` skips it), and each retry of
+        // `add_shard_internal` would allocate a fresh id while the
+        // dead one squats.
+        if let Err(e) = self.shard_manager.activate_shard(new_id) {
+            tracing::warn!(
+                shard_id = new_id,
+                error = %e,
+                "activate_shard failed; rolling back provisioning state"
+            );
+            // 1. Drop the sender so the batch worker's `recv()`
+            //    eventually returns None.
+            self.batch_senders.write().remove(&new_id);
+            // 2. Abort and forget the worker handles. The drain
+            //    worker is held alive by the channel sender we
+            //    just dropped, but it's also pinned to a `with_shard`
+            //    poll loop on an empty buffer — abort it so it
+            //    exits regardless of channel state.
+            if let Some(workers) = self.batch_workers.lock().remove(&new_id) {
+                workers.drain.abort();
+                workers.batch.abort();
+            }
+            // 3. Unmap the Provisioning entry so the mapper can
+            //    reuse the slot on retry.
+            let _ = self.shard_manager.remove_shard(new_id);
+            return Err(AdapterError::Fatal(e.to_string()));
+        }
 
         // Update poll merger
         self.poll_merger.store(Arc::new(PollMerger::new(
@@ -388,19 +512,84 @@ impl EventBus {
             .remove_shard(shard_id)
             .map_err(|e| AdapterError::Fatal(e.to_string()))?;
 
-        // Step 3: drop worker handles. The drain worker should have
-        // exited (or be about to). The batch worker exits when its
-        // channel closes — once the drain worker drops its sender
-        // clone, the channel is closed.
-        self.batch_workers.lock().remove(&shard_id);
+        // Step 3: take ownership of the worker handles (move them
+        // OUT of the mutex map so we can `await` them — `await`
+        // consumes a `JoinHandle`). With the bus-side sender already
+        // dropped (step 1) and the shard unmapped (step 2), the
+        // drain worker exits at its next poll and drops its sender
+        // clone, which closes the BatchWorker's `rx`. The
+        // BatchWorker then flushes any pending `current_batch` and
+        // any events still buffered in the channel, dispatches them
+        // via the standard `dispatch_batch` path with their PROPER
+        // `next_sequence` values, and exits.
+        //
+        // Await both handles before constructing the stranded
+        // batch. Dropping the `JoinHandle`s without await would let
+        // a draining shard whose ring buffer transiently emptied
+        // finalize and remove while the BatchWorker still had
+        // events in its `current_batch` or in the mpsc channel —
+        // those events would be dispatched (the worker keeps
+        // running on a dropped handle) but their dispatch could
+        // overlap with this function's own stranded-flush, racing
+        // through JetStream dedup with their msg-ids. Awaiting
+        // first means we observe a quiescent worker before
+        // constructing the stranded batch.
+        let workers = self.batch_workers.lock().remove(&shard_id);
+        let final_next_sequence = if let Some(workers) = workers {
+            // Errors here mean the task panicked or was cancelled.
+            // We log and proceed — the stranded-flush still runs
+            // either way, and the atomic was last written under the
+            // worker's last successful flush so it remains a valid
+            // upper bound (just possibly stale by one batch's worth
+            // of events the worker never finished dispatching).
+            if let Err(e) = workers.batch.await {
+                tracing::warn!(
+                    shard_id,
+                    error = %e,
+                    "BatchWorker JoinHandle errored on await; \
+                     proceeding with stranded-flush using last \
+                     published next_sequence",
+                );
+            }
+            if let Err(e) = workers.drain.await {
+                tracing::warn!(
+                    shard_id,
+                    error = %e,
+                    "drain worker JoinHandle errored on await; \
+                     drain worker should have already exited via \
+                     `with_shard -> None`",
+                );
+            }
+            workers.next_sequence.load(AtomicOrdering::Acquire)
+        } else {
+            // No worker registered for this shard — shouldn't
+            // happen on the normal scale-down path, but defensively
+            // fall back to 0. This branch only activates if a
+            // caller manages to call `remove_shard_internal` for a
+            // shard that was never spawned (or already removed).
+            0
+        };
 
         // Step 4: flush the stranded ring-buffer events through the
-        // adapter in one shot. We construct a single `Batch` and
-        // push it through the same `dispatch_batch` helper the
-        // batch worker uses, so retry / timeout semantics match.
+        // adapter in one shot, using `final_next_sequence` (NOT 0)
+        // as the `sequence_start`. The stranded batch's msg-ids
+        // are `{nonce}:{shard_id}:{final_next_sequence}:{i}` —
+        // strictly past every msg-id the worker emitted. Using 0
+        // would collide with the worker's very first batch
+        // (`{nonce}:{shard_id}:0:{i}`), and JetStream's 2 min dedup
+        // window would silently drop the duplicate.
         if !stranded.is_empty() {
             let count = stranded.len();
-            let batch = crate::event::Batch::new(shard_id, stranded, 0);
+            // Use the bus's loaded producer nonce so the stranded
+            // batch's msg-ids share the same producer-identity
+            // segment as everything else this bus has emitted —
+            // critical for cross-process dedup.
+            let batch = crate::event::Batch::with_nonce(
+                shard_id,
+                stranded,
+                final_next_sequence,
+                self.producer_nonce,
+            );
             let dispatched = dispatch_batch(
                 &*self.adapter,
                 batch,
@@ -410,15 +599,23 @@ impl EventBus {
             )
             .await;
             if dispatched {
+                self.stats
+                    .batches_dispatched
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                self.stats
+                    .events_dispatched
+                    .fetch_add(count as u64, AtomicOrdering::Relaxed);
                 tracing::info!(
                     shard_id,
                     count,
+                    sequence_start = final_next_sequence,
                     "Removed shard: flushed stranded ring-buffer events to adapter"
                 );
             } else {
                 tracing::error!(
                     shard_id,
                     count,
+                    sequence_start = final_next_sequence,
                     "Removed shard: adapter rejected stranded ring-buffer events; \
                      events lost"
                 );
@@ -552,13 +749,19 @@ impl EventBus {
         };
 
         let total = events.len();
-        let success = self.shard_manager.ingest_raw_batch(events);
+        let (success, unrouted) = self.shard_manager.ingest_raw_batch(events);
         if success > 0 {
             self.stats
                 .events_ingested
                 .fetch_add(success as u64, AtomicOrdering::Relaxed);
         }
-        let dropped = total.saturating_sub(success);
+        // Subtract `unrouted` from the buffer-fullness drop count
+        // so the same event isn't tallied in both `events_unrouted`
+        // (bumped inside `ShardManager::ingest_raw_batch`) and
+        // `events_dropped` — using a plain `total - success` here
+        // would double-count unrouted events. Backpressure drops
+        // = events that reached a shard but failed to push.
+        let dropped = total.saturating_sub(success).saturating_sub(unrouted);
         if dropped > 0 {
             self.stats
                 .events_dropped
@@ -605,7 +808,25 @@ impl EventBus {
     /// Waits for all shard ring buffers to drain, then for the
     /// per-shard mpsc channels to drain, then for any pending batch
     /// inside each batch worker to time out and dispatch — and only
-    /// then calls `adapter.flush()`. Bounded by 5 s overall.
+    /// then calls `adapter.flush()`.
+    ///
+    /// # Latency bound
+    ///
+    /// The total wall-clock budget is the sum of three phases:
+    ///   * Phase 1 (ring-buffer drain): up to **5 s**.
+    ///   * Phase 2 (channel + pending-batch drain): up to
+    ///     `min(2 s, batch.max_delay × n_workers)` — capped at 2 s
+    ///     so a misconfigured `max_delay` cannot inflate the budget.
+    ///   * Phase 3 (`adapter.flush()` call): up to `adapter_timeout`
+    ///     (default **30 s**).
+    ///
+    /// Worst-case `flush()` runtime is therefore **~37 s under
+    /// default config**, NOT 5 s as an earlier doc-comment stated.
+    /// Callers wiring `flush()` into request-path latencies (HTTP
+    /// handler, RPC) MUST set `adapter_timeout` accordingly or run
+    /// the flush under their own outer timeout. The 5-second figure
+    /// describes Phase 1 only; the doc was misleading and is fixed
+    /// here.
     ///
     /// The previous implementation slept a single `batch.max_delay`
     /// (default 10 ms) after the ring buffers drained and immediately
@@ -633,18 +854,33 @@ impl EventBus {
             backoff = (backoff * 2).min(Duration::from_millis(10));
         }
 
-        // Phase 2: wait for the per-shard mpsc channels to be
-        // empty. We approximate this by sleeping `batch.max_delay`
-        // — the batch worker's `recv_timeout` cap — at least once
-        // per shard's worth of pending batch state, so any
-        // partially-filled batch has a chance to time out and
-        // dispatch.
+        // Phase 2: wait until every event ingested before flush()
+        // started has been handed to the adapter via `on_batch`.
+        // Snapshot the `events_ingested` counter at flush entry —
+        // that's our target. We then poll `events_dispatched` (sum
+        // of batch lengths from successful adapter dispatches) plus
+        // `events_dropped` (events the adapter rejected after retry
+        // exhaustion or that never made it past backpressure). The
+        // barrier is met when `events_dispatched + events_dropped >=
+        // target`: every pre-flush ingest is accounted for in one
+        // bucket or the other.
         //
-        // We can't directly observe channel depth (mpsc::Receiver
-        // doesn't expose len without consuming), so use the
-        // worst-case timing: `max_delay` per outstanding batch
-        // worker. With the default 10 ms `max_delay` and a
-        // typical 8-shard config, that's ~80 ms.
+        // This is a true delivery barrier — it doesn't rely on
+        // "no progress this window" heuristics that race a
+        // BatchWorker whose `batch_start` was set just before
+        // flush() ran. A progress gate that reads
+        // `batches_dispatched` only works if that counter is
+        // actually incremented on every dispatch, and Windows
+        // timer resolution alone has historically made any
+        // single-`max_delay`-sleep approach a frequent flake.
+        let target_ingested = self.stats.events_ingested.load(AtomicOrdering::Acquire);
+        let dropped_at_start = self.stats.events_dropped.load(AtomicOrdering::Acquire);
+
+        // Outer deadline still bounds Phase 2 in case a wedged
+        // adapter never returns. `max_delay * num_workers` is the
+        // worst-case shape (one partially-filled batch per worker,
+        // each waiting its full `max_delay` to time out), capped at
+        // 2 s — same upper bound as before.
         let n_workers = self.batch_workers.lock().len();
         let phase2_budget = self
             .config
@@ -653,18 +889,40 @@ impl EventBus {
             .saturating_mul(n_workers.max(1) as u32);
         let phase2_deadline =
             tokio::time::Instant::now() + phase2_budget.min(Duration::from_secs(2));
-        // Sleep one `max_delay` window at a time. After each sleep,
-        // if the ring buffers are still empty (no late drain refilled
-        // them), we've given the in-flight batches at least one
-        // `max_delay`-sized opportunity to time out and dispatch —
-        // good enough to declare phase 2 complete. Without this
-        // early-break, every `flush()` always paid the full budget
-        // (up to 2s) even on an idle system.
-        while tokio::time::Instant::now() < phase2_deadline {
-            tokio::time::sleep(self.config.batch.max_delay).await;
-            if self.shard_manager.all_shards_empty() {
+
+        // Inner poll cadence: re-check the counters every 1 ms (or
+        // `max_delay / 16`, whichever is larger). The fast cadence
+        // means we exit promptly once the BatchWorker dispatches,
+        // rather than waking exactly once per `max_delay` and
+        // potentially racing the dispatch by a few ms.
+        let poll_interval = (self.config.batch.max_delay / 16).max(Duration::from_millis(1));
+        loop {
+            let dispatched = self.stats.events_dispatched.load(AtomicOrdering::Acquire);
+            let dropped = self.stats.events_dropped.load(AtomicOrdering::Acquire);
+            // `dropped - dropped_at_start` is the number of events
+            // dropped *during* flush() (e.g. an adapter that
+            // exhausted retries on a pre-flush ingest). Those count
+            // toward the barrier — the corresponding `events_ingested`
+            // bumps already happened pre-flush so the dispatched
+            // bucket and the dropped-during-flush bucket together
+            // must catch up to `target_ingested` for the barrier to
+            // be met.
+            let dropped_during_flush = dropped.saturating_sub(dropped_at_start);
+            if dispatched.saturating_add(dropped_during_flush) >= target_ingested
+                && self.shard_manager.all_shards_empty()
+            {
                 break;
             }
+            if tokio::time::Instant::now() >= phase2_deadline {
+                tracing::warn!(
+                    target = target_ingested,
+                    dispatched,
+                    dropped = dropped.saturating_sub(dropped_at_start),
+                    "flush: Phase 2 deadline reached before all ingested events were dispatched",
+                );
+                break;
+            }
+            tokio::time::sleep(poll_interval).await;
         }
 
         // Phase 3: tell the adapter to flush whatever it has
@@ -702,12 +960,78 @@ impl EventBus {
     /// flag could leave events the drain worker pushed *after* its
     /// `try_recv` sweep stranded in the channel.
     pub async fn shutdown(self) -> Result<(), AdapterError> {
-        // 1. Signal shutdown. SeqCst pairs with `try_enter_ingest` —
-        // any producer that observed the previous `false` and is
-        // mid-push has its `in_flight_ingests` increment ordered
-        // before this store, and so will be visible to the wait
-        // below.
-        self.shutdown.store(true, AtomicOrdering::SeqCst);
+        self.shutdown_via_ref().await
+    }
+
+    /// Shutdown via shared reference — same semantics as
+    /// [`shutdown`](Self::shutdown), but does not consume `self`.
+    ///
+    /// Useful for callers that hold the bus behind `Arc<EventBus>`
+    /// (e.g., the SDK, where `subscribe` perpetuates an Arc clone
+    /// into every `EventStream`) and therefore cannot satisfy
+    /// `Arc::try_unwrap`. Idempotent: the first caller does the
+    /// work; concurrent or subsequent callers wait for the
+    /// `shutdown_completed` flag and return `Ok(())`.
+    pub async fn shutdown_via_ref(&self) -> Result<(), AdapterError> {
+        // 1. CAS the shutdown flag false→true. SeqCst pairs with
+        // `try_enter_ingest`'s shutdown check — any producer that
+        // observed the previous `false` and is mid-push has its
+        // `in_flight_ingests` increment ordered before this store
+        // (the CAS-success branch is a release of the new `true`),
+        // and so will be visible to the wait below.
+        //
+        // If the CAS loses (someone else — typically a concurrent
+        // call or `Drop` — already flipped the flag), spin until
+        // they finish. We can't run the rest of the body because
+        // workers/senders may already be partially torn down.
+        if self
+            .shutdown
+            .compare_exchange(false, true, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
+            .is_err()
+        {
+            // Bound the wait so a `Drop`-only path (which sets
+            // `shutdown=true` but never sets `shutdown_completed`)
+            // doesn't spin forever.
+            //
+            // Distinguish the two outcomes for callers. If
+            // `shutdown_completed` flips inside the window, we
+            // return `Ok(())` and the caller can be sure the first
+            // caller finished. If the deadline fires first, we
+            // surface `AdapterError::Transient(_)` — the bus IS
+            // being shut down (the flag is set), but completion is
+            // not yet observable; the caller can treat this as
+            // "another thread is working on it, retry the
+            // is_shutdown_completed() poll if you need a hard
+            // barrier."
+            //
+            // Returning `Ok(())` in both branches would let
+            // shutdown-done assumptions silently drift under a slow
+            // adapter (`adapter_timeout` default 30 s > the 10 s
+            // spin deadline), letting subsequent code observe a
+            // partially-shut-down bus.
+            // 10s in production builds; overridable via the
+            // `_TEST_OVERRIDE_SHUTDOWN_VIA_REF_DEADLINE` thread-local
+            // in test builds so the slow-first-caller test doesn't
+            // need to wall-clock-wait for the full deadline. The
+            // override is `#[cfg(test)]`-only; production cargo
+            // builds compile out the override entirely.
+            let deadline_dur = shutdown_via_ref_spin_deadline();
+            let deadline = std::time::Instant::now() + deadline_dur;
+            while !self.shutdown_completed.load(AtomicOrdering::Acquire) {
+                if std::time::Instant::now() >= deadline {
+                    return Err(AdapterError::Transient(
+                        "shutdown_via_ref: another caller is mid-shutdown; \
+                         deadline elapsed before shutdown_completed \
+                         flipped. The bus IS shutting down; poll \
+                         is_shutdown_completed() if you need a hard \
+                         barrier."
+                            .into(),
+                    ));
+                }
+                tokio::task::yield_now().await;
+            }
+            return Ok(());
+        }
 
         // 1a. Wait for in-flight ingests to drain BEFORE the drain
         // workers do their final ring-buffer sweep. Otherwise a
@@ -721,14 +1045,41 @@ impl EventBus {
         // increment) or completes its single non-blocking push and
         // decrements. Both paths take constant time; the total
         // wait is O(producer threads).
+        //
+        // The "every observed in-flight ingest completes before
+        // the final sweep" property holds under normal conditions,
+        // but the 5-second deadline below forces the gate open
+        // even when producers are still in their push window. A
+        // producer that has incremented `in_flight_ingests` (and
+        // so observed `shutdown=false`) but whose push is delayed
+        // past the deadline (heavy contention, debugger hit, etc.)
+        // will complete its push AFTER the final sweep — its event
+        // lands in the ring buffer and is never read. The deadline
+        // exists so a stuck producer can't deadlock shutdown
+        // indefinitely; the trade-off is documented data loss past
+        // the 5 s window, surfaced via the `events_dropped` stat
+        // (so the loss is observable to operators) and the `WARN`
+        // log below (so it's diagnosable). The "no stranding"
+        // promise on the happy path stands; the deadline path is
+        // the documented escape hatch.
         let in_flight_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while self.in_flight_ingests.load(AtomicOrdering::SeqCst) > 0 {
             if std::time::Instant::now() >= in_flight_deadline {
+                let stranded = self.in_flight_ingests.load(AtomicOrdering::SeqCst);
                 tracing::warn!(
-                    in_flight = self.in_flight_ingests.load(AtomicOrdering::SeqCst),
-                    "shutdown timed out waiting for in-flight ingests; \
-                     proceeding with potential event loss"
+                    in_flight = stranded,
+                    "shutdown timed out waiting for in-flight ingests after 5s; \
+                     proceeding — up to {} events may strand in the ring buffer \
+                     past final drain (documented data-loss path)",
+                    stranded,
                 );
+                // Surface the stranded count via `events_dropped`
+                // so SDK consumers reading `bus.stats()` see the
+                // loss, matching the bus's at-least-once-or-
+                // surfaced-as-dropped contract.
+                self.stats
+                    .events_dropped
+                    .fetch_add(stranded as u64, AtomicOrdering::Relaxed);
                 break;
             }
             tokio::task::yield_now().await;
@@ -756,11 +1107,21 @@ impl EventBus {
         //    to 10k events) from its ring buffer, sends it on the
         //    channel, and exits. After this loop, every event in
         //    the ring buffers has been pushed to its channel.
-        let mut batch_handles = Vec::with_capacity(workers.len());
-        for (_shard_id, ShardWorkers { batch, drain }) in workers {
-            let _ = drain.await;
-            batch_handles.push(batch);
-        }
+        //
+        // `join_all` lets the runtime overlap drain handles. A
+        // sequential `for ... { drain.await; }` would serialize
+        // shutdown wall-clock as N×T instead of max(T), which on
+        // the default 1024-shard config × per-shard final-drain
+        // time makes shutdown painful.
+        let (drains, batch_handles): (Vec<_>, Vec<_>) = workers
+            .into_iter()
+            .map(|(_shard_id, ShardWorkers { batch, drain, .. })| (drain, batch))
+            .unzip();
+        // We don't care about individual results — `JoinError` from
+        // a panicking drain worker would already have surfaced
+        // through `tracing::error` inside the worker itself. Just
+        // wait for all of them to terminate.
+        let _ = futures::future::join_all(drains).await;
 
         // 3. Drop the original senders so the channels close once
         //    drain-worker sender clones (already dropped above)
@@ -770,9 +1131,9 @@ impl EventBus {
 
         // 4. Await batch workers. They drain their channel until
         //    `recv() = None`, flush, and exit.
-        for handle in batch_handles {
-            let _ = handle.await;
-        }
+        //
+        // Same parallelization as the drain phase.
+        let _ = futures::future::join_all(batch_handles).await;
 
         // Flush and shutdown adapter (with timeout to prevent hanging)
         let timeout = self.config.adapter_timeout;
@@ -789,6 +1150,20 @@ impl EventBus {
         // Mark shutdown as completed so Drop knows not to warn.
         self.shutdown_completed.store(true, AtomicOrdering::Release);
         result
+    }
+
+    /// True once `shutdown` / `shutdown_via_ref` has signaled — does
+    /// not imply the shutdown work has finished. Use
+    /// [`is_shutdown_completed`](Self::is_shutdown_completed) for
+    /// completion.
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(AtomicOrdering::Acquire)
+    }
+
+    /// True once `shutdown` / `shutdown_via_ref` has fully drained
+    /// workers and the adapter shutdown returned (success path only).
+    pub fn is_shutdown_completed(&self) -> bool {
+        self.shutdown_completed.load(AtomicOrdering::Acquire)
     }
 
     /// Get shard metrics (if dynamic scaling is enabled).
@@ -812,15 +1187,71 @@ impl EventBus {
     }
 
     /// Manually trigger a scale-down (for testing or manual intervention).
-    pub fn manual_scale_down(&self, count: u16) -> Result<Vec<u16>, AdapterError> {
+    ///
+    /// Marks `count` shards as `Draining`, waits for them to empty,
+    /// finalizes them to `Stopped`, and removes them from the
+    /// routing table — mirroring the scaling monitor's per-tick
+    /// finalize loop. Returns the IDs of shards that were
+    /// successfully drained AND removed (subset of those marked
+    /// Draining if any failed to empty within the deadline).
+    ///
+    /// Drives the full scale-down lifecycle synchronously: a
+    /// plain `mapper.scale_down` call marks shards `Draining` but
+    /// does NOT finalize them — finalization is the scaling
+    /// monitor's responsibility. Bus configs without an active
+    /// monitor (or callers that shut down before the monitor's
+    /// next tick) would otherwise lose any events queued in those
+    /// shards' ring buffers.
+    pub async fn manual_scale_down(&self, count: u16) -> Result<Vec<u16>, AdapterError> {
         let mapper = self
             .shard_manager
             .mapper()
             .ok_or_else(|| AdapterError::Fatal("Dynamic scaling not enabled".into()))?;
 
-        mapper
+        let drained_ids = mapper
             .scale_down(count)
-            .map_err(|e| AdapterError::Fatal(e.to_string()))
+            .map_err(|e| AdapterError::Fatal(e.to_string()))?;
+
+        // `finalize_draining` requires the shard to have been
+        // Draining for >100ms with an empty ring buffer and no
+        // pushes since drain start. Poll until every requested
+        // shard finalizes, capped by an outer deadline so a wedged
+        // producer can't pin this method forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut finalized: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        let target: std::collections::HashSet<u16> = drained_ids.iter().copied().collect();
+
+        while finalized.len() < target.len() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let stopped = mapper.finalize_draining();
+            for shard_id in stopped {
+                if target.contains(&shard_id) {
+                    let _ = self.remove_shard_internal(shard_id).await;
+                    finalized.insert(shard_id);
+                }
+            }
+        }
+
+        // Surface partial success at WARN level. The return shape
+        // is preserved for compat (changing to `(Vec, Vec)` would
+        // break the existing callers + test) so a smaller-than-
+        // target list could otherwise be silently mistaken for full
+        // success; the WARN log gives operations tooling something
+        // to alert on.
+        if finalized.len() < target.len() {
+            let still_draining: Vec<u16> = target.difference(&finalized).copied().collect();
+            tracing::warn!(
+                requested = target.len(),
+                finalized = finalized.len(),
+                still_draining = ?still_draining,
+                "manual_scale_down deadline elapsed before all targeted \
+                 shards finalized — events still in-flight on the listed \
+                 shards. They will finalize on the next scaling-monitor \
+                 tick or on shutdown."
+            );
+        }
+
+        Ok(finalized.into_iter().collect())
     }
 }
 
@@ -872,12 +1303,68 @@ impl Drop for EventBus {
     }
 }
 
-/// Body of the scaling monitor task spawned by
-/// `EventBus::start_scaling_monitor`. Holds a `Weak<EventBus>` and
-/// upgrades it once per tick so the spawned task does not keep the
-/// bus alive past the caller's last `Arc` reference. Without this,
-/// `Arc::try_unwrap` (which the consuming `shutdown(self)` API
-/// requires) would fail forever.
+/// Spin deadline for the second-caller path in
+/// `shutdown_via_ref`. 10s in production.
+#[cfg(not(test))]
+fn shutdown_via_ref_spin_deadline() -> std::time::Duration {
+    std::time::Duration::from_secs(10)
+}
+
+/// Test-only override. Stored as milliseconds; `0` (the default)
+/// means "use the production 10s". Set via
+/// [`set_shutdown_via_ref_spin_deadline_for_test`] from inside a
+/// test that needs to exercise the deadline-elapsed path without
+/// wall-clock-waiting the full 10s.
+///
+/// This is a global atomic shared across all tests in the
+/// `cargo test --lib` binary. If two tests touched it concurrently,
+/// one's override would leak into the other's expectations. Tests
+/// that use the override MUST take the
+/// [`SHUTDOWN_DEADLINE_OVERRIDE_GUARD`] mutex for the duration of
+/// their override-setter / read window — see
+/// [`set_shutdown_via_ref_spin_deadline_for_test`].
+#[cfg(test)]
+static SHUTDOWN_VIA_REF_DEADLINE_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Serializes access to the deadline override so concurrent tests
+/// can't observe each other's transient values. Tests that override
+/// the deadline take this mutex via
+/// [`shutdown_deadline_override_lock`] and hold the guard until
+/// they reset the override to 0.
+///
+/// Uses `tokio::sync::Mutex` rather than `std::sync::Mutex` so
+/// the guard can legitimately be held across `.await` points
+/// while the guarded test runs (clippy::await_holding_lock would
+/// otherwise fire on the std variant — and rightly so for
+/// production code).
+#[cfg(test)]
+static SHUTDOWN_DEADLINE_OVERRIDE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Acquire the guard mutex protecting the deadline-override
+/// static. Tests touching the override hold the returned guard
+/// across both the set and the reset, so concurrent tests
+/// observe a consistent default.
+#[cfg(test)]
+pub(crate) async fn shutdown_deadline_override_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    SHUTDOWN_DEADLINE_OVERRIDE_GUARD.lock().await
+}
+
+#[cfg(test)]
+fn shutdown_via_ref_spin_deadline() -> std::time::Duration {
+    let ms = SHUTDOWN_VIA_REF_DEADLINE_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if ms == 0 {
+        std::time::Duration::from_secs(10)
+    } else {
+        std::time::Duration::from_millis(ms)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_shutdown_via_ref_spin_deadline_for_test(ms: u64) {
+    SHUTDOWN_VIA_REF_DEADLINE_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
 async fn run_scaling_monitor_via_weak(weak: std::sync::Weak<EventBus>) {
     // Refresh `interval` from the policy on every tick. The previous
     // version cached it once at task start, so any future runtime
@@ -903,7 +1390,16 @@ async fn run_scaling_monitor_via_weak(weak: std::sync::Weak<EventBus>) {
             None => break,
         };
 
-        if bus.shutdown.load(AtomicOrdering::Relaxed) {
+        // SeqCst to match the writer side (`EventBus::shutdown` /
+        // `Drop`). The Acquire/Release handshake on
+        // `drain_finalize_ready` already provides the load-bearing
+        // happens-before today — but a future code change that
+        // piggybacks on `shutdown`'s ordering (e.g. a producer that
+        // observes shutdown without going through
+        // `try_enter_ingest`) would silently break under Relaxed.
+        // Aligning the read-side ordering with the writer-side
+        // SeqCst is a one-instruction tax for the safety.
+        if bus.shutdown.load(AtomicOrdering::SeqCst) {
             break;
         }
 
@@ -1021,6 +1517,25 @@ struct BatchWorkerParams {
     config: BatchConfig,
     adapter_timeout: Duration,
     batch_retries: u32,
+    /// Bus-owned mirror of `BatchWorker::next_sequence`. The worker
+    /// stores its post-flush sequence here on every dispatch so the
+    /// bus can read it after the worker exits — see
+    /// `ShardWorkers::next_sequence` for the consumer side.
+    next_sequence: Arc<AtomicU64>,
+    /// Bus-level stats. The worker increments
+    /// `batches_dispatched` and `events_dispatched` after every
+    /// successful `dispatch_batch`. Both must actually be
+    /// incremented here, otherwise `flush()`'s Phase 2 progress
+    /// probe would always observe zero progress and early-break
+    /// after a single `max_delay` window — racing the
+    /// BatchWorker's first `recv_timeout` and flaking on
+    /// Windows-class timer resolution.
+    stats: Arc<EventBusStats>,
+    /// Producer nonce stamped on every batch the worker emits.
+    /// Bus-loaded from the persistent path when
+    /// `producer_nonce_path` is configured, otherwise from the
+    /// per-process default.
+    producer_nonce: u64,
 }
 
 fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
@@ -1032,9 +1547,12 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
         config,
         adapter_timeout,
         batch_retries,
+        next_sequence,
+        stats,
+        producer_nonce,
     } = params;
     tokio::spawn(async move {
-        let mut worker = BatchWorker::new(shard_id, config.clone());
+        let mut worker = BatchWorker::new(shard_id, config.clone(), next_sequence, producer_nonce);
 
         loop {
             // Wait for events with timeout. The batch worker exits
@@ -1048,6 +1566,7 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
             match tokio::time::timeout(recv_timeout, rx.recv()).await {
                 Ok(Some(events)) => {
                     if let Some(batch) = worker.add_events(events) {
+                        let batch_len = batch.len() as u64;
                         if dispatch_batch(
                             &*adapter,
                             batch,
@@ -1057,6 +1576,12 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                         )
                         .await
                         {
+                            stats
+                                .batches_dispatched
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                            stats
+                                .events_dispatched
+                                .fetch_add(batch_len, AtomicOrdering::Relaxed);
                             if let Some(shard_ref) = shard_manager.shard(shard_id) {
                                 shard_ref.lock().record_batch_dispatch();
                             }
@@ -1068,14 +1593,23 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                     if worker.has_pending() {
                         let batch = worker.flush();
                         if !batch.is_empty() {
-                            dispatch_batch(
+                            let batch_len = batch.len() as u64;
+                            if dispatch_batch(
                                 &*adapter,
                                 batch,
                                 shard_id,
                                 adapter_timeout,
                                 batch_retries,
                             )
-                            .await;
+                            .await
+                            {
+                                stats
+                                    .batches_dispatched
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                                stats
+                                    .events_dispatched
+                                    .fetch_add(batch_len, AtomicOrdering::Relaxed);
+                            }
                         }
                     }
                     break;
@@ -1083,6 +1617,7 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                 Err(_) => {
                     // Timeout - check if we need to flush
                     if let Some(batch) = worker.add_events(vec![]) {
+                        let batch_len = batch.len() as u64;
                         if dispatch_batch(
                             &*adapter,
                             batch,
@@ -1092,6 +1627,12 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                         )
                         .await
                         {
+                            stats
+                                .batches_dispatched
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                            stats
+                                .events_dispatched
+                                .fetch_add(batch_len, AtomicOrdering::Relaxed);
                             if let Some(shard_ref) = shard_manager.shard(shard_id) {
                                 shard_ref.lock().record_batch_dispatch();
                             }
@@ -1133,8 +1674,15 @@ fn spawn_drain_worker_for_shard(
         let mut scratch: Vec<crate::event::InternalEvent> = Vec::with_capacity(STEADY_BATCH);
 
         loop {
-            // Relaxed: same rationale as ingest — see `EventBus::ingest`.
-            if shutdown.load(AtomicOrdering::Relaxed) {
+            // SeqCst to match the writer side (`EventBus::shutdown` /
+            // `Drop`). `try_enter_ingest` itself uses SeqCst, and
+            // the Acquire/Release handshake on
+            // `drain_finalize_ready` (below) is what actually makes
+            // the producer-push happen-before visible. Aligning to
+            // SeqCst here makes the contract robust to future
+            // producer-side changes that might piggyback on
+            // `shutdown`'s ordering.
+            if shutdown.load(AtomicOrdering::SeqCst) {
                 // Before doing the final sweep, wait for `shutdown()`
                 // to release the finalize gate. The gate is set only
                 // after the in-flight ingest counter reaches zero,
@@ -1344,6 +1892,60 @@ mod tests {
         bus.shutdown().await.unwrap();
     }
 
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #82: previously
+    /// `manual_scale_down` only called `mapper.scale_down(count)`,
+    /// which marks shards as `Draining` but does NOT finalize them.
+    /// Bus configs without an active scaling monitor (or callers
+    /// shutting down before the monitor's next tick) lost any
+    /// events queued in the drained shards' ring buffers because
+    /// `remove_shard_internal` was never invoked. The fix runs the
+    /// full lifecycle synchronously: scale_down → poll for empty →
+    /// finalize_draining → remove_shard_internal.
+    ///
+    /// We pin this by scaling up, manually scaling down, and
+    /// asserting that `num_shards` actually decreases — pre-fix
+    /// the count would still reflect the Draining shards.
+    #[tokio::test]
+    async fn manual_scale_down_finalizes_and_removes_drained_shards() {
+        let policy = ScalingPolicy {
+            min_shards: 2,
+            max_shards: 8,
+            cooldown: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .scaling(policy)
+            .build()
+            .unwrap();
+        let bus = EventBus::new(config).await.unwrap();
+
+        // Scale up to 4, then back down to 2.
+        let added = bus.manual_scale_up(2).await.unwrap();
+        assert_eq!(added.len(), 2);
+        assert_eq!(bus.num_shards(), 4);
+
+        let removed = bus.manual_scale_down(2).await.unwrap();
+        assert_eq!(
+            removed.len(),
+            2,
+            "manual_scale_down must complete the lifecycle for both \
+             requested shards (mark Draining → wait → finalize → remove)"
+        );
+
+        // Pre-fix: `num_shards` would still be 4 because shards
+        // were only marked Draining (and the routing-table removal
+        // path never ran). Post-fix: it's back to 2.
+        assert_eq!(
+            bus.num_shards(),
+            2,
+            "drained shards must be removed from the routing table"
+        );
+
+        bus.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_shard_metrics() {
         let policy = ScalingPolicy::default();
@@ -1543,6 +2145,252 @@ mod tests {
         }
     }
 
+    /// CR-23: pin that `EventBus::shutdown` actually invokes the
+    /// adapter's `flush()` and `shutdown()` methods. The existing
+    /// `sdk/tests/shutdown_regression.rs` covers BUG #80/#81's
+    /// "shutdown runs even with outstanding Arc clones" property
+    /// using a memory adapter whose `flush`/`shutdown` are no-ops
+    /// — so a regression that elided the adapter calls would still
+    /// pass. This test uses a recording adapter that increments
+    /// per-method counters; we assert flush AND shutdown both fired
+    /// exactly once after a clean `bus.shutdown().await`.
+    ///
+    /// The fix in BUG #80 routes `Net::shutdown` through
+    /// `shutdown_via_ref`, which in turn calls
+    /// `self.adapter.flush()` and `self.adapter.shutdown()` once
+    /// each. CR-23 pins this contract at the bus layer so an
+    /// inadvertent regression at the SDK or adapter wrapper layer
+    /// can be caught without an integration setup.
+    #[tokio::test]
+    async fn cr23_shutdown_invokes_adapter_flush_and_shutdown_exactly_once() {
+        struct RecordingAdapter {
+            on_batch_calls: Arc<AtomicU64>,
+            flush_calls: Arc<AtomicU64>,
+            shutdown_calls: Arc<AtomicU64>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::adapter::Adapter for RecordingAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+                self.on_batch_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                self.flush_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                self.shutdown_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _shard_id: u16,
+                _from_id: Option<&str>,
+                _limit: usize,
+            ) -> Result<crate::adapter::ShardPollResult, AdapterError> {
+                Ok(crate::adapter::ShardPollResult::empty())
+            }
+            fn name(&self) -> &'static str {
+                "cr23-recording"
+            }
+            async fn is_healthy(&self) -> bool {
+                true
+            }
+        }
+
+        let on_batch = Arc::new(AtomicU64::new(0));
+        let flush = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicU64::new(0));
+        let adapter: Box<dyn crate::adapter::Adapter> = Box::new(RecordingAdapter {
+            on_batch_calls: on_batch.clone(),
+            flush_calls: flush.clone(),
+            shutdown_calls: shutdown.clone(),
+        });
+
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .build()
+            .unwrap();
+        let bus = EventBus::new_with_adapter(config, adapter).await.unwrap();
+
+        // Drive a small burst so on_batch fires at least once —
+        // pins that the adapter is wired up correctly. The
+        // load-bearing assertions below are on flush and shutdown.
+        for i in 0..16 {
+            let _ = bus.ingest(Event::new(json!({"i": i})));
+        }
+
+        // Pre-CR-23 a regression that elided one of these would
+        // pass `shutdown_regression.rs::shutdown_runs_even_with_outstanding_event_stream`
+        // because the memory adapter's flush/shutdown are no-ops.
+        // Here the recording adapter makes the contract observable.
+        bus.shutdown().await.unwrap();
+
+        assert!(
+            on_batch.load(AtomicOrdering::SeqCst) > 0,
+            "sanity: on_batch must have fired at least once"
+        );
+        assert_eq!(
+            flush.load(AtomicOrdering::SeqCst),
+            1,
+            "CR-23 regression: shutdown MUST call adapter.flush() exactly once"
+        );
+        assert_eq!(
+            shutdown.load(AtomicOrdering::SeqCst),
+            1,
+            "CR-23 regression: shutdown MUST call adapter.shutdown() exactly once"
+        );
+    }
+
+    /// CR-25: pin that a SECOND caller of `shutdown_via_ref` whose
+    /// CAS loses (because a first caller already flipped the
+    /// `shutdown` flag) and whose deadline elapses BEFORE the
+    /// first caller sets `shutdown_completed=true` returns
+    /// `AdapterError::Transient(_)` — NOT a silent `Ok(())`.
+    ///
+    /// Pre-CR-25 both branches returned `Ok`. A caller that lost
+    /// the CAS race had no way to distinguish "first caller
+    /// finished shutdown" from "deadline timed out mid-shutdown."
+    /// Under a slow adapter (`adapter_timeout` default 30s >
+    /// the 10s spin deadline), the second caller silently saw
+    /// `Ok` while the bus was still mid-shutdown — letting
+    /// subsequent code observe a partially-shut-down bus.
+    ///
+    /// We use a slow first caller (sleeps inside `flush()`)
+    /// and override the spin deadline to a few ms so the test
+    /// runs fast.
+    #[tokio::test]
+    async fn cr25_second_caller_returns_transient_when_deadline_elapses() {
+        struct SlowFlushAdapter {
+            // Block flush() for this long. The first caller
+            // gets stuck here while the second caller's spin
+            // deadline elapses.
+            flush_delay: std::time::Duration,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::adapter::Adapter for SlowFlushAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                tokio::time::sleep(self.flush_delay).await;
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _shard_id: u16,
+                _from_id: Option<&str>,
+                _limit: usize,
+            ) -> Result<crate::adapter::ShardPollResult, AdapterError> {
+                Ok(crate::adapter::ShardPollResult::empty())
+            }
+            fn name(&self) -> &'static str {
+                "cr25-slow-flush"
+            }
+            async fn is_healthy(&self) -> bool {
+                true
+            }
+        }
+
+        // Cubic P2: serialize access to the global deadline
+        // override so concurrent tests don't interfere. Hold the
+        // guard until the override is reset to 0 below.
+        let _override_guard = super::shutdown_deadline_override_lock().await;
+
+        // Override the second-caller spin deadline to a short
+        // value so the test doesn't wall-clock-wait 10s. Production
+        // builds use the 10s default (the cfg(test) override is
+        // compiled out).
+        super::set_shutdown_via_ref_spin_deadline_for_test(50);
+
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .adapter_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        // First caller's flush() sleeps 500ms — far longer than
+        // the 50ms spin deadline.
+        let adapter: Box<dyn crate::adapter::Adapter> = Box::new(SlowFlushAdapter {
+            flush_delay: std::time::Duration::from_millis(500),
+        });
+        let bus = Arc::new(EventBus::new_with_adapter(config, adapter).await.unwrap());
+
+        // Spawn the FIRST caller — it wins the CAS and proceeds
+        // into the slow flush. We don't await it; we want it
+        // running in parallel.
+        let bus_first = Arc::clone(&bus);
+        let first_caller = tokio::spawn(async move { bus_first.shutdown_via_ref().await });
+
+        // Cubic P2: poll `is_shutdown()` until the first caller
+        // has set the flag, instead of a fixed sleep. This makes
+        // the test scheduler-independent — we proceed as soon as
+        // the first caller has won the CAS, regardless of how
+        // tokio happens to schedule things. Bounded by a 1s
+        // timeout so a regression that prevents `shutdown_via_ref`
+        // from setting the flag doesn't hang the test.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !bus.is_shutdown() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first caller did not set shutdown flag within 1s");
+
+        // The second caller's CAS will fail; it enters the spin
+        // and times out at 50ms.
+        let start = std::time::Instant::now();
+        let second_result = bus.shutdown_via_ref().await;
+        let elapsed = start.elapsed();
+
+        // Reset the override for other tests, then drop the guard.
+        super::set_shutdown_via_ref_spin_deadline_for_test(0);
+
+        // CR-25 contract: the second caller MUST get a Transient
+        // error, not a silent Ok.
+        let err = second_result.expect_err(
+            "CR-25 regression: second caller MUST surface AdapterError::Transient \
+             when its deadline elapses, NOT a silent Ok",
+        );
+        match err {
+            AdapterError::Transient(msg) => {
+                assert!(
+                    msg.contains("deadline elapsed") || msg.contains("mid-shutdown"),
+                    "error message must reference the deadline path; got: {msg}"
+                );
+            }
+            other => panic!("expected Transient, got {:?}", other),
+        }
+
+        // Sanity: the second caller's elapsed time is bounded by
+        // the override (50ms) + scheduler slop. If this is
+        // anywhere near the production 10s, the cfg(test)
+        // override path broke.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "second caller took {elapsed:?}; the cfg(test) deadline override \
+             broke if this is near the 10s production default"
+        );
+
+        // Wait for the first caller to finish. Even though it
+        // took the slow path, the bus IS shutting down and will
+        // eventually complete.
+        let _ = first_caller.await.unwrap();
+        assert!(bus.is_shutdown_completed());
+    }
+
     /// Regression: BUG_REPORT.md #6 — `shutdown()` must deliver every
     /// successfully-ingested event to the adapter before returning.
     /// Pins the broader durability contract that the
@@ -1654,6 +2502,379 @@ mod tests {
             "flush() returned but only {delivered} of {successes} \
              events reached the adapter (#16); flush waited {:?}",
             elapsed
+        );
+
+        bus.shutdown().await.unwrap();
+    }
+
+    /// Regression for BUG #56 (Phase 1): when configured with a
+    /// persistent `producer_nonce_path`, two bus instances launched
+    /// against the same path stamp the SAME nonce on every emitted
+    /// batch. JetStream / Redis adapters key dedup on this nonce, so
+    /// a producer that crashed mid-batch and restarted (within the
+    /// backend's dedup window) issues retries with the same msg-ids
+    /// and the backend correctly recognizes them as duplicates.
+    ///
+    /// Pre-fix the per-process nonce regenerated on every startup,
+    /// so post-crash retries wrote NEW msg-ids and the backend
+    /// persisted the partial-batch's accepted half twice.
+    #[tokio::test]
+    async fn persistent_producer_nonce_survives_bus_restart() {
+        // Use a per-test temp file so concurrent runs don't collide.
+        let mut nonce_path = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        nonce_path.push(format!("net-test-bus-nonce-{pid}-{nanos}"));
+
+        let make_config = |path: &std::path::Path| {
+            EventBusConfig::builder()
+                .num_shards(1)
+                .ring_buffer_capacity(1024)
+                .producer_nonce_path(path)
+                .build()
+                .unwrap()
+        };
+
+        // First bus: ingest one event. Read its nonce off the
+        // adapter-bound batch via a recording adapter.
+        struct NonceRecordingAdapter {
+            nonce: Arc<parking_lot::Mutex<Option<u64>>>,
+        }
+        #[async_trait::async_trait]
+        impl crate::adapter::Adapter for NonceRecordingAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+                *self.nonce.lock() = Some(batch.process_nonce);
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _: u16,
+                _: Option<&str>,
+                _: usize,
+            ) -> Result<crate::adapter::ShardPollResult, AdapterError> {
+                Ok(crate::adapter::ShardPollResult::empty())
+            }
+            fn name(&self) -> &'static str {
+                "nonce-recording"
+            }
+        }
+
+        let nonce_first_run = Arc::new(parking_lot::Mutex::new(None));
+        {
+            let bus = EventBus::new_with_adapter(
+                make_config(&nonce_path),
+                Box::new(NonceRecordingAdapter {
+                    nonce: nonce_first_run.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+            bus.ingest(Event::new(json!({"i": 1}))).unwrap();
+            bus.flush().await.unwrap();
+            bus.shutdown().await.unwrap();
+        }
+
+        let nonce_second_run = Arc::new(parking_lot::Mutex::new(None));
+        {
+            let bus = EventBus::new_with_adapter(
+                make_config(&nonce_path),
+                Box::new(NonceRecordingAdapter {
+                    nonce: nonce_second_run.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+            bus.ingest(Event::new(json!({"i": 2}))).unwrap();
+            bus.flush().await.unwrap();
+            bus.shutdown().await.unwrap();
+        }
+
+        let n_a = nonce_first_run
+            .lock()
+            .expect("first bus must have dispatched a batch");
+        let n_b = nonce_second_run
+            .lock()
+            .expect("second bus must have dispatched a batch");
+        assert_eq!(
+            n_a, n_b,
+            "two bus instances against the same producer_nonce_path \
+             must stamp the same nonce — pre-fix this regenerated on \
+             every restart and JetStream's dedup window saw new \
+             msg-ids as fresh batches",
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&nonce_path);
+    }
+
+    /// Pin that ALL spawn sites — both the static initial-shard
+    /// loop in `new_with_adapter` and the dynamic-add path in
+    /// `add_shard_internal` — clone the bus's loaded
+    /// `producer_nonce` correctly. Pre-#56 there was no nonce
+    /// concept at the bus layer; if any future refactor drops the
+    /// `producer_nonce: self.producer_nonce` line from one of the
+    /// spawn sites (or stops loading the persistent path), the
+    /// post-scale-up shard's batches would carry a different nonce
+    /// and JetStream's cross-restart dedup would silently break for
+    /// events ingested into the dynamic shard. Pin all observed
+    /// batches across the static + dynamic shards share the bus's
+    /// nonce.
+    #[tokio::test]
+    async fn multi_shard_bus_stamps_consistent_nonce_across_static_and_dynamic_shards() {
+        let mut nonce_path = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        nonce_path.push(format!("net-test-multi-shard-nonce-{pid}-{nanos}"));
+
+        struct CollectingAdapter {
+            nonces: Arc<parking_lot::Mutex<Vec<u64>>>,
+        }
+        #[async_trait::async_trait]
+        impl crate::adapter::Adapter for CollectingAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+                self.nonces.lock().push(batch.process_nonce);
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _: u16,
+                _: Option<&str>,
+                _: usize,
+            ) -> Result<crate::adapter::ShardPollResult, AdapterError> {
+                Ok(crate::adapter::ShardPollResult::empty())
+            }
+            fn name(&self) -> &'static str {
+                "collecting"
+            }
+        }
+
+        let nonces = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 8,
+            cooldown: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .scaling(policy)
+            .producer_nonce_path(&nonce_path)
+            .build()
+            .unwrap();
+
+        let bus = EventBus::new_with_adapter(
+            config,
+            Box::new(CollectingAdapter {
+                nonces: nonces.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Drive the two static shards.
+        for i in 0..200u64 {
+            let _ = bus.ingest(Event::new(json!({"i": i})));
+        }
+        bus.flush().await.unwrap();
+
+        // Add a dynamic shard and drive it too.
+        let _ = bus.manual_scale_up(1).await.unwrap();
+        for i in 200..400u64 {
+            let _ = bus.ingest(Event::new(json!({"i": i})));
+        }
+        bus.flush().await.unwrap();
+
+        bus.shutdown().await.unwrap();
+
+        let observed = nonces.lock().clone();
+        assert!(
+            !observed.is_empty(),
+            "expected the adapter to have observed at least one batch",
+        );
+        let first = observed[0];
+        for (i, &n) in observed.iter().enumerate() {
+            assert_eq!(
+                n, first,
+                "batch {i} stamped a different nonce ({n:#x}) than the first \
+                 batch ({first:#x}) — at least one spawn site (initial-shard \
+                 loop or `add_shard_internal`) failed to inherit the bus's \
+                 producer_nonce",
+            );
+        }
+
+        let _ = std::fs::remove_file(&nonce_path);
+    }
+
+    /// Pin the within-process caching contract for the fallback
+    /// (no-`producer_nonce_path`) path: two bus instances created
+    /// in the same process see the SAME `batch_process_nonce()`
+    /// because the helper is `OnceLock`-cached. The
+    /// "different-across-restarts" semantic is a *process-level*
+    /// guarantee — restart the process to get a fresh nonce — and
+    /// is pinned by `persistent_producer_nonce_survives_bus_restart`
+    /// (which uses a path; the without-path branch of #56 has no
+    /// cross-restart guarantee by design).
+    ///
+    /// Cubic-ai P3: this test was previously named
+    /// `process_nonce_fallback_differs_across_bus_instances`, which
+    /// contradicted its own assertion (`assert_eq!(n_a, n_b)`).
+    /// Renamed to match what it actually pins.
+    #[tokio::test]
+    async fn process_nonce_fallback_is_cached_within_process() {
+        struct NonceRecordingAdapter {
+            nonce: Arc<parking_lot::Mutex<Option<u64>>>,
+        }
+        #[async_trait::async_trait]
+        impl crate::adapter::Adapter for NonceRecordingAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+                *self.nonce.lock() = Some(batch.process_nonce);
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _: u16,
+                _: Option<&str>,
+                _: usize,
+            ) -> Result<crate::adapter::ShardPollResult, AdapterError> {
+                Ok(crate::adapter::ShardPollResult::empty())
+            }
+            fn name(&self) -> &'static str {
+                "nonce-recording"
+            }
+        }
+
+        let cfg = || {
+            EventBusConfig::builder()
+                .num_shards(1)
+                .ring_buffer_capacity(1024)
+                .build()
+                .unwrap()
+        };
+
+        let n_a = Arc::new(parking_lot::Mutex::new(None));
+        let n_b = Arc::new(parking_lot::Mutex::new(None));
+        {
+            let bus = EventBus::new_with_adapter(
+                cfg(),
+                Box::new(NonceRecordingAdapter { nonce: n_a.clone() }),
+            )
+            .await
+            .unwrap();
+            bus.ingest(Event::new(json!({"i": 1}))).unwrap();
+            bus.flush().await.unwrap();
+            bus.shutdown().await.unwrap();
+        }
+        {
+            let bus = EventBus::new_with_adapter(
+                cfg(),
+                Box::new(NonceRecordingAdapter { nonce: n_b.clone() }),
+            )
+            .await
+            .unwrap();
+            bus.ingest(Event::new(json!({"i": 2}))).unwrap();
+            bus.flush().await.unwrap();
+            bus.shutdown().await.unwrap();
+        }
+
+        // Note: in a single-process test BOTH bus instances see the
+        // same `OnceLock`-cached `batch_process_nonce`, so the
+        // nonces ARE equal here even though the documented
+        // semantic is "fresh per process." This test pins the
+        // cached-within-a-process invariant; the across-PROCESSES
+        // semantic is exercised by the persistent-nonce test
+        // above (which is the actually-load-bearing path for the
+        // BUG #56 fix).
+        let n_a = n_a.lock().unwrap();
+        let n_b = n_b.lock().unwrap();
+        assert_eq!(
+            n_a, n_b,
+            "within one process, batch_process_nonce is OnceLock-cached \
+             so two bus instances see the same nonce — the \
+             different-across-restarts contract is process-level, \
+             pinned via `persistent_producer_nonce_survives_bus_restart`",
+        );
+    }
+
+    /// Regression for BUG #157: `EventBusStats::batches_dispatched`
+    /// (and the new `events_dispatched`) must actually increment on
+    /// every successful adapter dispatch. Pre-fix `batches_dispatched`
+    /// was declared but never updated, so flush()'s Phase 2 progress
+    /// gate was constant-zero and early-broke after one window —
+    /// flake on Windows-class timer resolution. Pin both counters
+    /// directly here so a future refactor that drops the increment
+    /// fails this test, not the timing-dependent
+    /// `flush_is_a_delivery_barrier`.
+    #[tokio::test]
+    async fn dispatch_increments_bus_level_event_and_batch_counters() {
+        let received = Arc::new(AtomicU64::new(0));
+        let adapter: Box<dyn crate::adapter::Adapter> = Box::new(CountingAdapter {
+            received: received.clone(),
+        });
+
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .batch(crate::config::BatchConfig {
+                min_size: 1,
+                max_size: 10,
+                max_delay: Duration::from_millis(10),
+                adaptive: false,
+                velocity_window: Duration::from_millis(100),
+            })
+            .build()
+            .unwrap();
+        let bus = EventBus::new_with_adapter(config, adapter).await.unwrap();
+
+        for i in 0..50 {
+            bus.ingest(Event::new(json!({"i": i}))).unwrap();
+        }
+        bus.flush().await.unwrap();
+
+        let batches = bus.stats().batches_dispatched.load(AtomicOrdering::Acquire);
+        let events = bus.stats().events_dispatched.load(AtomicOrdering::Acquire);
+        assert!(
+            batches > 0,
+            "batches_dispatched must be > 0 after flush — pre-fix it was \
+             never incremented anywhere, breaking flush()'s Phase 2 progress gate",
+        );
+        assert_eq!(
+            events, 50,
+            "events_dispatched must equal the number of events handed to \
+             the adapter (got {events}, expected 50)",
         );
 
         bus.shutdown().await.unwrap();

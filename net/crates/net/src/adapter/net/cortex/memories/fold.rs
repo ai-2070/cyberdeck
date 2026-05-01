@@ -18,25 +18,34 @@ pub struct MemoriesFold;
 
 impl RedexFold<MemoriesState> for MemoriesFold {
     fn apply(&mut self, ev: &RedexEvent, state: &mut MemoriesState) -> Result<(), RedexError> {
+        // Per-event decode failures use `RedexError::Decode` (a
+        // recoverable variant) so the `Stop` fold policy
+        // skip-and-continues instead of permanently halting on a
+        // single bad event. See `tasks/fold.rs` for the full
+        // rationale.
         if ev.payload.len() < EVENT_META_SIZE {
-            return Err(RedexError::Encode(format!(
+            return Err(RedexError::Decode(format!(
                 "memories payload too short: {} bytes (need >= {})",
                 ev.payload.len(),
                 EVENT_META_SIZE
             )));
         }
         let meta = EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
-            .ok_or_else(|| RedexError::Encode("bad EventMeta prefix".into()))?;
+            .ok_or_else(|| RedexError::Decode("bad EventMeta prefix".into()))?;
         let tail = &ev.payload[EVENT_META_SIZE..];
 
-        // Verify the checksum stamped at ingest against the tail we
-        // received from RedEX. Catches disk corruption, tampered
-        // on-disk files, and truncated tails. Under
-        // `FoldErrorPolicy::Stop` this halts the fold task; under
-        // `LogAndContinue` the event is counted and skipped.
+        // Verify the corruption-detection checksum stamped at
+        // ingest against the tail we received from RedEX.
+        //
+        // This catches accidental disk corruption (stray bit
+        // flips, truncated writes, mis-aligned reads). It is NOT a
+        // tamper detector — the 32-bit unkeyed xxh3 truncation is
+        // recomputable by any party that can write to the
+        // underlying file. See `compute_checksum`'s doc for the
+        // full scope.
         let expected = compute_checksum(tail);
         if meta.checksum != expected {
-            return Err(RedexError::Encode(format!(
+            return Err(RedexError::Decode(format!(
                 "memories fold: EventMeta checksum mismatch at seq {} (got {:#010x}, tail hashes to {:#010x})",
                 ev.entry.seq, meta.checksum, expected
             )));
@@ -45,23 +54,40 @@ impl RedexFold<MemoriesState> for MemoriesFold {
         match meta.dispatch {
             DISPATCH_MEMORY_STORED => {
                 let p: MemoryStoredPayload =
-                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
-                state.memories.insert(
-                    p.id,
-                    Memory {
-                        id: p.id,
-                        content: p.content,
-                        tags: p.tags,
-                        source: p.source,
-                        created_ns: p.now_ns,
-                        updated_ns: p.now_ns,
-                        pinned: false,
-                    },
-                );
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
+                // Treat STORED as a content-update for an
+                // existing id: preserve `pinned` and `created_ns`,
+                // advance `updated_ns`, and overwrite the rest. A
+                // blanket `insert` would silently replace any
+                // existing entry, so `memories.store(42, "updated",
+                // ...)` after `memories.pin(42)` would drop the pin
+                // flag and overwrite the original creation
+                // timestamp with no observable signal to the
+                // operator.
+                if let Some(existing) = state.memories.get_mut(&p.id) {
+                    existing.content = p.content;
+                    existing.tags = p.tags;
+                    existing.source = p.source;
+                    existing.updated_ns = p.now_ns;
+                    // pinned + created_ns intentionally preserved.
+                } else {
+                    state.memories.insert(
+                        p.id,
+                        Memory {
+                            id: p.id,
+                            content: p.content,
+                            tags: p.tags,
+                            source: p.source,
+                            created_ns: p.now_ns,
+                            updated_ns: p.now_ns,
+                            pinned: false,
+                        },
+                    );
+                }
             }
             DISPATCH_MEMORY_RETAGGED => {
                 let p: MemoryRetaggedPayload =
-                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
                 if let Some(m) = state.memories.get_mut(&p.id) {
                     m.tags = p.tags;
                     m.updated_ns = p.now_ns;
@@ -69,7 +95,7 @@ impl RedexFold<MemoriesState> for MemoriesFold {
             }
             DISPATCH_MEMORY_PINNED => {
                 let p: MemoryPinTogglePayload =
-                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
                 if let Some(m) = state.memories.get_mut(&p.id) {
                     m.pinned = true;
                     m.updated_ns = p.now_ns;
@@ -77,7 +103,7 @@ impl RedexFold<MemoriesState> for MemoriesFold {
             }
             DISPATCH_MEMORY_UNPINNED => {
                 let p: MemoryPinTogglePayload =
-                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
                 if let Some(m) = state.memories.get_mut(&p.id) {
                     m.pinned = false;
                     m.updated_ns = p.now_ns;
@@ -85,7 +111,7 @@ impl RedexFold<MemoriesState> for MemoriesFold {
             }
             DISPATCH_MEMORY_DELETED => {
                 let p: MemoryDeletedPayload =
-                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
                 state.memories.remove(&p.id);
             }
             other => {

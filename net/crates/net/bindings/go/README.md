@@ -495,6 +495,96 @@ Errors surfaced as typed sentinels:
 `ErrCortexClosed`, `ErrCortexFold`, `ErrNetDb`, `ErrRedex`,
 `ErrStreamTimeout`, `ErrStreamEnded`.
 
+## Redis Streams consumer-side dedup helper
+
+The Net Redis adapter writes a stable `dedup_id` field on every
+XADD entry of the form
+`{producer_nonce:hex}:{shard_id}:{sequence_start}:{i}`. Combined
+with the bus's persistent producer-nonce path (`producer_nonce_path`
+on `EventBusConfig`), the id is stable across both
+within-process retries AND cross-process restart — the
+`MULTI/EXEC`-timeout race that drops two stream entries for one
+logical event becomes filterable at consume time.
+
+`RedisStreamDedup` is the consumer-side helper:
+
+```go
+import (
+    "fmt"
+    netbinding "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
+    "github.com/redis/go-redis/v9"
+)
+
+func consume(ctx context.Context, rdb *redis.Client, stream string) error {
+    // ~10k events/sec * 1 min dedup window → capacity ~600,000.
+    // The default of 4096 is fine for low-throughput / short-window
+    // deployments.
+    dedup := netbinding.NewRedisStreamDedup(600_000)
+    defer dedup.Close()
+
+    cursor := "0"
+    for {
+        // XRANGE bounds are INCLUSIVE on both ends. After the first
+        // page we must use the exclusive form `(<id>` so we don't
+        // re-read the entry the cursor points at — a vanilla
+        // `XRange(ctx, stream, cursor, "+")` loop spins forever
+        // once the cursor reaches the tail.
+        start := cursor
+        if cursor != "0" {
+            start = "(" + cursor
+        }
+        entries, err := rdb.XRange(ctx, stream, start, "+").Result()
+        if err != nil { return err }
+
+        for _, entry := range entries {
+            id, ok := entry.Values["dedup_id"].(string)
+            if !ok {
+                // Older entries / non-Net producers: skip dedup,
+                // process as-is. (Or treat as a hard error if your
+                // pipeline owns every producer.)
+                process(entry)
+                continue
+            }
+            if !dedup.IsDuplicate(id) {
+                process(entry)
+            }
+            cursor = entry.ID
+        }
+        if len(entries) == 0 { break }
+    }
+    return nil
+}
+```
+
+The helper is transport-agnostic — bring your own `go-redis` /
+`redigo` / equivalent client; it just answers the dedup question
+against an in-memory LRU.
+
+### Concurrency
+
+Each handle wraps a Rust `Mutex<RedisStreamDedup>`, so concurrent
+`IsDuplicate` calls from multiple goroutines on the same helper
+are safe but serialize. Production-shape: one helper per consumer
+goroutine (each with its own LRU), or shard your dedup state
+yourself if a single goroutine drains across multiple stream
+partitions.
+
+### Surface
+
+| Method | Description |
+|--------|-------------|
+| `NewRedisStreamDedup(capacity uint) *RedisStreamDedup` | Construct. `0` → default 4096. |
+| `(*RedisStreamDedup).Close()` | Release the C handle. Idempotent. |
+| `(*RedisStreamDedup).IsDuplicate(id string) bool` | Test-and-insert. `false` is fail-open on bad input. |
+| `(*RedisStreamDedup).IsDuplicateChecked(id string) (bool, error)` | Same, with `ErrInvalidDedupID` / `ErrNullPointer`. |
+| `(*RedisStreamDedup).Len() uint` | Distinct ids tracked. |
+| `(*RedisStreamDedup).Capacity() uint` | Configured LRU capacity. |
+| `(*RedisStreamDedup).IsEmpty() bool` | True if no ids tracked. |
+| `(*RedisStreamDedup).Clear()` | Drop all tracked ids. |
+
+A `runtime.SetFinalizer` is wired up as a backstop, but explicit
+`Close` is preferred (finalizer scheduling is non-deterministic).
+
 ## Security Surface (Stage A–E)
 
 The Go bindings ship the same identity / capabilities / subnets /
