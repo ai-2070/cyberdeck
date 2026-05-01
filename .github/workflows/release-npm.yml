@@ -70,15 +70,10 @@ jobs:
         working-directory: net/crates/net
         run: rustup target add ${{ matrix.target }}
 
-      - name: Install dependencies (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
       - name: Install cross-compilation tools (aarch64-linux-gnu)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
           # Pin the linker so cargo doesn't fall back to host `cc`
           # (which is x86_64 on these runners). Rust 1.95 defaults
@@ -88,38 +83,51 @@ jobs:
           # errors when no explicit linker env is set.
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
-      # `cc-rs` (used by `ring` and other native deps) needs a real
-      # `<arch>-linux-musl-gcc` binary on PATH for musl cross-builds.
-      # Ubuntu doesn't ship one. Earlier attempts:
-      #   - `--use-napi-cross` from `@napi-rs/cli`: didn't pull a
-      #     Docker image in this env (silent no-op).
-      #   - Direct download from musl.cc: hit exit-code-4 (wget
-      #     network failure) when musl.cc was unreachable.
-      # `messense/setup-musl-cross` is a thin wrapper that
-      # downloads from a redundant mirror set, used widely in the
-      # napi-rs and pyo3 ecosystems. Pair it with explicit linker
-      # envs so cargo wires the new gcc into the right
-      # `CARGO_TARGET_*_LINKER` slot.
-      - name: Install musl cross compiler
+      # Cross-compile to musl via Zig. Zig ships a fully-functional
+      # C cross-compiler with built-in support for every musl target
+      # (`zig cc -target <arch>-linux-musl`), so we don't need a
+      # prebuilt `<arch>-linux-musl-gcc` binary on PATH. cc-rs and
+      # cargo's linker can only point at a single binary (no args),
+      # so we write a tiny wrapper script that exec's zig with the
+      # right `-target` flag, then point the cross-build env vars
+      # at it. This is the same pattern `cargo-zigbuild` uses
+      # under the hood — without bringing the extra crate in.
+      - name: Install zig (musl cross compiler)
         if: contains(matrix.target, 'musl')
-        uses: messense/setup-musl-cross@v0
-        with:
-          target: ${{ matrix.target }}
+        uses: goto-bus-stop/setup-zig@v2
 
-      - name: Pin musl linker env
+      - name: Wrap zig as the musl cross-compiler
         if: contains(matrix.target, 'musl')
         shell: bash
         run: |
           case "${{ matrix.target }}" in
             x86_64-unknown-linux-musl)
-              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc" >> "$GITHUB_ENV"
-              echo "CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc" >> "$GITHUB_ENV"
+              ZIG_TARGET=x86_64-linux-musl
+              ENV_TGT=x86_64_unknown_linux_musl
               ;;
             aarch64-unknown-linux-musl)
-              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
-              echo "CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
+              ZIG_TARGET=aarch64-linux-musl
+              ENV_TGT=aarch64_unknown_linux_musl
+              ;;
+            *)
+              echo "Unexpected musl target: ${{ matrix.target }}" >&2
+              exit 1
               ;;
           esac
+
+          WRAPPER="$HOME/zig-cc-${ZIG_TARGET}.sh"
+          cat > "$WRAPPER" <<EOF
+          #!/bin/bash
+          exec zig cc -target ${ZIG_TARGET} "\$@"
+          EOF
+          chmod +x "$WRAPPER"
+
+          UPPER=$(echo "$ENV_TGT" | tr '[:lower:]' '[:upper:]')
+          {
+            echo "CC_${ENV_TGT}=$WRAPPER"
+            echo "CXX_${ENV_TGT}=$WRAPPER"
+            echo "CARGO_TARGET_${UPPER}_LINKER=$WRAPPER"
+          } >> "$GITHUB_ENV"
 
       - name: Install npm dependencies
         run: npm i
