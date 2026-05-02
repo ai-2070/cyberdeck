@@ -1952,8 +1952,23 @@ fn spawn_drain_worker_for_shard(
                 // buffer can hold up to `ring_buffer_capacity`
                 // events (default 1M) and any leftover would be
                 // silently lost on shutdown.
+                //
+                // BUG #46: pre-fix this broke at the first
+                // `popped == 0`. The audit posited a narrow race
+                // where a producer that fetch_add'd
+                // in_flight_ingests but stalled before the
+                // shard-lock body could push AFTER shutdown
+                // observed in_flight=0 yet BEFORE this final
+                // sweep saw the event. The SeqCst guard pattern
+                // makes this unlikely (the push happens-before
+                // the guard drop), but the defense is cheap:
+                // require TWO consecutive zero-event passes
+                // before declaring drain. The yield_now between
+                // them gives a stalled producer a chance to land
+                // the push.
                 let mut final_scratch: Vec<crate::event::InternalEvent> =
                     Vec::with_capacity(FINAL_BATCH);
+                let mut consecutive_zeros = 0u32;
                 loop {
                     let popped = shard_manager
                         .with_shard(shard_id, |shard| {
@@ -1961,8 +1976,16 @@ fn spawn_drain_worker_for_shard(
                         })
                         .unwrap_or(0);
                     if popped == 0 {
-                        break;
+                        consecutive_zeros += 1;
+                        if consecutive_zeros >= 2 {
+                            break;
+                        }
+                        // Yield to let any racing producer commit
+                        // its push, then re-poll.
+                        tokio::task::yield_now().await;
+                        continue;
                     }
+                    consecutive_zeros = 0;
                     let batch =
                         std::mem::replace(&mut final_scratch, Vec::with_capacity(FINAL_BATCH));
                     if sender.send(batch).await.is_err() {
