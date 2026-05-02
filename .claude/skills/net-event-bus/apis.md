@@ -6,8 +6,10 @@ Verified against `net-sdk` v0.8.0 (Rust) / `@ai2070/net-sdk` ≥ 0.8.0 peer (TS)
 ```bash
 # Rust: confirms emit/emit_raw/emit_str/emit_batch/emit_raw_batch are still exported (expect 5)
 grep -cE "^\s*pub fn emit" net/crates/net/sdk/src/net.rs
-# Rust: confirms the SdkError variant set this skill enumerates (expect 11)
-grep -cE "^\s*(Shutdown|Ingestion|Poll|Adapter|Serialization|Config|NoMesh|Backpressure|NotConnected|ChannelRejected|Traversal)" net/crates/net/sdk/src/error.rs
+# Rust: confirms the SdkError variant set this skill enumerates (expect 13).
+# `SdkError` is `#[non_exhaustive]` — count drift can also mean a *new*
+# variant was added that this skill hasn't documented yet.
+grep -cE "^\s*(Shutdown|Ingestion|Sampled|Unrouted|Poll|Adapter|Serialization|Config|NoMesh|Backpressure|NotConnected|ChannelRejected|Traversal)" net/crates/net/sdk/src/error.rs
 ```
 
 If any count drops, the SDK has churned underneath this doc — re-verify from source. If anything else looks wrong, **read the SDK source directly** — it is authoritative. The README is a good intro; the source is ground truth.
