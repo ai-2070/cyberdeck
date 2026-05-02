@@ -89,6 +89,20 @@ impl MigrationSourceHandler {
         // snapshot). That's far cheaper than a deadlock — and
         // the duplicate snapshot work is bounded to the racing
         // pair, not all co-hashed origins.
+        //
+        // Side-effect note: `daemon_registry.snapshot(...)` calls
+        // user-supplied `MeshDaemon::snapshot()` code. Two racing
+        // `start_snapshot` calls therefore produce two snapshot
+        // side-effects (counter bumps, deferred I/O, etc.) where
+        // the prior single-flight design produced one. This is
+        // fine for any *idempotent* `MeshDaemon::snapshot()` —
+        // which is the documented contract — but a non-idempotent
+        // implementation must be aware that the second call's
+        // result is discarded *after* it ran. If your daemon's
+        // snapshot has visible side-effects beyond serializing
+        // state, gate them behind your own single-flight (e.g. a
+        // `tokio::sync::Mutex`) inside `MeshDaemon::snapshot`
+        // rather than relying on this layer to deduplicate.
 
         if !self.daemon_registry.contains(daemon_origin) {
             return Err(MigrationError::DaemonNotFound(daemon_origin));
