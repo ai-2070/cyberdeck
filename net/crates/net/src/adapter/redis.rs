@@ -477,11 +477,22 @@ impl Adapter for RedisAdapter {
             return false;
         }
 
+        // BUG #41: pre-fix, the PING relied entirely on the
+        // `ConnectionManager`'s configured request timeout. If
+        // that's unset or large, a network partition leaves the
+        // health check blocked indefinitely, making the adapter
+        // appear "pending" rather than "unhealthy" — a real risk
+        // for liveness probes in orchestrators that treat slow
+        // health responses as "OK". Wrap explicitly in
+        // `command_timeout` so an unhealthy backend always
+        // returns `false` within a bounded window.
         if let Ok(mut conn) = self.get_conn().await {
-            redis::cmd("PING")
-                .query_async::<String>(&mut conn)
-                .await
-                .is_ok()
+            let cmd = redis::cmd("PING");
+            let fut = cmd.query_async::<String>(&mut conn);
+            matches!(
+                tokio::time::timeout(self.config.command_timeout, fut).await,
+                Ok(Ok(_))
+            )
         } else {
             false
         }
