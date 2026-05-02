@@ -389,6 +389,7 @@ pub struct ShardMapper {
     ///   - Keep the cooldown read+write inside the outer lock, OR
     ///   - Use a `compare_exchange`-style update on a single
     ///     `AtomicI64` of nanos so the gate is atomic on its own.
+    ///
     /// The doc-comment is here so a future refactorer doesn't
     /// silently break the contract.
     last_scaling: RwLock<Option<Instant>>,

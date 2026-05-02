@@ -123,7 +123,7 @@ impl RedisStreamDedup {
     /// and `HashSet` and OOMed on construction. Capacity is now
     /// clamped to [`Self::MAX_CAPACITY`].
     pub fn with_capacity(capacity: usize) -> Self {
-        let capacity = capacity.max(1).min(Self::MAX_CAPACITY);
+        let capacity = capacity.clamp(1, Self::MAX_CAPACITY);
         Self {
             order: VecDeque::with_capacity(capacity),
             seen: HashSet::with_capacity(capacity),
@@ -453,8 +453,9 @@ mod tests {
         // The clamp value must be small enough to actually pre-
         // allocate without OOMing on a development machine — the
         // mere fact that this test reached this assertion proves
-        // it.
-        assert!(
+        // it. Const-block assert so clippy doesn't flag it as
+        // a runtime check on a constant.
+        const _: () = assert!(
             RedisStreamDedup::MAX_CAPACITY < usize::MAX,
             "MAX_CAPACITY must strictly bound usize::MAX",
         );

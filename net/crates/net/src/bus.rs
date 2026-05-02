@@ -1227,7 +1227,7 @@ impl EventBus {
                 // surfaced-as-dropped contract.
                 self.stats
                     .events_dropped
-                    .fetch_add(stranded as u64, AtomicOrdering::Relaxed);
+                    .fetch_add(stranded, AtomicOrdering::Relaxed);
                 // BUG #48: also set the dedicated lossy-shutdown
                 // flag so `shutdown_via_ref` callers can detect a
                 // lossy outcome without parsing log lines or
