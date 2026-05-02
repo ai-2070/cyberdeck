@@ -243,3 +243,88 @@ impl Identity {
 // Callers who want a random identity must call
 // [`Identity::generate`] directly; callers restoring from a seed
 // call [`Identity::from_seed`].
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Identity::issue_token` previously routed through
+    /// `try_issue_token(...).expect(...)`, which blew up the
+    /// process on `Duration::ZERO` (because `try_issue` returns
+    /// `TokenError::ZeroTtl`). The current behaviour soft-clamps
+    /// to a 1-second TTL (with a `debug_assert!` to surface the
+    /// misuse in tests). Release builds therefore mint a
+    /// short-but-valid token instead of process-aborting.
+    ///
+    /// The `debug_assert!` fires under `cargo test`, so we
+    /// exercise the soft-clamp via `release` semantics by
+    /// `#[cfg]`-gating off of `debug_assertions`. The assertion
+    /// itself is covered by a separate `#[should_panic]` test
+    /// below.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn issue_token_zero_duration_soft_clamps_in_release() {
+        let id = Identity::generate();
+        let subject = Identity::generate();
+        let channel = ChannelName::new("zero-ttl-soft-clamp").unwrap();
+        let token = id.issue_token(
+            subject.entity_id().clone(),
+            crate::TokenScope::PUBLISH,
+            &channel,
+            Duration::ZERO,
+            0,
+        );
+        assert!(
+            token.verify().is_ok(),
+            "soft-clamped 1s TTL must produce a verify-ok token"
+        );
+        assert!(
+            token.is_valid().is_ok(),
+            "soft-clamped 1s TTL must be live at issue time"
+        );
+    }
+
+    /// Companion to the above: in debug builds the soft-clamp
+    /// fires `debug_assert!` so the misuse surfaces in tests.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Duration::ZERO")]
+    fn issue_token_zero_duration_debug_asserts() {
+        let id = Identity::generate();
+        let subject = Identity::generate();
+        let channel = ChannelName::new("zero-ttl-debug").unwrap();
+        let _ = id.issue_token(
+            subject.entity_id().clone(),
+            crate::TokenScope::PUBLISH,
+            &channel,
+            Duration::ZERO,
+            0,
+        );
+    }
+
+    /// `try_issue_token` is the explicit fallible surface — must
+    /// reject `Duration::ZERO` with `TokenError::ZeroTtl` rather
+    /// than soft-clamping. This is the path FFI bindings route
+    /// through; an attempt to mint a zero-TTL token there should
+    /// surface as an error to the caller, not be silently
+    /// remediated.
+    #[test]
+    fn try_issue_token_zero_duration_returns_zero_ttl() {
+        let id = Identity::generate();
+        let subject = Identity::generate();
+        let channel = ChannelName::new("zero-ttl-fallible").unwrap();
+        let err = id
+            .try_issue_token(
+                subject.entity_id().clone(),
+                crate::TokenScope::PUBLISH,
+                &channel,
+                Duration::ZERO,
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TokenError::ZeroTtl),
+            "expected ZeroTtl, got {err:?}"
+        );
+    }
+}
