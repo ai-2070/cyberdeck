@@ -660,17 +660,30 @@ impl StandbyGroup {
     }
 
     /// `"active"` | `"standby"` | `null` (out-of-range index).
+    ///
+    /// BUG #4: pre-fix, `index as u8` silently wrapped — a JS caller
+    /// passing 256 expected null (out-of-range) but received the role
+    /// for member 0. `u8::try_from` returns `Err` on overflow, which
+    /// we map to `None` for the documented contract.
     #[napi]
     pub fn member_role(&self, index: u32) -> Option<String> {
+        let idx = u8::try_from(index).ok()?;
         self.inner
-            .member_role(index as u8)
+            .member_role(idx)
             .map(member_role_str)
             .map(String::from)
     }
 
+    /// Returns the highest event sequence the standby member at
+    /// `index` has acknowledged, or `null` if `index` is out of range.
+    ///
+    /// BUG #4: same wrapping hazard as `member_role`. A JS caller
+    /// polling sync progress for index 257 would silently get the
+    /// lag of member 1 and could make an incorrect failover decision.
     #[napi]
     pub fn synced_through(&self, index: u32) -> Option<BigInt> {
-        self.inner.synced_through(index as u8).map(BigInt::from)
+        let idx = u8::try_from(index).ok()?;
+        self.inner.synced_through(idx).map(BigInt::from)
     }
 
     #[napi(getter)]
