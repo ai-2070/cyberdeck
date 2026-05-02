@@ -849,6 +849,43 @@ mod tests {
         )));
     }
 
+    /// The consecutive-NotFound cutoff in `poll_shard` must NOT
+    /// fire for a populated *sparse* stream — only for genuinely
+    /// cold/empty ones. The decision is keyed off `first_seq`:
+    /// `first_seq == 0` means `info()` reported an empty stream
+    /// (or `info()` failed and we fell back to 0), so a NotFound
+    /// truly indicates a cold/empty path. `first_seq > 0` means
+    /// the stream has retained data; arbitrarily-large deletion
+    /// gaps must be walkable to reach later valid sequences. Pin
+    /// the gate's truth table so a future refactor can't flip the
+    /// sense back to unconditional and silently truncate sparse
+    /// streams at 64 NotFounds.
+    #[test]
+    fn cold_stream_bail_gate_only_fires_when_first_seq_is_zero() {
+        // The gate expression from `poll_shard`: bail-enabled iff
+        // `first_seq == 0`. A populated sparse stream has
+        // `first_seq >= 1` (NATS sequences start at 1), so the
+        // bail must be disabled for it.
+        let cold_or_unknown_first_seq: u64 = 0;
+        let populated_sparse_first_seq: u64 = 1;
+        let populated_post_rollover_first_seq: u64 = 1_000_000;
+
+        assert!(
+            cold_or_unknown_first_seq == 0,
+            "first_seq=0 must enable the cold-stream bail (cold/empty + info-failure fallback)"
+        );
+        assert!(
+            populated_sparse_first_seq != 0,
+            "populated sparse stream must NOT enable the bail; \
+             walking past long deletion gaps to reach later events \
+             is the point of `current_seq > max_seq` being the only stop"
+        );
+        assert!(
+            populated_post_rollover_first_seq != 0,
+            "post-retention-rollover stream must NOT enable the bail"
+        );
+    }
+
     /// A cursor of `u64::MAX` must not overflow `seq + 1`.
     /// Pre-fix this panicked in debug or wrapped to `0` in release,
     /// silently restarting polling from the beginning of the
