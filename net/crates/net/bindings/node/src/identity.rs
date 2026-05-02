@@ -231,7 +231,7 @@ impl Identity {
         let subject_id = buffer_to_entity_id(&subject)?;
         let scope_bits = parse_scope(scope)?;
         let channel_hash = channel_to_hash(&channel)?;
-        // BUG #22: route through `try_issue` so a `ttl_seconds=0`
+        // Route through `try_issue` so a `ttl_seconds=0`
         // surfaces as `TokenError::ZeroTtl` (mapped to NAPI
         // Error here) rather than minting a born-expired token
         // that every receiver rejects with no diagnostic to the

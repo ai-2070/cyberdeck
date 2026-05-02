@@ -89,7 +89,7 @@ pub struct EventBus {
     /// where a producer that observed `shutdown=false` could push
     /// *after* the drain worker's last `pop_batch_into` returned
     /// zero, leaving the event stranded in the ring buffer.
-    /// BUG #59: pre-fix this was `AtomicU32`. A 4-billion-in-flight
+    /// Pre-fix this was `AtomicU32`. A 4-billion-in-flight
     /// wrap is not realistic in production, but the counter
     /// participates in the shutdown protocol — a wrap to 0 would
     /// trick the wait-for-zero loop into thinking shutdown was
@@ -185,7 +185,7 @@ pub struct EventBusStats {
     /// `bus.stats()` afterward (only meaningful for the
     /// `shutdown_via_ref` path that doesn't consume the bus).
     ///
-    /// BUG #48: pre-fix the warning + `events_dropped` increment
+    /// Pre-fix the warning + `events_dropped` increment
     /// were the only signal; `Result<(), AdapterError>` returned
     /// `Ok` indistinguishable from a clean shutdown.
     pub shutdown_was_lossy: std::sync::atomic::AtomicBool,
@@ -254,7 +254,7 @@ impl EventBus {
 
         // Create poll merger.
         //
-        // BUG #67: pass the live id set rather than the count. At
+        // Pass the live id set rather than the count. At
         // initial construction the ids are dense (`0..num_shards`),
         // but using `shard_ids()` here keeps a single code path with
         // the post-scaling re-stores below.
@@ -469,7 +469,7 @@ impl EventBus {
         // `current_batch` is flushed via the channel-close path),
         // then dispatch any stranded ring-buffer events through
         // the adapter. Pre-fix this used `.abort()` on both
-        // handles (BUG #44 + #45) which dropped the drain
+        // handles which dropped the drain
         // worker's scratch and the batch worker's current_batch
         // without dispatch.
         if let Err(e) = self.shard_manager.activate_shard(new_id) {
@@ -584,7 +584,7 @@ impl EventBus {
             return Err(AdapterError::Fatal(e.to_string()));
         }
 
-        // Update poll merger with the post-add id set (BUG #67).
+        // Update poll merger with the post-add id set.
         self.poll_merger.store(Arc::new(PollMerger::new(
             self.adapter.clone(),
             self.shard_manager.shard_ids(),
@@ -738,7 +738,7 @@ impl EventBus {
             }
         }
 
-        // Update poll merger with the post-remove id set (BUG #67).
+        // Update poll merger with the post-remove id set.
         // Without this, a default-shards poll (`request.shards == None`)
         // would still iterate `0..num_shards` and skip the live shard
         // whose id is now the largest, while polling a nonexistent /
@@ -894,7 +894,7 @@ impl EventBus {
     ///
     /// This retrieves events from storage according to the request parameters.
     ///
-    /// # Topology-change visibility (BUG #50)
+    /// # Topology-change visibility
     ///
     /// `ArcSwap::load()` snapshots the current `PollMerger` for
     /// the duration of this call. A concurrent `add_shard` /
@@ -1228,7 +1228,7 @@ impl EventBus {
                 self.stats
                     .events_dropped
                     .fetch_add(stranded, AtomicOrdering::Relaxed);
-                // BUG #48: also set the dedicated lossy-shutdown
+                // Also set the dedicated lossy-shutdown
                 // flag so `shutdown_via_ref` callers can detect a
                 // lossy outcome without parsing log lines or
                 // diffing `events_dropped` snapshots.
@@ -1242,7 +1242,7 @@ impl EventBus {
 
         // 1b. Release the drain-finalize gate.
         //
-        // BUG #60: pre-fix used `Ordering::Release` for this store
+        // Pre-fix used `Ordering::Release` for this store
         // and relied on the SeqCst spin above (loading
         // `in_flight_ingests`) to provide the happens-before for
         // every observed-pre-shutdown push. That works today
@@ -1444,7 +1444,7 @@ impl Drop for EventBus {
         self.drain_finalize_ready
             .store(true, AtomicOrdering::SeqCst);
 
-        // BUG #49: workers do NOT hold `Arc<EventBus>` — they hold
+        // Workers do NOT hold `Arc<EventBus>` — they hold
         // independent `Arc<ShardManager>` / `Arc<dyn Adapter>`
         // clones plus the channel halves. When `Drop` returns,
         // those Arcs survive in the still-running tasks and they
@@ -1642,7 +1642,7 @@ async fn run_scaling_monitor_via_weak(weak: std::sync::Weak<EventBus>) {
 /// truth for this decision.
 /// Compute the per-attempt backoff for `dispatch_batch` retries.
 ///
-/// BUG #74: pre-fix the retry loop slept a flat `Duration::from_millis(100)`
+/// Pre-fix the retry loop slept a flat `Duration::from_millis(100)`
 /// after every failure. Under a partial backend outage (Redis /
 /// JetStream slow but not dead), every shard's BatchWorker retried
 /// on the exact same 100 ms cadence, producing a synchronized
@@ -1689,7 +1689,7 @@ async fn dispatch_batch(
             Ok(Ok(())) => return true,
             Ok(Err(e)) => {
                 if !e.is_retryable() {
-                    // BUG #52: tag with a `reason` field so this
+                    // Tag with a `reason` field so this
                     // distinct drop cause is separately filterable
                     // from retry-exhausted and timeout in
                     // observability tools.
@@ -1711,7 +1711,7 @@ async fn dispatch_batch(
         tokio::time::sleep(retry_backoff(shard_id, attempt)).await;
     }
 
-    // BUG #52: pre-fix the final attempt collapsed every drop into
+    // Pre-fix the final attempt collapsed every drop into
     // one log line ("Failed to dispatch batch, dropping"), making
     // it impossible to tell retry-exhausted from fatal-non-
     // retryable from timeout in metrics. The non-retryable case
@@ -1950,7 +1950,7 @@ fn spawn_drain_worker_for_shard(
                 // events (default 1M) and any leftover would be
                 // silently lost on shutdown.
                 //
-                // BUG #46: pre-fix this broke at the first
+                // Pre-fix this broke at the first
                 // `popped == 0`. The audit posited a narrow race
                 // where a producer that fetch_add'd
                 // in_flight_ingests but stalled before the
@@ -2402,7 +2402,7 @@ mod tests {
         }
     }
 
-    /// BUG #74: `retry_backoff` exponentially grows the base delay
+    /// `retry_backoff` exponentially grows the base delay
     /// per attempt and adds per-(shard, attempt) jitter to
     /// decorrelate retries across shards. Pin both invariants:
     /// monotonic growth on the base, and jitter that produces
@@ -2430,7 +2430,7 @@ mod tests {
             s0_a6
         );
 
-        // BUG #74 jitter property: different shards at the same
+        // Jitter property: different shards at the same
         // attempt land on different backoffs. Sample 16 distinct
         // shard ids and assert at least 8 unique backoff values
         // — the hasher's distribution should easily clear that.
@@ -2440,7 +2440,7 @@ mod tests {
             .collect();
         assert!(
             s_attempt2.len() >= 8,
-            "BUG #74: jitter must decorrelate retries across shards; \
+            "jitter must decorrelate retries across shards; \
              only {} unique backoffs across 16 shards",
             s_attempt2.len()
         );
@@ -2448,7 +2448,7 @@ mod tests {
 
     /// CR-23: pin that `EventBus::shutdown` actually invokes the
     /// adapter's `flush()` and `shutdown()` methods. The existing
-    /// `sdk/tests/shutdown_regression.rs` covers BUG #80/#81's
+    /// `sdk/tests/shutdown_regression.rs` covers the
     /// "shutdown runs even with outstanding Arc clones" property
     /// using a memory adapter whose `flush`/`shutdown` are no-ops
     /// — so a regression that elided the adapter calls would still
@@ -2456,7 +2456,7 @@ mod tests {
     /// per-method counters; we assert flush AND shutdown both fired
     /// exactly once after a clean `bus.shutdown().await`.
     ///
-    /// The fix in BUG #80 routes `Net::shutdown` through
+    /// The fix routes `Net::shutdown` through
     /// `shutdown_via_ref`, which in turn calls
     /// `self.adapter.flush()` and `self.adapter.shutdown()` once
     /// each. CR-23 pins this contract at the bus layer so an
@@ -2808,7 +2808,7 @@ mod tests {
         bus.shutdown().await.unwrap();
     }
 
-    /// Regression for BUG #56 (Phase 1): when configured with a
+    /// Regression (Phase 1): when configured with a
     /// persistent `producer_nonce_path`, two bus instances launched
     /// against the same path stamp the SAME nonce on every emitted
     /// batch. JetStream / Redis adapters key dedup on this nonce, so
@@ -3118,7 +3118,7 @@ mod tests {
         // cached-within-a-process invariant; the across-PROCESSES
         // semantic is exercised by the persistent-nonce test
         // above (which is the actually-load-bearing path for the
-        // BUG #56 fix).
+        // persistent-nonce fix).
         let n_a = n_a.lock().unwrap();
         let n_b = n_b.lock().unwrap();
         assert_eq!(
@@ -3130,7 +3130,7 @@ mod tests {
         );
     }
 
-    /// Regression for BUG #157: `EventBusStats::batches_dispatched`
+    /// Regression: `EventBusStats::batches_dispatched`
     /// (and the new `events_dispatched`) must actually increment on
     /// every successful adapter dispatch. Pre-fix `batches_dispatched`
     /// was declared but never updated, so flush()'s Phase 2 progress

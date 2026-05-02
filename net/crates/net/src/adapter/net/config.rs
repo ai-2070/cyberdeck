@@ -96,14 +96,14 @@ impl NetAdapterConfig {
     /// Default handshake timeout
     pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Upper bound on `packet_pool_size`. BUG #18 — pre-fix this
+    /// Upper bound on `packet_pool_size`. Pre-fix this
     /// was unbounded, so a typo'd `with_pool_size(1_000_000_000)`
     /// walked past validate() and OOMed at first allocation. The
     /// 1 << 20 (1 048 576) cap is far above any realistic
     /// production setting; the default is 64.
     pub const MAX_PACKET_POOL_SIZE: usize = 1 << 20;
 
-    /// Upper bound on `handshake_retries`. BUG #18 — pre-fix
+    /// Upper bound on `handshake_retries`. Pre-fix
     /// unbounded; a misconfigured large value just took forever to
     /// fail. 1024 covers any realistic flaky-network policy; the
     /// default is 3.
@@ -248,7 +248,7 @@ impl NetAdapterConfig {
             return Err("packet_pool_size must be > 0".into());
         }
 
-        // BUG #18: pre-fix only the zero / ordering checks were
+        // Pre-fix only the zero / ordering checks were
         // enforced. A typo'd `with_pool_size(1_000_000_000)` (or
         // an env-var-fed `usize::MAX`) walked past validation and
         // OOMed at first allocation. Bound the pool size at a
@@ -261,7 +261,7 @@ impl NetAdapterConfig {
             ));
         }
 
-        // BUG #18: handshake_retries had no upper clamp. A
+        // handshake_retries had no upper clamp. A
         // misconfigured large value would just take forever to
         // fail. Bound at 1024 (covers any realistic flaky
         // network).
@@ -277,7 +277,7 @@ impl NetAdapterConfig {
             return Err("heartbeat_interval must be > 0".into());
         }
 
-        // BUG #18: pre-fix `heartbeat_interval = 1ns` passed.
+        // Pre-fix `heartbeat_interval = 1ns` passed.
         // Floor at 10 ms — heartbeats faster than that are not a
         // real use case and would just drown the network.
         if self.heartbeat_interval < Duration::from_millis(10) {
@@ -460,7 +460,7 @@ mod tests {
         )
     }
 
-    /// BUG #18: pathological `packet_pool_size` (e.g. usize::MAX
+    /// Pathological `packet_pool_size` (e.g. usize::MAX
     /// from a misconfigured env var) must be rejected at validate
     /// time, not OOM at first allocation.
     #[test]
@@ -483,7 +483,7 @@ mod tests {
         );
     }
 
-    /// BUG #18: 1ns heartbeat is below any realistic floor and
+    /// 1ns heartbeat is below any realistic floor and
     /// would drown the network.
     #[test]
     fn validate_rejects_heartbeat_below_minimum() {
@@ -498,7 +498,7 @@ mod tests {
         );
     }
 
-    /// BUG #18: handshake_retries far above realistic values must
+    /// handshake_retries far above realistic values must
     /// be rejected.
     #[test]
     fn validate_rejects_pathological_handshake_retries() {

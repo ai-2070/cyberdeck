@@ -790,7 +790,7 @@ impl ShardManager {
     ///
     /// Idempotent: calling on an already-`Active` shard is `Ok(())`.
     ///
-    /// BUG #35: pre-fix this unconditionally `fetch_add(1)`d
+    /// Pre-fix this unconditionally `fetch_add(1)`d
     /// `num_shards` even when the mapper's `activate()` early-
     /// returned for an already-`Active` shard. After repeated
     /// activate calls, `num_shards` exceeded both the mapper's
@@ -1460,7 +1460,7 @@ mod tests {
         assert!(manager.with_shard(1, |s| s.id).is_none());
     }
 
-    /// BUG #35: `ShardManager::activate_shard` is idempotent at
+    /// `ShardManager::activate_shard` is idempotent at
     /// the API level — two calls on the same shard return Ok(())
     /// each — but pre-fix `num_shards` was bumped on every call
     /// even when the mapper's `activate()` had already
@@ -1499,7 +1499,7 @@ mod tests {
         assert_eq!(
             manager.num_shards(),
             3,
-            "BUG #35: repeated activate_shard must NOT keep bumping num_shards; \
+            "repeated activate_shard must NOT keep bumping num_shards; \
              pre-fix this would be 5 after three calls",
         );
     }

@@ -1220,7 +1220,7 @@ mod tests {
         table.record_in(novel, 1);
         assert!(
             !table.stream_stats.contains_key(&novel),
-            "novel stream_id at cap must NOT be admitted (BUG #89 \
+            "novel stream_id at cap must NOT be admitted (pre-fix \
              would have inserted unconditionally and grown the map \
              unboundedly)"
         );
@@ -1236,7 +1236,7 @@ mod tests {
         assert!(
             stats.get_packets_in() >= 2,
             "existing entry must continue to record despite the \
-             cap — BUG #89 fix is admit-side only"
+             cap — fix is admit-side only"
         );
     }
 

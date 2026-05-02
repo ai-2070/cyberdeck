@@ -514,7 +514,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #114: pruned-no-snapshot logs must not report Continuous
+    // pruned-no-snapshot logs must not report Continuous
     // ========================================================================
 
     /// A log whose first event has `sequence > 1` (e.g. because
@@ -764,7 +764,7 @@ mod tests {
     ///
     /// The CR-34 detection only fires for non-genesis snapshots
     /// — without this carve-out, every genesis-anchored chain
-    /// would be `Unverifiable`, defeating the BUG #114 fix.
+    /// would be `Unverifiable`, defeating the pruned-no-snapshot fix.
     #[test]
     fn cr34_genesis_snapshot_with_empty_head_payload_still_validates() {
         use crate::adapter::net::state::horizon::ObservedHorizon;
@@ -1010,7 +1010,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #98: verify_against must walk the full chain, not just endpoints
+    // verify_against must walk the full chain, not just endpoints
     // ========================================================================
 
     /// `verify_against` rejects a proof whose middle is missing or
@@ -1058,7 +1058,7 @@ mod tests {
         assert!(
             matches!(result, Err(ProofError::MissingEvent(1))),
             "verify_against must reject with MissingEvent(from_seq=1) when \
-             from_seq itself is gone (BUG #98 + cubic-ai P3), got {:?}",
+             from_seq itself is gone (cubic-ai P3), got {:?}",
             result,
         );
     }
@@ -1076,7 +1076,7 @@ mod tests {
         let result = proof.verify_against(&log);
         assert!(
             matches!(result, Err(ProofError::InvalidRange { .. })),
-            "verify_against must reject reversed bounds (BUG #98), got {:?}",
+            "verify_against must reject reversed bounds, got {:?}",
             result,
         );
     }
@@ -1094,7 +1094,7 @@ mod tests {
         let result = proof.verify_against(&log);
         assert!(
             matches!(result, Err(ProofError::SpanTooLarge { .. })),
-            "verify_against must reject spans over MAX_PROOF_VERIFY_SPAN (BUG #98), got {:?}",
+            "verify_against must reject spans over MAX_PROOF_VERIFY_SPAN, got {:?}",
             result,
         );
     }

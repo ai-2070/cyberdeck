@@ -35,7 +35,7 @@ pub const STREAM_WINDOW_SIZE: usize = 16;
 /// `tx_credit_remaining = tx_window - (tx_bytes_sent - total_consumed)`,
 /// making the mechanism self-healing against lost grants.
 ///
-/// # Consumer-side validation (BUG #19)
+/// # Consumer-side validation
 ///
 /// The codec accepts any `total_consumed: u64`. Pre-fix the doc-
 /// comment's "self-healing" framing implied no further validation
@@ -56,7 +56,7 @@ pub struct StreamWindow {
     /// Receiver's cumulative consumed-byte count on this stream.
     ///
     /// Consumers MUST clamp this to the local `tx_bytes_sent`
-    /// watermark before deriving credit (BUG #19).
+    /// watermark before deriving credit.
     pub total_consumed: u64,
 }
 

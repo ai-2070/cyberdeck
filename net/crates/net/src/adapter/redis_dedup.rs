@@ -84,7 +84,7 @@ pub struct RedisStreamDedup {
     /// is `Arc::clone`-shared with `seen` so we don't pay a second
     /// allocation per insert.
     ///
-    /// BUG #73: pre-fix doc-comments described this as
+    /// Pre-fix doc-comments described this as
     /// "LRU eviction" but `is_duplicate` doesn't move re-observed
     /// ids to the back of the queue — re-observation is a no-op
     /// and the queue stays strictly insertion-ordered. The
@@ -118,7 +118,7 @@ impl RedisStreamDedup {
     /// that want "no dedup at all" should not construct this
     /// helper in the first place.
     ///
-    /// BUG #42: pre-fix, `capacity` had no upper clamp. A
+    /// Pre-fix, `capacity` had no upper clamp. A
     /// misconfigured `usize::MAX` pre-allocated the `VecDeque`
     /// and `HashSet` and OOMed on construction. Capacity is now
     /// clamped to [`Self::MAX_CAPACITY`].
@@ -405,7 +405,7 @@ mod tests {
         assert_eq!(g.len(), 4 * 16);
     }
 
-    /// Pin the canonical use case: BUG #57 producer-side dup
+    /// Pin the canonical use case: producer-side dup
     /// scenario. Two `XADD`s of the same logical event produce
     /// stream entries with distinct server-generated `*` ids but
     /// IDENTICAL `dedup_id` fields. The dedup helper filters the
@@ -438,7 +438,7 @@ mod tests {
         }
     }
 
-    /// BUG #42: a misconfigured `capacity == usize::MAX` must not
+    /// A misconfigured `capacity == usize::MAX` must not
     /// OOM at construction. Pre-fix, `with_capacity(usize::MAX)`
     /// pre-allocated `VecDeque` + `HashSet` for the full range and
     /// the process aborted before the helper was even usable.
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(
             d.capacity,
             RedisStreamDedup::MAX_CAPACITY,
-            "BUG #42: capacity must be clamped at MAX_CAPACITY",
+            "capacity must be clamped at MAX_CAPACITY",
         );
         // The clamp value must be small enough to actually pre-
         // allocate without OOMing on a development machine — the

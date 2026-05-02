@@ -69,7 +69,7 @@ impl MigrationSourceHandler {
         target_node: u64,
         orchestrator_node: u64,
     ) -> Result<StateSnapshot, MigrationError> {
-        // BUG #14: pre-fix, the Vacant entry write-guard from
+        // Pre-fix, the Vacant entry write-guard from
         // `migrations.entry(daemon_origin)` was held across
         // `daemon_registry.contains` and `daemon_registry.snapshot`,
         // both of which take an inner `Mutex<DaemonHost>`.

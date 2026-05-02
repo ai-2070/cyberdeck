@@ -216,7 +216,7 @@ impl PersistentProducerNonce {
             p.set_file_name(name);
             p
         };
-        // BUG #40 + #68: pre-fix, the write/sync split was
+        // Pre-fix, the write/sync split was
         //   fs::write(&tmp_path, buf)?;        // (a) write + close
         //   if let Ok(f) = fs::File::open(&tmp_path) {
         //       let _ = f.sync_all();          // (b) sync_all on

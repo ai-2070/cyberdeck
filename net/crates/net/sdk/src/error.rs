@@ -10,7 +10,7 @@ pub enum SdkError {
     /// Generic ingestion failure that doesn't map to a more
     /// specific variant.
     ///
-    /// BUG #10: pre-fix, every `IngestionError` was funnelled here
+    /// Pre-fix, every `IngestionError` was funnelled here
     /// — `Backpressure`, `Sampled`, `Unrouted`, and shutdown all
     /// became `Ingestion("…")` and callers had to string-match to
     /// pick a remediation. Today's `From<IngestionError>` impl
@@ -109,7 +109,7 @@ impl From<net::adapter::net::StreamError> for SdkError {
 impl From<net::error::IngestionError> for SdkError {
     fn from(e: net::error::IngestionError) -> Self {
         use net::error::IngestionError;
-        // BUG #10: pre-fix this stringified every variant into
+        // Pre-fix this stringified every variant into
         // `SdkError::Ingestion(String)`, forcing callers to match
         // on the message text to distinguish "ring buffer full,
         // retry with backoff" (Backpressure) from "event dropped
@@ -156,7 +156,7 @@ mod tests {
     use super::*;
     use net::error::IngestionError;
 
-    /// BUG #10: each `IngestionError` variant must map to a
+    /// Each `IngestionError` variant must map to a
     /// structured `SdkError` so callers don't have to string-
     /// match the message text to pick a remediation.
     #[test]
@@ -164,7 +164,7 @@ mod tests {
         let sdk: SdkError = IngestionError::Backpressure.into();
         assert!(
             matches!(sdk, SdkError::Backpressure),
-            "Backpressure must map to SdkError::Backpressure (BUG #10), got {:?}",
+            "Backpressure must map to SdkError::Backpressure, got {:?}",
             sdk
         );
     }
@@ -174,7 +174,7 @@ mod tests {
         let sdk: SdkError = IngestionError::Sampled.into();
         assert!(
             matches!(sdk, SdkError::Sampled),
-            "Sampled must map to SdkError::Sampled (BUG #10) so callers \
+            "Sampled must map to SdkError::Sampled so callers \
              know retry is pointless; got {:?}",
             sdk
         );
@@ -185,7 +185,7 @@ mod tests {
         let sdk: SdkError = IngestionError::Unrouted.into();
         assert!(
             matches!(sdk, SdkError::Unrouted),
-            "Unrouted must map to SdkError::Unrouted (BUG #10) so callers \
+            "Unrouted must map to SdkError::Unrouted so callers \
              know to wait for topology to stabilize; got {:?}",
             sdk
         );
@@ -196,7 +196,7 @@ mod tests {
         let sdk: SdkError = IngestionError::ShuttingDown.into();
         assert!(
             matches!(sdk, SdkError::Shutdown),
-            "ShuttingDown must reuse SdkError::Shutdown (BUG #10), got {:?}",
+            "ShuttingDown must reuse SdkError::Shutdown, got {:?}",
             sdk
         );
     }
@@ -211,7 +211,7 @@ mod tests {
         let sdk: SdkError = IngestionError::Serialization(parse_err).into();
         assert!(
             matches!(sdk, SdkError::Serialization(_)),
-            "Serialization must keep its #[from] serde_json::Error (BUG #10), got {:?}",
+            "Serialization must keep its #[from] serde_json::Error, got {:?}",
             sdk
         );
     }

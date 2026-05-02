@@ -77,7 +77,7 @@ pub fn subnet_id_from_js(id: SubnetIdJs) -> Result<SubnetId> {
         bytes[i] = *raw as u8;
     }
     // `SubnetId::try_new` returns Result instead of panicking on
-    // out-of-range input (BUG #9). The pre-validation above (length
+    // out-of-range input. The pre-validation above (length
     // check at lines 63-68) makes this branch unreachable, but
     // routing through the fallible API keeps the panic path off
     // the FFI surface entirely.
@@ -106,7 +106,7 @@ fn subnet_rule_from_js(r: SubnetRuleJs) -> Result<SubnetRule> {
     let mut rule = SubnetRule::new(r.tag_prefix, level);
     for (tag_value, level_value) in r.values {
         let v = parse_u8(level_value, &format!("rule value for {}", tag_value))?;
-        // BUG #9: route through `try_map` so a `level_value == 0`
+        // Route through `try_map` so a `level_value == 0`
         // surfaces as a typed `SubnetError` (mapped to NAPI Error
         // here) rather than a native-side panic. This replaces the
         // earlier explicit `if v == 0` check at the NAPI boundary
@@ -125,7 +125,7 @@ fn subnet_rule_from_js(r: SubnetRuleJs) -> Result<SubnetRule> {
 /// Validate + convert a JS `SubnetPolicyJs` into a core
 /// `SubnetPolicy`.
 ///
-/// BUG #9: routes through `try_add_rule` so any future loosening
+/// Routes through `try_add_rule` so any future loosening
 /// of the per-rule pre-validation in `subnet_rule_from_js` still
 /// surfaces an out-of-range `level` as a typed error rather than
 /// a native panic.

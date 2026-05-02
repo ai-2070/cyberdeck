@@ -150,7 +150,7 @@ impl PartitionDetector {
             _ => return None, // broad outage, not a partition
         };
 
-        // BUG #20: pre-fix `self.next_id += 1` panicked in debug
+        // Pre-fix `self.next_id += 1` panicked in debug
         // and wrapped to 0 in release at u64::MAX, reusing partition
         // ID 0 — `confirm` / `find_mut` would then operate on the
         // wrong record. Astronomical in practice (a node would have
@@ -204,7 +204,7 @@ impl PartitionDetector {
     ///
     /// # Overlapping partitions
     ///
-    /// BUG #32: a single node id can appear in `other_side` of
+    /// A single node id can appear in `other_side` of
     /// multiple active partition records (e.g., a noisy detector
     /// classified one physical outage into two records). This
     /// function intentionally walks **all** matching records and

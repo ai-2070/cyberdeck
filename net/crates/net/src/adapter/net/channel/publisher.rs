@@ -129,7 +129,7 @@ impl PublishReport {
     /// the vacuous case where the roster was empty (zero peers
     /// attempted, zero failures, every attempt succeeded).
     ///
-    /// BUG #26: pre-fix this required `attempted > 0`, so a
+    /// Pre-fix this required `attempted > 0`, so a
     /// publish with zero subscribers was simultaneously
     /// `is_empty() == true` AND `all_delivered() == false`.
     /// Callers branching on `all_delivered()` for the "everything
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_report_helpers() {
-        // BUG #26: empty roster is `all_delivered()` (vacuously
+        // Empty roster is `all_delivered()` (vacuously
         // true). Pre-fix this returned false, which made callers
         // branching on `all_delivered()` for "all good" treat
         // empty rosters as failure — a real hazard after
@@ -201,7 +201,7 @@ mod tests {
         assert!(empty.is_empty());
         assert!(
             empty.all_delivered(),
-            "empty roster must be vacuously all_delivered (BUG #26)"
+            "empty roster must be vacuously all_delivered"
         );
 
         let full = PublishReport {

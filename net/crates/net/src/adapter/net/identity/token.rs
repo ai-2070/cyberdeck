@@ -159,15 +159,29 @@ impl PermissionToken {
         duration_secs: u64,
         delegation_depth: u8,
     ) -> Self {
-        Self::try_issue(
+        // Match each `try_issue` failure to a precise panic message.
+        // A blanket `.expect("...public-only keypair...")` would
+        // mis-blame any future variant (today: `ZeroTtl`) on the
+        // ReadOnly path, leading whoever sees the panic to start
+        // chasing a key-loading bug for what is actually a
+        // `duration_secs == 0` callsite.
+        match Self::try_issue(
             issuer_keypair,
             subject,
             scope,
             channel_hash,
             duration_secs,
             delegation_depth,
-        )
-        .expect("PermissionToken::issue called with a public-only keypair — use try_issue")
+        ) {
+            Ok(token) => token,
+            Err(TokenError::ReadOnly) => {
+                panic!("PermissionToken::issue called with a public-only keypair — use try_issue")
+            }
+            Err(TokenError::ZeroTtl) => {
+                panic!("PermissionToken::issue called with duration_secs == 0 — use try_issue")
+            }
+            Err(e) => panic!("PermissionToken::issue failed: {e:?} — use try_issue"),
+        }
     }
 
     /// Fallible counterpart to [`Self::issue`]: returns
@@ -184,7 +198,7 @@ impl PermissionToken {
         duration_secs: u64,
         delegation_depth: u8,
     ) -> Result<Self, TokenError> {
-        // BUG #22: a TTL of 0 produces a token with
+        // A TTL of 0 produces a token with
         // `not_after == not_before`. The signature verifies but
         // `is_valid()` rejects it as `Expired` immediately
         // (`is_valid` uses strict `now >= not_after`, so a token
@@ -709,7 +723,7 @@ pub enum TokenError {
     ReadOnly,
     /// `duration_secs == 0` was passed to [`PermissionToken::try_issue`].
     ///
-    /// BUG #22: pre-fix, a TTL of 0 produced a token with
+    /// Pre-fix, a TTL of 0 produced a token with
     /// `not_after == not_before`, which every receiver immediately
     /// rejects as `Expired`. The signature verifies but every
     /// authorization check fails — silently. Reject at issue
@@ -768,7 +782,7 @@ mod tests {
         assert!(token.is_valid().is_ok());
     }
 
-    /// BUG #22: a TTL of 0 must surface as `TokenError::ZeroTtl`,
+    /// A TTL of 0 must surface as `TokenError::ZeroTtl`,
     /// not silently mint a born-expired token. Pre-fix, the
     /// caller got a token whose signature verified but every
     /// authorization check failed at the receiver — no diagnostic
@@ -790,7 +804,50 @@ mod tests {
         assert_eq!(err, TokenError::ZeroTtl, "expected ZeroTtl, got {:?}", err);
     }
 
-    /// BUG #22 corollary: TTL of 1 second is the lowest valid
+    /// `issue` is the panicking convenience wrapper around
+    /// `try_issue`. When `try_issue` rejects on a *non*-`ReadOnly`
+    /// reason (today: `ZeroTtl`), the panic message must name the
+    /// real cause — not the canned "called with a public-only
+    /// keypair" string. Pre-fix the wrapper did
+    /// `.expect("...public-only keypair...")` unconditionally, so a
+    /// `duration_secs == 0` panic mis-blamed key loading and sent
+    /// whoever saw the panic chasing the wrong bug.
+    #[test]
+    #[should_panic(expected = "duration_secs == 0")]
+    fn issue_zero_ttl_panic_message_blames_ttl_not_keypair() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let _ = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            0, // the bug — must panic with a TTL-flavored message
+            0,
+        );
+    }
+
+    /// Companion to the above: when the *real* cause is a
+    /// public-only keypair, the wrapper still panics with the
+    /// long-standing `ReadOnly`-flavored message, so existing
+    /// callsites that grep on it keep working.
+    #[test]
+    #[should_panic(expected = "public-only keypair")]
+    fn issue_public_only_keypair_panic_message_blames_keypair() {
+        let full = EntityKeypair::generate();
+        let issuer = EntityKeypair::public_only(full.entity_id().clone());
+        let subject = EntityKeypair::generate();
+        let _ = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        );
+    }
+
+    /// TTL of 1 second is the lowest valid
     /// value; must mint a token that is `is_valid()` immediately.
     #[test]
     fn try_issue_accepts_one_second_ttl() {
@@ -835,7 +892,7 @@ mod tests {
 
         // Mint with the minimum valid TTL (1 second), then
         // backdate `not_after` to the past and re-sign — this is
-        // how we test expiry semantics now that BUG #22 rejects
+        // how we test expiry semantics now that try_issue rejects
         // `duration_secs == 0` outright.
         let mut token = PermissionToken::issue(
             &issuer,
@@ -1226,7 +1283,7 @@ mod tests {
         let cache = TokenCache::new();
 
         // Insert an expired channel-specific token. Mint with
-        // TTL=1 (BUG #22 rejects 0), then backdate not_after to
+        // TTL=1 (try_issue rejects 0), then backdate not_after to
         // force expiry.
         let mut expired_token = PermissionToken::issue(
             &issuer,
@@ -1758,7 +1815,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #146: TokenCache must bound slot growth and within-slot growth
+    // TokenCache must bound slot growth and within-slot growth
     // ========================================================================
 
     /// Helper: build a token whose subject is the bytes of `subject_seed`
@@ -1994,7 +2051,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #121: try_issue / delegate must NOT panic on public-only keypair
+    // try_issue / delegate must NOT panic on public-only keypair
     // ========================================================================
 
     /// `try_issue` returns `TokenError::ReadOnly` instead of
@@ -2019,7 +2076,7 @@ mod tests {
         );
         assert!(
             matches!(result, Err(TokenError::ReadOnly)),
-            "try_issue must surface public-only keypair as ReadOnly (BUG #121), got {:?}",
+            "try_issue must surface public-only keypair as ReadOnly, got {:?}",
             result.map(|_| "Ok"),
         );
     }
@@ -2052,7 +2109,7 @@ mod tests {
         );
         assert!(
             matches!(result, Err(TokenError::ReadOnly)),
-            "delegate must surface public-only signer as ReadOnly (BUG #121), got {:?}",
+            "delegate must surface public-only signer as ReadOnly, got {:?}",
             result.map(|_| "Ok"),
         );
     }

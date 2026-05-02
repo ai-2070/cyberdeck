@@ -140,7 +140,7 @@ fn token_err_to_code(e: &CoreTokenError) -> c_int {
         // token-content issue. The error message in `Display`
         // makes the cause clear to the caller.
         CoreTokenError::ReadOnly => NET_ERR_IDENTITY,
-        // BUG #22: a zero-TTL request is a malformed token-issue
+        // A zero-TTL request is a malformed token-issue
         // input. Routes to `NET_ERR_TOKEN_INVALID_FORMAT` (the
         // closest existing semantic — invalid input shape) so
         // the C/Go header surface stays unchanged. The Display
@@ -3106,7 +3106,7 @@ mod tests {
         net_free_bytes(&mut sentinel as *mut u8, 0);
     }
 
-    /// BUG #58: `net_free_bytes` must NOT panic when called with a
+    /// `net_free_bytes` must NOT panic when called with a
     /// `len` larger than `isize::MAX`. Pre-fix
     /// `Layout::array::<u8>(len).expect(...)` panicked on such
     /// values (a documented `Layout::array` failure mode); the

@@ -18,10 +18,10 @@
 //! on the Python side. The only async boundary is the shared
 //! tokio runtime the bindings own.
 //!
-//! BUG #6: the methods above can each block on internal locks for
+//! The methods above can each block on internal locks for
 //! milliseconds-to-seconds (scheduler placement, registry I/O,
 //! snapshot serialization). They take a `py: Python<'_>` and call
-//! `py.allow_threads(|| self.inner.<method>(...))` so the GIL is
+//! `py.detach(|| self.inner.<method>(...))` so the GIL is
 //! released during the blocking work. Daemon factory callbacks
 //! re-acquire the GIL via `Python::attach` (see compute.rs:963 et
 //! seq.), so this is safe.
@@ -263,7 +263,7 @@ impl PyReplicaGroup {
     /// different kind would silently grow the group with a
     /// different daemon implementation.
     ///
-    /// BUG #6: pre-fix this held the GIL across a scheduler
+    /// Pre-fix this held the GIL across a scheduler
     /// placement + registry insert that can block on internal
     /// locks for milliseconds-to-seconds. A Python program with
     /// a watchdog thread or asyncio loop was frozen for the
@@ -271,24 +271,23 @@ impl PyReplicaGroup {
     /// `Python::attach` (compute.rs:963/984/1016/1145) so
     /// releasing here is safe.
     fn scale_to(&self, py: Python<'_>, n: u8) -> PyResult<()> {
-        py.allow_threads(|| self.inner.scale_to(n))
-            .map_err(group_err)
+        py.detach(|| self.inner.scale_to(n)).map_err(group_err)
     }
 
     /// Handle failure of a node hosting one or more replicas.
     /// Returns the indices of replicas that were re-spawned.
     /// Reuses the group's spawn kind.
     ///
-    /// BUG #6: same GIL-blocking concern as `scale_to` —
+    /// Same GIL-blocking concern as `scale_to` —
     /// re-spawning replicas can take seconds when the registry
     /// is contended.
     fn on_node_failure(&self, py: Python<'_>, failed_node_id: u64) -> PyResult<Vec<u8>> {
-        py.allow_threads(|| self.inner.on_node_failure(failed_node_id))
+        py.detach(|| self.inner.on_node_failure(failed_node_id))
             .map_err(group_err)
     }
 
     fn on_node_recovery(&self, py: Python<'_>, recovered_node_id: u64) {
-        py.allow_threads(|| self.inner.on_node_recovery(recovered_node_id));
+        py.detach(|| self.inner.on_node_recovery(recovered_node_id));
     }
 
     #[getter]
@@ -371,20 +370,19 @@ impl PyForkGroup {
         self.inner.route_event(&rc).map_err(group_err)
     }
 
-    /// BUG #6: see `PyReplicaGroup::scale_to`; same fix applies
+    /// See `PyReplicaGroup::scale_to`; same fix applies
     /// to fork groups.
     fn scale_to(&self, py: Python<'_>, n: u8) -> PyResult<()> {
-        py.allow_threads(|| self.inner.scale_to(n))
-            .map_err(group_err)
+        py.detach(|| self.inner.scale_to(n)).map_err(group_err)
     }
 
     fn on_node_failure(&self, py: Python<'_>, failed_node_id: u64) -> PyResult<Vec<u8>> {
-        py.allow_threads(|| self.inner.on_node_failure(failed_node_id))
+        py.detach(|| self.inner.on_node_failure(failed_node_id))
             .map_err(group_err)
     }
 
     fn on_node_recovery(&self, py: Python<'_>, recovered_node_id: u64) {
-        py.allow_threads(|| self.inner.on_node_recovery(recovered_node_id));
+        py.detach(|| self.inner.on_node_recovery(recovered_node_id));
     }
 
     #[getter]
@@ -483,26 +481,25 @@ impl PyStandbyGroup {
         self.inner.active_origin()
     }
 
-    /// BUG #6: snapshot serialization can take significant time
+    /// Snapshot serialization can take significant time
     /// for large daemon states; release the GIL while it runs.
     fn sync_standbys(&self, py: Python<'_>) -> PyResult<u64> {
-        py.allow_threads(|| self.inner.sync_standbys())
-            .map_err(group_err)
+        py.detach(|| self.inner.sync_standbys()).map_err(group_err)
     }
 
-    /// BUG #6: promotion may run a snapshot-restore on the
+    /// Promotion may run a snapshot-restore on the
     /// promoted standby; release the GIL.
     fn promote(&self, py: Python<'_>) -> PyResult<u32> {
-        py.allow_threads(|| self.inner.promote()).map_err(group_err)
+        py.detach(|| self.inner.promote()).map_err(group_err)
     }
 
     fn on_node_failure(&self, py: Python<'_>, failed_node_id: u64) -> PyResult<Option<u32>> {
-        py.allow_threads(|| self.inner.on_node_failure(failed_node_id))
+        py.detach(|| self.inner.on_node_failure(failed_node_id))
             .map_err(group_err)
     }
 
     fn on_node_recovery(&self, py: Python<'_>, recovered_node_id: u64) {
-        py.allow_threads(|| self.inner.on_node_recovery(recovered_node_id));
+        py.detach(|| self.inner.on_node_recovery(recovered_node_id));
     }
 
     #[getter]

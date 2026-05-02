@@ -354,7 +354,7 @@ impl RedexFile {
     /// Next sequence to be assigned (== total append count since open,
     /// including any evicted head).
     ///
-    /// BUG #11: pre-fix this read `next_seq` outside the state
+    /// Pre-fix, this read `next_seq` outside the state
     /// lock. `append` / `append_batch` etc. allocate a seq via
     /// `fetch_add` before the disk write and `fetch_sub`-rollback
     /// on failure — both within the state-lock critical section.
@@ -500,7 +500,7 @@ impl RedexFile {
     /// in the batch, or `None` for an empty input. All entries
     /// land contiguously in the index.
     ///
-    /// # Empty input (BUG #27)
+    /// # Empty input
     ///
     /// Pre-fix the signature was `Result<u64, RedexError>` and an
     /// empty `payloads` returned `Ok(next_seq)` — the seq value
@@ -725,9 +725,8 @@ impl RedexFile {
     /// seq-ordered relative to any other ordered writers. Same
     /// failure-atomicity contract as [`Self::append_batch`].
     ///
-    /// BUG #27 corollary: returns `Some(first_seq)` on a non-empty
-    /// batch and `None` on empty input — same convention as
-    /// `append_batch`.
+    /// Returns `Some(first_seq)` on a non-empty batch and `None`
+    /// on empty input — same convention as `append_batch`.
     pub fn append_batch_ordered(&self, payloads: &[Bytes]) -> Result<Option<u64>, RedexError> {
         self.check_not_closed()?;
         if payloads.is_empty() {
@@ -893,7 +892,7 @@ impl RedexFile {
             return ReceiverStream::new(rx);
         }
 
-        // BUG #2: detect retention-induced history loss.
+        // Detect retention-induced history loss.
         // `partition_point(|e| e.seq < from_seq)` only catches
         // overflow within the retained range — it cannot tell us
         // the requested `from_seq` predates the lowest retained
@@ -996,7 +995,7 @@ impl RedexFile {
     /// Run the retention policy synchronously. Exposed so a background
     /// task (heartbeat loop) can drive it; no hot-path cost.
     ///
-    /// # BUG #12 — disk I/O under parking_lot Mutex
+    /// # Disk I/O under parking_lot Mutex
     ///
     /// `sweep_retention` and `append_batch` call disk operations
     /// (`disk.compact_to`, `disk.append_entries_at`) while
@@ -1488,7 +1487,7 @@ mod tests {
         assert_eq!(events[1].payload.as_ref(), b"third");
     }
 
-    /// BUG #2: a subscriber that requests `tail(from_seq)` for a
+    /// A subscriber that requests `tail(from_seq)` for a
     /// `from_seq` BELOW the lowest currently retained entry must
     /// receive `Err(Lagged)` as the first stream item, not a silently
     /// truncated history.
@@ -1525,7 +1524,7 @@ mod tests {
         );
     }
 
-    /// BUG #2 corollary: `from_seq` exactly at or above the lowest
+    /// `from_seq` exactly at or above the lowest
     /// retained head must NOT signal `Lagged` — every requested seq
     /// is still present.
     #[tokio::test]
@@ -1549,7 +1548,7 @@ mod tests {
         );
     }
 
-    /// BUG #2 corollary: `from_seq < next_seq` with no retained
+    /// `from_seq < next_seq` with no retained
     /// entries also signals `Lagged` — events were appended and
     /// then entirely retention-evicted.
     #[tokio::test]
@@ -1574,7 +1573,7 @@ mod tests {
         );
     }
 
-    /// BUG #2 corollary: `from_seq >= next_seq` (waiting for future
+    /// `from_seq >= next_seq` (waiting for future
     /// events) on an empty index must NOT signal `Lagged` — the
     /// subscriber is just ahead of the file.
     #[tokio::test]

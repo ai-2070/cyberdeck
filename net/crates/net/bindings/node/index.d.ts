@@ -790,6 +790,19 @@ export declare class NetMesh {
   findNodesScoped(filter: CapabilityFilterJs, scope: ScopeFilterJs): Array<bigint>
   /** Shutdown the mesh node. */
   shutdown(): Promise<void>
+  /**
+   * **Test-only** helper for the vitest groups suite.
+   * Injects a synthetic capability announcement directly
+   * into the local capability index, simulating a peer
+   * announcement without going through a real handshake.
+   *
+   * Gated behind the `test-helpers` feature so it is
+   * **not** exported to production JS consumers. Enabling
+   * `groups` alone does not pull this in; vitest builds with
+   * `--features groups,test-helpers` explicitly. Production
+   * code uses the normal `announce_capabilities` path.
+   */
+  testInjectSyntheticPeer(nodeId: bigint): void
 }
 
 /**
@@ -841,10 +854,16 @@ export declare class RedexFile {
   append(payload: Buffer): bigint
   /**
    * Append a batch of payloads atomically. Returns the sequence
-   * number of the FIRST appended event; callers deduce subsequent
+   * number of the FIRST appended event, or `null` if `payloads`
+   * was empty (no events appended). Callers deduce subsequent
    * seqs as `first + 0, first + 1, ...`.
+   *
+   * The underlying `RedexFile::append_batch`
+   * returns `Result<Option<u64>>` so callers can distinguish
+   * "wrote zero" from "wrote one with seq N". The TypeScript
+   * signature mirrors that — `BigInt | null`.
    */
-  appendBatch(payloads: Array<Buffer>): bigint
+  appendBatch(payloads: Array<Buffer>): bigint | null
   /**
    * Read the half-open range `[start, end)` from the in-memory
    * index. Returns only entries still retained — any seq in the
@@ -891,44 +910,6 @@ export declare class RedexTailIter {
   next(): Promise<RedexEventJs | null>
   /** Terminate the iterator. Idempotent. */
   close(): void
-}
-
-/**
- * Consumer-side dedup helper for the Redis Streams adapter.
- *
- * See `net::adapter::redis` module docs for the producer-side
- * contract that produces the `dedup_id` field this helper filters
- * on.
- */
-export declare class RedisStreamDedup {
-  /**
-   * Create a helper with the given LRU capacity. Defaults to
-   * 4096 if omitted. `0` is clamped to 1.
-   *
-   * Sizing: a consumer at ~10k events/sec with a 1 min
-   * dedup window should pick ~600k.
-   */
-  constructor(capacity?: number | undefined | null)
-  /**
-   * Test-and-insert: returns `true` if the caller should treat
-   * the entry as a DUPLICATE (skip it), `false` if it's the
-   * first time we've seen this `dedupId`.
-   *
-   * Matches the Rust `is_duplicate(&mut self, &str) -> bool`.
-   */
-  isDuplicate(dedupId: string): boolean
-  /** Number of distinct ids currently tracked. */
-  get len(): number
-  /** Configured maximum capacity. */
-  get capacity(): number
-  /** True if no ids are tracked yet. */
-  get isEmpty(): boolean
-  /**
-   * Clear all tracked ids. Use after a consumer-group
-   * rebalance to reset the dedup window without losing the
-   * helper instance.
-   */
-  clear(): void
 }
 
 export declare class ReplicaGroup {
@@ -992,8 +973,23 @@ export declare class StandbyGroup {
   get health(): GroupHealthJs
   get activeHealthy(): boolean
   get activeIndex(): number
-  /** `"active"` | `"standby"` | `null` (out-of-range index). */
+  /**
+   * `"active"` | `"standby"` | `null` (out-of-range index).
+   *
+   * Pre-fix, `index as u8` silently wrapped — a JS caller
+   * passing 256 expected null (out-of-range) but received the role
+   * for member 0. `u8::try_from` returns `Err` on overflow, which
+   * we map to `None` for the documented contract.
+   */
   memberRole(index: number): string | null
+  /**
+   * Returns the highest event sequence the standby member at
+   * `index` has acknowledged, or `null` if `index` is out of range.
+   *
+   * Same wrapping hazard as `member_role`. A JS caller
+   * polling sync progress for index 257 would silently get the
+   * lag of member 1 and could make an incorrect failover decision.
+   */
   syncedThrough(index: number): bigint | null
   get bufferedEventCount(): number
   get groupId(): number

@@ -139,7 +139,7 @@ where
                         match next {
                             Some(Ok(event)) => apply_event(&task_inner, &project, &event),
                             Some(Err(RedexError::Lagged)) => {
-                                // BUG #3: pre-fix, the loop just
+                                // Pre-fix, the loop just
                                 // logged at debug! and continued,
                                 // but the underlying watcher had
                                 // been dropped from the file —
@@ -179,7 +179,7 @@ where
                                 tracing::debug!(error = %e, "RedexIndex tail error; continuing");
                             }
                             None => {
-                                // BUG #3 corollary: stream ended.
+                                // Stream ended.
                                 // Two distinct causes share this
                                 // branch:
                                 //   (a) the file was closed —
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(idx.len(), 1);
     }
 
-    /// BUG #3: a `Lagged` from the underlying tail must NOT
+    /// A `Lagged` from the underlying tail must NOT
     /// permanently halt the index task. Pre-fix the loop logged at
     /// debug! and continued, but the file had already dropped the
     /// watcher — the next `tail.next()` returned `None` and the
@@ -557,7 +557,7 @@ mod tests {
         // `None`.
         let post_keys = idx.get(&"post".to_string()).expect(
             "post-lag bucket missing — pre-fix the index task halted \
-                 permanently after Lagged and never observed these events (BUG #3)",
+                 permanently after Lagged and never observed these events",
         );
         assert_eq!(
             post_keys.len(),
@@ -574,7 +574,7 @@ mod tests {
         }
     }
 
-    /// BUG #3 corollary: closing the file naturally must still
+    /// Closing the file naturally must still
     /// terminate the index task (no infinite re-tail loop).
     #[tokio::test]
     async fn index_terminates_when_file_closes() {

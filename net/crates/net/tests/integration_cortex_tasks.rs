@@ -496,7 +496,7 @@ async fn test_regression_fold_rejects_checksum_mismatch() {
     // Regression (originally): neither `TasksFold` nor `MemoriesFold`
     // verified `EventMeta::checksum` against the payload tail.
     //
-    // Updated for BUG #141 (2026-04-30): both folds now stamp
+    // Updated 2026-04-30: both folds now stamp
     // `RedexError::Decode` on checksum mismatch (instead of
     // `Encode`), and the cortex adapter's `Stop` policy treats
     // `Decode` as skip-and-continue. The original test asserted
@@ -545,8 +545,8 @@ async fn test_regression_fold_rejects_checksum_mismatch() {
     // errors are recoverable per-event failures, not stream-fatal.
     assert!(
         adapter.is_running(),
-        "fold task must continue after checksum mismatch (BUG #141 — \
-         decode errors are recoverable under Stop policy)"
+        "fold task must continue after checksum mismatch — \
+         decode errors are recoverable under Stop policy"
     );
     assert_eq!(
         adapter.fold_errors(),
@@ -682,7 +682,7 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
 
 #[tokio::test]
 async fn test_open_returns_with_state_already_caught_up() {
-    // BUG #148 fix changed `TasksAdapter::open[_with_config]` to await
+    // The fix changed `TasksAdapter::open[_with_config]` to await
     // the inner fold task's catch-up before returning. After this
     // change a fresh adapter opened against a non-empty Redex sees
     // the full state synchronously — no `wait_for_seq` required.
@@ -776,7 +776,7 @@ async fn test_open_from_snapshot_with_empty_replay_tail_keeps_snapshot_app_seq()
 
 #[tokio::test]
 async fn test_regression_open_advances_app_seq_past_existing_same_origin_events() {
-    // Regression for BUG #148 secondary-fix: pre-fix
+    // Regression: pre-fix
     // `TasksAdapter::open` set `app_seq = AtomicU64::new(0)`
     // unconditionally, so reopening against a Redex (or persistent
     // file) that already had same-origin events caused the next
@@ -828,7 +828,7 @@ async fn test_regression_open_advances_app_seq_past_existing_same_origin_events(
 
 #[tokio::test]
 async fn test_regression_open_ignores_other_origins_when_advancing_app_seq() {
-    // The `WatermarkingFold` wrapper installed by BUG #148's fix
+    // The `WatermarkingFold` wrapper installed by the fix
     // only advances `app_seq` for events whose `origin_hash` matches
     // the adapter's. An adapter for origin A reopening against a
     // file populated by origin B should still see `app_seq = 0` for

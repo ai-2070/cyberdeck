@@ -399,7 +399,7 @@ impl MigrationTargetHandler {
     /// by the next `replay_events` / `buffer_event` / `activate`) resumes
     /// at the failure point.
     ///
-    /// BUG #1: pre-fix, this returned `?` on the first delivery error
+    /// Pre-fix, this returned `?` on the first delivery error
     /// without updating `replayed_through` and without restoring the
     /// remaining events. Every event in `to_replay` had already been
     /// removed from `pending_events` upstream, so on retry the
@@ -409,7 +409,7 @@ impl MigrationTargetHandler {
     fn drain_pending(&self, state: &mut TargetMigrationState) -> Result<(), MigrationError> {
         // Collect events to replay (contiguous from replayed_through + 1).
         //
-        // BUG #31: pre-fix `state.replayed_through + 1` and `next_seq
+        // Pre-fix `state.replayed_through + 1` and `next_seq
         // += 1` would panic in debug or wrap to 0 in release at
         // u64::MAX. Saturating arithmetic clamps at u64::MAX so an
         // (astronomical) overflow surfaces as "no further events
@@ -1082,7 +1082,7 @@ mod tests {
         }
     }
 
-    /// BUG #1: a daemon whose `process()` fails on event N of M during
+    /// A daemon whose `process()` fails on event N of M during
     /// `replay_events` would, pre-fix, lose every event with seq > N
     /// permanently — `drain_pending` removed all M events from
     /// `pending_events` upstream of the delivery loop, and the `?`
@@ -1187,7 +1187,7 @@ mod tests {
             handler.replayed_through(origin),
             Some(2),
             "replayed_through must advance past the events that did \
-             land before the failure (BUG #1)"
+             land before the failure"
         );
 
         // Confirm 3 process() calls happened (1 OK, 2 OK, 3 fail).
@@ -1207,7 +1207,7 @@ mod tests {
         assert_eq!(
             replayed, 5,
             "second drain must replay seq 3, 4, 5 — pre-fix these were \
-             permanently lost when the first batch errored (BUG #1)"
+             permanently lost when the first batch errored"
         );
         assert_eq!(handler.replayed_through(origin), Some(5));
     }

@@ -79,7 +79,7 @@ impl SubnetPolicy {
 
     /// Fallible variant of [`Self::add_rule`].
     ///
-    /// BUG #9: pre-existing `add_rule` panics on `rule.level >= 4`.
+    /// Pre-existing `add_rule` panics on `rule.level >= 4`.
     /// Subnet policies typically come from config / FFI / JSON and
     /// a malformed entry should surface as a recoverable error
     /// rather than crashing the daemon loader.
@@ -142,7 +142,7 @@ impl SubnetRule {
 
     /// Fallible variant of [`Self::map`].
     ///
-    /// BUG #9: pre-existing `map` panics on `level_value == 0`.
+    /// Pre-existing `map` panics on `level_value == 0`.
     /// Returns [`SubnetError::LevelValueReserved`] instead.
     pub fn try_map(
         mut self,
@@ -388,7 +388,7 @@ mod tests {
         );
     }
 
-    /// BUG #9: out-of-range `level` must surface as `Err(...)`,
+    /// Out-of-range `level` must surface as `Err(...)`,
     /// not panic. Subnet policies typically come from config /
     /// FFI / JSON; a malformed entry must not crash the daemon
     /// loader.
@@ -414,7 +414,7 @@ mod tests {
             .expect("level=3 must be accepted (boundary)");
     }
 
-    /// BUG #9: zero `level_value` must surface as `Err(...)`,
+    /// Zero `level_value` must surface as `Err(...)`,
     /// not panic.
     #[test]
     fn try_map_rejects_reserved_zero() {

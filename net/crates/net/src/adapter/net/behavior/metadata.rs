@@ -1670,7 +1670,7 @@ mod tests {
         got.validate_bounds().expect(
             "CR-30: every node returned from MetadataStore::get MUST satisfy \
              validate_bounds. If this fires, a write path is bypassing \
-             upsert's bound check (BUG #124).",
+             upsert's bound check.",
         );
 
         // Read via `query`: same invariant.
@@ -1695,7 +1695,7 @@ mod tests {
     /// cap also has to update this test.
     ///
     /// (Mirrors the pattern in `TokenCache::insert_unchecked` and
-    /// `ContextStore::create_context` after BUG #136.)
+    /// `ContextStore::create_context`.)
     #[test]
     fn cr18_capacity_check_is_a_soft_cap_under_concurrent_upserts() {
         use std::sync::Arc;
@@ -1754,7 +1754,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #124: NodeMetadata bounds must be enforced before indexing
+    // NodeMetadata bounds must be enforced before indexing
     // ========================================================================
 
     /// Oversized tag set is rejected by `upsert` before touching the
@@ -1771,7 +1771,7 @@ mod tests {
         let result = store.upsert(node);
         assert!(
             matches!(result, Err(MetadataError::Invalid(_))),
-            "oversized tags must surface as MetadataError::Invalid (BUG #124), got {:?}",
+            "oversized tags must surface as MetadataError::Invalid, got {:?}",
             result,
         );
     }
@@ -1814,7 +1814,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #123: upsert must serialize concurrent writers on the same node_id
+    // upsert must serialize concurrent writers on the same node_id
     // ========================================================================
 
     /// Concurrent `upsert`s on the same `node_id` with DIFFERENT
@@ -1901,7 +1901,7 @@ mod tests {
             } else {
                 assert!(
                     !bucket_has_node,
-                    "stale status {:?} bucket must NOT contain the node (BUG #123)",
+                    "stale status {:?} bucket must NOT contain the node",
                     status
                 );
             }
@@ -1923,7 +1923,7 @@ mod tests {
                     .unwrap_or(false);
                 assert!(
                     !bucket_has_node,
-                    "stale tag '{}' bucket must NOT contain the node (BUG #123)",
+                    "stale tag '{}' bucket must NOT contain the node",
                     tag
                 );
             }
@@ -1936,7 +1936,7 @@ mod tests {
             .unwrap_or(false);
         assert!(
             !seed_bucket_has_node,
-            "the original seed tag must have been removed (BUG #123)"
+            "the original seed tag must have been removed"
         );
     }
 

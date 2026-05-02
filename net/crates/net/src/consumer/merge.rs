@@ -99,7 +99,7 @@ impl CompositeCursor {
 
     /// Encode the cursor as a base64 string.
     ///
-    /// BUG #63: pre-fix used `unwrap_or_default()`, which silently
+    /// Pre-fix used `unwrap_or_default()`, which silently
     /// produced an empty string on serialization failure. The
     /// empty cursor then base64-encoded to an empty string and
     /// the consumer's next poll restarted from the beginning of
@@ -110,7 +110,7 @@ impl CompositeCursor {
     /// as a clear "BUG" panic rather than a silent restart.
     pub fn encode(&self) -> String {
         let json = serde_json::to_string(&self.positions).expect(
-            "BUG #63: CompositeCursor::encode failed to serialize positions; \
+            "CompositeCursor::encode failed to serialize positions; \
                      the schema (HashMap<u16, Arc<str>>) is supposed to be infallible",
         );
         BASE64.encode(json.as_bytes())
@@ -236,7 +236,7 @@ pub struct ConsumeResponse {
     /// events than `limit` per `poll()` even when the underlying
     /// streams have more — pagination via `next_id` still works.
     ///
-    /// BUG #57: pre-fix this clamp was silent. The default is
+    /// Pre-fix this clamp was silent. The default is
     /// `false`; tools building observability around large polls
     /// can detect under-delivery via this flag.
     pub truncated_at_per_shard_cap: bool,
@@ -247,7 +247,7 @@ pub struct ConsumeResponse {
     /// monitoring adapter health should know which shards are
     /// stuck.
     ///
-    /// BUG #64: pre-fix the suppression was logged at warn but
+    /// Pre-fix the suppression was logged at warn but
     /// invisible to callers. Empty on the happy path; populated
     /// only when a stall was detected and suppressed.
     pub stalled_shards: Vec<u16>,
@@ -302,7 +302,7 @@ pub struct PollMerger {
     /// Active shard IDs to poll when the request omits an explicit
     /// `shards` list.
     ///
-    /// BUG #67: previously stored only `num_shards: u16` and generated
+    /// Previously stored only `num_shards: u16` and generated
     /// `(0..num_shards)` on every default-shards poll. After a dynamic
     /// scale-down (`ShardMapper::scale_down` evicts the lowest-weight
     /// shard, not necessarily the highest id), the active id set can
@@ -351,7 +351,7 @@ impl PollMerger {
         // Calculate per-shard limit (over-fetch to account for filtering)
         // Use ceiling division to avoid truncating to 0 when limit < shard count.
         //
-        // BUG #57: pre-fix this `min(10_000)` clamp was silent —
+        // Pre-fix this `min(10_000)` clamp was silent —
         // a caller with `limit=200_000` over 10 shards expected
         // 20 000/shard plus over-fetch but got 10 000/shard with
         // no diagnostic. Track whether the clamp triggered and
@@ -393,7 +393,7 @@ impl PollMerger {
             .sum();
         let mut all_events = Vec::with_capacity(total_events);
         let mut any_has_more = false;
-        // BUG #64: track which shards reported `has_more=true` so
+        // Track which shards reported `has_more=true` so
         // we can surface them on the response when the merger
         // suppresses has_more for caller-protection. Pre-fix, an
         // adapter stuck reporting `has_more=true` with no events
@@ -642,7 +642,7 @@ impl PollMerger {
         // response and must back off rather than spin.
         let we_made_progress = !all_events.is_empty() || cursor_advanced;
         let has_more = (any_has_more || had_extra || all_filtered) && we_made_progress;
-        // BUG #64: when we suppress has_more for caller-protection
+        // When we suppress has_more for caller-protection
         // (an adapter stuck at has_more=true with no progress),
         // surface the offending shard ids on the response so
         // operators can alert. Pre-fix the suppression was warn-
@@ -705,7 +705,7 @@ mod tests {
         let events = vec![
             StoredEvent::from_value("100-0".to_string(), json!({}), 100, 0),
             StoredEvent::from_value("200-0".to_string(), json!({}), 200, 1),
-            // BUG #66: this used to be "later event in shard 0" by
+            // This used to be "later event in shard 0" by
             // virtue of being LAST in the input slice, but its id
             // (150-0) is stream-order BEFORE 200-0 — wait, this is
             // for shard 0 not shard 1. shard 0 only had 100-0
@@ -720,7 +720,7 @@ mod tests {
         assert_eq!(cursor.get(1), Some("200-0"));
     }
 
-    /// BUG #66: cursor must NOT regress when events arrive in a
+    /// Cursor must NOT regress when events arrive in a
     /// non-ascending order for the same shard. Pre-fix the cursor
     /// for shard 0 would land on `100-0` (the last item in the
     /// slice), regressing past `200-0`.
@@ -738,11 +738,11 @@ mod tests {
         assert_eq!(
             cursor.get(0),
             Some("200-0"),
-            "cursor must hold the highest id, not the last-in-slice id (BUG #66)",
+            "cursor must hold the highest id, not the last-in-slice id",
         );
     }
 
-    /// BUG #66: a partial overlap (advance for one shard, regression
+    /// A partial overlap (advance for one shard, regression
     /// attempt for another shard) must keep both cursors at their
     /// respective max.
     #[test]
@@ -1206,7 +1206,7 @@ mod tests {
         assert_eq!(merger.shard_ids, vec![0, 1, 2, 3]);
     }
 
-    /// BUG #67: when the active shard id set is sparse (e.g. shard 0
+    /// When the active shard id set is sparse (e.g. shard 0
     /// was scaled down, leaving `{1, 2}`), a poll with no explicit
     /// `request.shards` must hit shards 1 and 2 — not generate
     /// `[0, 1]` from a stale count and miss the live shard 2.
@@ -1731,7 +1731,7 @@ mod tests {
         assert_eq!(response2.events.len(), 4, "Should get remaining 4 events");
     }
 
-    /// BUG #57: when the per-shard fetch hits the
+    /// When the per-shard fetch hits the
     /// PER_SHARD_FETCH_CAP clamp, the response must surface
     /// `truncated_at_per_shard_cap = true` so callers can detect
     /// the silent under-delivery.
@@ -1752,11 +1752,11 @@ mod tests {
         let response = merger.poll(ConsumeRequest::new(50_000)).await.unwrap();
         assert!(
             response.truncated_at_per_shard_cap,
-            "BUG #57: large limit must flag the per-shard cap clamp",
+            "large limit must flag the per-shard cap clamp",
         );
     }
 
-    /// BUG #57 corollary: a small request that fits well below
+    /// Corollary: a small request that fits well below
     /// the cap must NOT flag truncation.
     #[tokio::test]
     async fn poll_merger_does_not_flag_truncation_on_small_limit() {

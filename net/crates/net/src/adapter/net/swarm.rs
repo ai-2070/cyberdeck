@@ -948,7 +948,7 @@ mod tests {
     /// `last_seq` advances forward and `last_seen` refreshes,
     /// keeping the entry off the stale-cleanup path.
     ///
-    /// CR-6 + Cubic P1 update: the LIVENESS half of BUG #120 is
+    /// CR-6 + Cubic P1 update: the LIVENESS half is
     /// preserved via `touch()` only — neither `last_seq` nor
     /// `addr` updates on the unauthenticated restart-only path.
     /// Pingwaves are unauthenticated UDP and the original fix

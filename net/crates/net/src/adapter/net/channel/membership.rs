@@ -212,7 +212,7 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
                         }
                     }
                 };
-                // BUG #25: enforce strict-trailer rejection after
+                // Enforce strict-trailer rejection after
                 // the token (now that cur is correctly past it).
                 // Pre-fix, SUBSCRIBE accepted arbitrary garbage
                 // after a valid token.
@@ -233,7 +233,7 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
                 // mirror that here so the trailing-byte check
                 // below is meaningful).
                 cur.set_position(end as u64);
-                // BUG #25: pre-fix UNSUBSCRIBE returned Ok without
+                // Pre-fix UNSUBSCRIBE returned Ok without
                 // checking that the buffer was fully consumed. A
                 // malformed peer could append arbitrary bytes
                 // after a valid Unsubscribe and the decoder
@@ -269,7 +269,7 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
                 ACK_REASON_TOO_MANY_CHANNELS => Some(AckReason::TooManyChannels),
                 other => return Err(MembershipCodecError::UnknownType(other)),
             };
-            // BUG #25: same strict-trailer rejection on the ACK
+            // Same strict-trailer rejection on the ACK
             // path.
             if cur.remaining() != 0 {
                 return Err(MembershipCodecError::Truncated("trailing bytes after ack"));
@@ -487,7 +487,7 @@ mod tests {
         assert!(matches!(decode(&buf), Err(MembershipCodecError::Name(_))));
     }
 
-    /// BUG #25: trailing bytes after a valid UNSUBSCRIBE must be
+    /// Trailing bytes after a valid UNSUBSCRIBE must be
     /// rejected. Pre-fix the decoder returned Ok without checking
     /// `cur.remaining() == 0`, so a malformed peer could append
     /// garbage that hid upstream framer bugs.
@@ -507,7 +507,7 @@ mod tests {
         );
     }
 
-    /// BUG #25: same strict-trailer rejection on the ACK path.
+    /// Same strict-trailer rejection on the ACK path.
     #[test]
     fn ack_with_trailing_bytes_is_rejected() {
         let msg = MembershipMsg::Ack {
@@ -525,7 +525,7 @@ mod tests {
         );
     }
 
-    /// BUG #25: SUBSCRIBE-with-token must reject trailing bytes
+    /// SUBSCRIBE-with-token must reject trailing bytes
     /// after the token. Pre-fix this was the SUBSCRIBE path's
     /// equivalent gap.
     #[test]

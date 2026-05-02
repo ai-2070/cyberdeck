@@ -123,7 +123,7 @@ fn compare_values(
 /// Compare two `serde_json::Number` values without losing precision
 /// when both fit in an integer type.
 ///
-/// BUG #7: pre-fix, `compare_values` always reduced both sides to
+/// Pre-fix, `compare_values` always reduced both sides to
 /// `f64` via `as_f64()`. For integer fields above `2^53` (e.g. byte
 /// counts, ns timestamps, monotonic sequence numbers) the cast was
 /// lossy: two adjacent values like `9_007_199_254_740_992` and
@@ -615,7 +615,7 @@ pub struct RateLimit {
 impl Rule {
     /// Create a new rule
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
-        // BUG #21: pre-fix this used `.as_millis() as u64`, which
+        // Pre-fix this used `.as_millis() as u64`, which
         // silently truncated the u128 millis on overflow. Realistic
         // dates (anything within u64::MAX milliseconds since UNIX
         // epoch — year ~584,554,051) are unaffected, but `as`
@@ -1238,7 +1238,7 @@ impl RuleEngine {
     fn record_execution(&mut self, rule_id: &str) {
         let now = Instant::now();
 
-        // BUG #17: pre-fix this incremented `execution_count`
+        // Pre-fix this incremented `execution_count`
         // unconditionally, even for rules without a rate_limit.
         // A rule that toggled rate-limited → unlimited carried
         // its old count forever; on toggle BACK to rate-limited
@@ -1305,7 +1305,7 @@ pub struct RuleSet {
 impl RuleSet {
     /// Create a new rule set
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
-        // BUG #21: see Rule::new for rationale on saturating
+        // See Rule::new for rationale on saturating
         // u128 → u64 instead of `as u64`.
         let now = u64::try_from(
             SystemTime::now()
@@ -1376,7 +1376,7 @@ mod tests {
         );
     }
 
-    /// BUG #7: pre-fix, both sides were reduced to f64 via
+    /// Pre-fix, both sides were reduced to f64 via
     /// `as_f64()`. Two adjacent u64 values above 2^53 round to
     /// the same f64 — `9_007_199_254_740_992` and
     /// `9_007_199_254_740_993` both become `9007199254740992.0`,
@@ -1393,24 +1393,24 @@ mod tests {
         // the same f64).
         assert!(
             CompareOp::Gt.evaluate(&big, &small),
-            "Gt must distinguish u64 values one apart at the f64 boundary (BUG #7)"
+            "Gt must distinguish u64 values one apart at the f64 boundary"
         );
         assert!(
             !CompareOp::Gt.evaluate(&small, &big),
-            "Gt must NOT report the smaller value as greater (BUG #7)"
+            "Gt must NOT report the smaller value as greater"
         );
         assert!(
             CompareOp::Lt.evaluate(&small, &big),
-            "Lt must distinguish at the f64 boundary (BUG #7)"
+            "Lt must distinguish at the f64 boundary"
         );
         assert!(
             !CompareOp::Eq.evaluate(&small, &big),
-            "Eq must NOT collapse two distinct u64 values (BUG #7); \
+            "Eq must NOT collapse two distinct u64 values; \
              pre-fix these compared equal because both round to the same f64"
         );
     }
 
-    /// BUG #7: very large u64 values (> i64::MAX) must still
+    /// Very large u64 values (> i64::MAX) must still
     /// compare correctly even though as_i64() returns None for
     /// them.
     #[test]
@@ -1421,7 +1421,7 @@ mod tests {
         assert!(CompareOp::Lt.evaluate(&b, &a));
     }
 
-    /// BUG #7: comparing a negative i64 against a u64 above
+    /// Comparing a negative i64 against a u64 above
     /// i64::MAX must always say "negative is less". Pre-fix the
     /// f64 fallback could happen to give a numerically correct
     /// answer here (negatives < positives in f64), but only by
@@ -1434,7 +1434,7 @@ mod tests {
         assert!(CompareOp::Gt.evaluate(&huge, &neg));
     }
 
-    /// BUG #7 corollary: floats still work via the f64 fallback.
+    /// Floats still work via the f64 fallback.
     #[test]
     fn float_comparisons_still_work_via_fallback() {
         let a = serde_json::json!(1.5);
@@ -1443,7 +1443,7 @@ mod tests {
         assert!(CompareOp::Gt.evaluate(&b, &a));
     }
 
-    /// BUG #7 corollary: integer-vs-float comparison falls back
+    /// Integer-vs-float comparison falls back
     /// to f64 (with the documented loss of precision for huge
     /// integers, which is unavoidable when one side is a float).
     #[test]

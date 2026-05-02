@@ -70,7 +70,7 @@ pub(crate) fn compute_eviction_count(
     // within a single process, so the first entry with
     // `ts >= cutoff` marks the retained head.
     //
-    // BUG #23: pre-fix the predicate was `ts > cutoff` (drop on
+    // Pre-fix, the predicate was `ts > cutoff` (drop on
     // `ts <= cutoff`), so an entry with `ts == cutoff` — i.e.
     // an entry exactly `max_age_ns` old — was dropped.
     // Intuitive "max age" semantics retain the boundary entry;
@@ -217,7 +217,7 @@ mod tests {
         // max_age = 5 ns, now = 1009 → cutoff = 1004. Drop entries
         // with ts < 1004: ts 1000..=1003 = 4 entries.
         //
-        // BUG #23 (breaking change): pre-fix, the predicate was
+        // Breaking change: pre-fix, the predicate was
         // `ts > cutoff` (drop on `ts <= cutoff`), so an entry
         // exactly `max_age_ns` old (ts == cutoff) was dropped —
         // 5 entries dropped here. Post-fix uses `ts >= cutoff`
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(compute_eviction_count(&entries, &ts, 1000, &cfg), 10);
     }
 
-    /// BUG #23 regression: an entry with timestamp exactly equal
+    /// Regression: an entry with timestamp exactly equal
     /// to the cutoff (`ts == now - max_age_ns`) — i.e. an entry
     /// that is exactly `max_age_ns` old — must be RETAINED, not
     /// dropped. Pre-fix the predicate was `ts > cutoff` (drop on
@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(
             compute_eviction_count(&entries, &ts, 20, &cfg),
             1,
-            "BUG #23: entry at exactly cutoff (ts=15, max_age=5, now=20) \
+            "entry at exactly cutoff (ts=15, max_age=5, now=20) \
              must be retained — pre-fix this dropped 2 entries"
         );
     }

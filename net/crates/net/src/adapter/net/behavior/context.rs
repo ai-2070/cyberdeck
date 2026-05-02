@@ -1549,7 +1549,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #136: create_context capacity check must be atomic
+    // create_context capacity check must be atomic
     // ========================================================================
 
     /// Concurrent `create_context` calls must not grow `contexts` past
@@ -1592,7 +1592,7 @@ mod tests {
         assert!(
             stats.active_traces <= MAX_TRACES as u64,
             "active_traces ({}) exceeded MAX_TRACES ({}) — admission gate \
-             must hold under concurrent inserts (BUG #136)",
+             must hold under concurrent inserts",
             stats.active_traces,
             MAX_TRACES,
         );
@@ -1649,7 +1649,7 @@ mod tests {
 
     /// `complete_trace` releases an `active_count` slot so the
     /// store can re-admit after a trace finishes. Without this,
-    /// the BUG #136 atomic counter would leak slots and the
+    /// the atomic counter would leak slots and the
     /// admission gate would refuse new traces even after the
     /// `contexts` map shrinks.
     #[test]
@@ -1773,7 +1773,7 @@ mod tests {
         );
     }
 
-    /// CR-21 / BUG #150: pin that this module's `random_u64`
+    /// CR-21: pin that this module's `random_u64`
     /// uses the abort-on-fail pattern, NOT `expect()` or
     /// `.unwrap()`. A getrandom panic here would unwind across
     /// any `extern "C"` FFI frame that called into the trace

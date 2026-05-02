@@ -157,7 +157,7 @@ mod tests {
     use super::*;
 
     /// Smoke test: NAPI surface answers the same way as the Rust
-    /// helper for the canonical BUG #57 producer-retry scenario.
+    /// helper for the canonical producer-retry scenario.
     /// Pre-fix consumers had no way to filter — the duplicate
     /// XADDs reached the application; the helper makes the filter
     /// trivial.

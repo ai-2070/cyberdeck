@@ -6,7 +6,7 @@
 //!
 //! # Threat model — origin spoofability inside an authenticated channel
 //!
-//! BUG #29: `origin_hash` is written verbatim into the wire header
+//! `origin_hash` is written verbatim into the wire header
 //! and protected only by the channel's AEAD seal. There is **no
 //! per-packet signature** binding the payload to the originator's
 //! keypair. Any peer with the session key (i.e., any node admitted

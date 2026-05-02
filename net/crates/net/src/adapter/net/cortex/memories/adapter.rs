@@ -83,7 +83,7 @@ impl MemoriesAdapter {
     /// so the first `ingest_typed` after `open` cannot collide
     /// with an already-stored event THIS ADAPTER caused.
     ///
-    /// # BUG #13 — single-origin invariant
+    /// # Single-origin invariant
     ///
     /// `app_seq` is initialized by reading `file.next_seq()` and
     /// awaiting `wait_for_seq(next_seq - 1)`. If another writer
@@ -105,7 +105,7 @@ impl MemoriesAdapter {
     ///
     /// The pre-fix doc said "the first `ingest_typed` after open
     /// cannot collide with an already-stored event" full-stop;
-    /// the qualifier "THIS ADAPTER caused" is BUG #13's correction.
+    /// the qualifier "THIS ADAPTER caused" is the correction.
     pub async fn open(redex: &Redex, origin_hash: u32) -> Result<Self, CortexAdapterError> {
         Self::open_with_config(redex, origin_hash, RedexFileConfig::default()).await
     }

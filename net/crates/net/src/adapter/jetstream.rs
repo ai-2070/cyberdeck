@@ -105,7 +105,7 @@ impl JetStreamAdapter {
         let value: serde_json::Value = serde_json::from_slice(data)?;
 
         let raw = value.get("r").cloned().unwrap_or(serde_json::Value::Null);
-        // BUG #53: pre-fix used `unwrap_or_default()` on the
+        // Pre-fix used `unwrap_or_default()` on the
         // re-serialize, so a malformed/oversized `r` value whose
         // serialization failed silently became empty bytes. The
         // event was then "delivered" with an empty payload
@@ -123,7 +123,7 @@ impl JetStreamAdapter {
         })?);
         let insertion_ts = value.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
 
-        // BUG #39: pre-fix this was `... as u16`, which silently
+        // Pre-fix this was `... as u16`, which silently
         // wrapped on a stored shard_id > 65 535 (e.g. 100 000 →
         // 34 464). The result was a misrouted event at consume
         // time, classified to a different shard than it was
@@ -423,7 +423,7 @@ impl Adapter for JetStreamAdapter {
 
         // Parse the cursor (sequence number).
         //
-        // BUG #69: pre-fix, `seq + 1` panicked in debug or wrapped
+        // Pre-fix, `seq + 1` panicked in debug or wrapped
         // to 0 in release on a caller-supplied cursor of `u64::MAX`,
         // silently restarting polling from the start of the stream
         // and re-delivering everything. Cursors are produced by the
@@ -439,7 +439,7 @@ impl Adapter for JetStreamAdapter {
 
         // Fetch one extra to detect has_more.
         //
-        // BUG #71: `limit + 1` panicked in debug or wrapped to 0 in
+        // Pre-fix `limit + 1` panicked in debug or wrapped to 0 in
         // release on `limit == usize::MAX`. The FFI poll-request
         // JSON path does `usize::try_from` but doesn't bound the
         // value, so an attacker could craft a request that returns
@@ -505,7 +505,7 @@ impl Adapter for JetStreamAdapter {
         let mut last_seen_seq: Option<u64> = None;
         let mut max_seq = max_seq;
         let mut max_seq_re_checked = false;
-        // BUG #54: pre-fix, on `stream.info()` failure for a
+        // Pre-fix, on `stream.info()` failure for a
         // cold/empty stream, `first_seq=0` and `max_seq=start_seq+
         // fetch_limit*10` together caused the loop to walk every
         // sequence from 1 to `max_seq`, doing one direct_get RTT
@@ -547,7 +547,12 @@ impl Adapter for JetStreamAdapter {
                     consecutive_not_found = 0;
                     match Self::deserialize_event(current_seq, &msg.payload) {
                         Ok(event) => events.push(event),
-                        Err(e) => {
+                        // Per-record JSON corruption is treated as a
+                        // skippable hole in the stream — the cursor
+                        // still advances (`last_seen_seq` is set
+                        // above) so the consumer doesn't re-fetch the
+                        // bad record forever.
+                        Err(e @ AdapterError::Serialization(_)) => {
                             tracing::warn!(
                                 stream = %self.stream_name(shard_id),
                                 seq = current_seq,
@@ -555,6 +560,17 @@ impl Adapter for JetStreamAdapter {
                                 "Failed to deserialize event, skipping"
                             );
                         }
+                        // `deserialize_event` returns
+                        // `AdapterError::Fatal` when the stored
+                        // record is structurally corrupt (e.g.
+                        // `shard_id` outside the u16 range, where
+                        // silent truncation would mis-route the
+                        // event). Propagating these surfaces the
+                        // corruption at parse time as the original
+                        // fix intended; logging-and-skipping would
+                        // re-bury it under the existing "wrong
+                        // shard" symptom downstream.
+                        Err(e) => return Err(e),
                     }
                     current_seq += 1;
                 }
@@ -564,7 +580,7 @@ impl Adapter for JetStreamAdapter {
                         DirectGetErrorKind::NotFound => {
                             // Try next sequence (there might be gaps due to deletions),
                             // but bail after `consecutive_not_found_cap` to avoid
-                            // burning RTTs on a cold stream (BUG #54).
+                            // burning RTTs on a cold stream.
                             consecutive_not_found += 1;
                             if consecutive_not_found >= consecutive_not_found_cap {
                                 tracing::debug!(
@@ -686,7 +702,7 @@ mod tests {
         assert_eq!(raw["token"], "world");
     }
 
-    /// BUG #39: a stored shard_id outside the u16 range must be
+    /// A stored shard_id outside the u16 range must be
     /// rejected, not silently wrapped via `as u16`. Pre-fix,
     /// `s: 100_000` deserialized to `shard_id = 34_464` (100 000
     /// % 65 536), routing the event under the wrong shard at
@@ -704,12 +720,46 @@ mod tests {
         );
     }
 
-    /// BUG #39 boundary: u16::MAX must still parse cleanly.
+    /// Boundary: u16::MAX must still parse cleanly.
     #[test]
     fn deserialize_event_accepts_max_u16_shard_id() {
         let data = br#"{"r":{},"t":0,"s":65535}"#;
         let event = JetStreamAdapter::deserialize_event(0, data).unwrap();
         assert_eq!(event.shard_id, u16::MAX);
+    }
+
+    /// Pins the `poll_shard` error-classification policy that the
+    /// inner match arms above implement: structurally-corrupt records
+    /// (those that surface as `AdapterError::Fatal` from
+    /// `deserialize_event`) must propagate so the corruption is
+    /// observable, while per-record `Serialization` failures are
+    /// skipped (the cursor advances via `last_seen_seq`). Without
+    /// this split, the prior fix for the out-of-range shard_id
+    /// (which deliberately upgraded the error to `Fatal`) was
+    /// re-buried by the loop's blanket `Err(_) => log+skip` arm —
+    /// the same "wrong shard" mystery the upgrade was meant to
+    /// surface.
+    #[test]
+    fn poll_shard_propagates_fatal_deserialize_errors() {
+        let bad = br#"{"r":{"token":"x"},"t":1,"s":100000}"#;
+        let fatal = JetStreamAdapter::deserialize_event(42, bad).unwrap_err();
+        assert!(
+            matches!(fatal, AdapterError::Fatal(_)),
+            "out-of-range shard_id must produce Fatal, got: {fatal:?}"
+        );
+        assert!(
+            !fatal.is_retryable(),
+            "Fatal must be non-retryable so callers don't paper over the corruption"
+        );
+
+        // Per-record JSON garbage must remain skippable so a single
+        // corrupt entry doesn't poison the whole shard's poll.
+        let junk = b"not json at all";
+        let skip = JetStreamAdapter::deserialize_event(43, junk).unwrap_err();
+        assert!(
+            matches!(skip, AdapterError::Serialization(_)),
+            "non-JSON payloads must surface as Serialization, got: {skip:?}"
+        );
     }
 
     #[test]
@@ -765,7 +815,7 @@ mod tests {
         )));
     }
 
-    /// BUG #69: a cursor of `u64::MAX` must not overflow `seq + 1`.
+    /// A cursor of `u64::MAX` must not overflow `seq + 1`.
     /// Pre-fix this panicked in debug or wrapped to `0` in release,
     /// silently restarting polling from the beginning of the
     /// stream. The fix uses `checked_add(1).unwrap_or(seq)` to
@@ -781,18 +831,18 @@ mod tests {
         // produce 0 (which would re-poll from the start of the
         // stream).
         let start_seq = parsed.checked_add(1).unwrap_or(parsed);
-        assert_ne!(start_seq, 0, "BUG #69: u64::MAX cursor must not wrap to 0");
+        assert_ne!(start_seq, 0, "u64::MAX cursor must not wrap to 0");
         assert_eq!(start_seq, u64::MAX, "must saturate at u64::MAX");
     }
 
-    /// BUG #71: `limit + 1` must not overflow on `limit ==
+    /// `limit + 1` must not overflow on `limit ==
     /// usize::MAX`. Pre-fix this panicked / wrapped to 0;
     /// `saturating_add(1)` clamps at `usize::MAX`.
     #[test]
     fn fetch_limit_with_usize_max_does_not_overflow() {
         let limit: usize = usize::MAX;
         let fetch_limit = limit.saturating_add(1);
-        assert_ne!(fetch_limit, 0, "BUG #71: usize::MAX must not wrap to 0");
+        assert_ne!(fetch_limit, 0, "usize::MAX must not wrap to 0");
         assert_eq!(fetch_limit, usize::MAX);
     }
 }

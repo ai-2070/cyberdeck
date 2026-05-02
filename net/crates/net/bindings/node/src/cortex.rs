@@ -278,7 +278,7 @@ impl RedexFile {
     /// was empty (no events appended). Callers deduce subsequent
     /// seqs as `first + 0, first + 1, ...`.
     ///
-    /// BUG #27 cascade: the underlying `RedexFile::append_batch`
+    /// The underlying `RedexFile::append_batch`
     /// returns `Result<Option<u64>>` so callers can distinguish
     /// "wrote zero" from "wrote one with seq N". The TypeScript
     /// signature mirrors that — `BigInt | null`.

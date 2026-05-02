@@ -139,7 +139,7 @@ impl Identity {
     ///
     /// # Panics
     /// Panics on a zero `ttl` (TTL of 0 seconds would produce a
-    /// born-expired token; BUG #22). For untrusted input prefer
+    /// born-expired token). For untrusted input prefer
     /// [`Self::try_issue_token`].
     pub fn issue_token(
         &self,
@@ -155,7 +155,7 @@ impl Identity {
 
     /// Fallible variant of [`Self::issue_token`].
     ///
-    /// BUG #22: returns [`TokenError::ZeroTtl`] when `ttl ==
+    /// Returns [`TokenError::ZeroTtl`] when `ttl ==
     /// Duration::ZERO`. Pre-fix this minted a born-expired token
     /// — every receiver rejected it as `Expired` and the issuer
     /// learned about the misuse only by reading log lines on the

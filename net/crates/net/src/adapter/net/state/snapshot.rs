@@ -538,7 +538,7 @@ pub struct SnapshotStore {
     /// drops the live entry cannot rewind state by re-storing an
     /// older snapshot.
     ///
-    /// BUG #8: pre-fix the store had no such record. After
+    /// Pre-fix the store had no such record. After
     /// `remove`, ANY snapshot — including one with a
     /// `through_seq` lower than the just-removed value — was
     /// accepted. A stale producer racing retention could
@@ -587,7 +587,7 @@ impl SnapshotStore {
         let key = *snapshot.entity_id.as_bytes();
         let new_seq = snapshot.through_seq;
 
-        // BUG #8: gate on the per-entity high-water mark first.
+        // Gate on the per-entity high-water mark first.
         // The high-water survives `remove`, so a stale producer
         // racing retention can't rewind state. Order: check
         // high_water under its own shard guard, then check the
@@ -621,7 +621,7 @@ impl SnapshotStore {
         }
     }
 
-    /// Clear the per-entity high-water mark (BUG #8).
+    /// Clear the per-entity high-water mark.
     ///
     /// Use this when the entity is being legitimately rebound for
     /// a fresh reconstruction (e.g. wiping for a daemon migration
@@ -767,7 +767,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #122: store() must reject older snapshots (no rewind)
+    // store() must reject older snapshots (no rewind)
     // ========================================================================
 
     /// Building snapshots via the chain helper makes the
@@ -847,7 +847,7 @@ mod tests {
     /// the right move is to add a per-entity high-water-mark cache
     /// that survives `remove` — but that's a separate audit
     /// entry. For now: this test documents the gap.
-    /// BUG #8 (was CR-17): post-fix, the store maintains a
+    /// CR-17: post-fix, the store maintains a
     /// per-entity high-water mark that survives `remove`. A stale
     /// producer racing retention can no longer rewind state by
     /// re-storing an older snapshot under the same entity_id.
@@ -887,13 +887,13 @@ mod tests {
         let removed = store.remove(&entity_id);
         assert!(removed.is_some(), "remove must return the stored snapshot");
 
-        // BUG #8: a stale producer that races AFTER retention
-        // tries to re-store the older snapshot. Post-fix this is
-        // rejected by the high-water gate.
+        // A stale producer that races AFTER retention tries to
+        // re-store the older snapshot. Post-fix this is rejected
+        // by the high-water gate.
         let stale_rejected = !store.store(older.clone());
         assert!(
             stale_rejected,
-            "BUG #8: post-`remove`, an older snapshot must be rejected \
+            "post-`remove`, an older snapshot must be rejected \
              because the high-water mark survives remove. Pre-fix this \
              would accept and rewind state."
         );
@@ -907,9 +907,9 @@ mod tests {
         );
     }
 
-    /// BUG #8 corollary: `forget` clears the high-water so a
-    /// legitimate rebind at a lower through_seq is possible. Use
-    /// this when the entity is being reconstructed from scratch.
+    /// `forget` clears the high-water so a legitimate rebind at
+    /// a lower through_seq is possible. Use this when the entity
+    /// is being reconstructed from scratch.
     #[test]
     fn bug8_forget_clears_high_water_to_allow_rebind() {
         let store = SnapshotStore::new();
@@ -978,7 +978,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #128: try_to_bytes must NOT panic on oversized state / bindings
+    // try_to_bytes must NOT panic on oversized state / bindings
     // ========================================================================
 
     /// `try_to_bytes` returns `SnapshotError::ExceedsWireFormat`
@@ -1350,7 +1350,7 @@ mod tests {
             .open_identity_envelope(&target_priv)
             .expect_err("impostor envelope must be rejected");
         use crate::adapter::net::identity::EnvelopeError;
-        // BUG #127: post-fix the early `expected_signer_pub` check
+        // Post-fix the early `expected_signer_pub` check
         // fires first (before any cryptographic work) and surfaces
         // `InvalidSignerKey`. The pre-fix rejection was at the
         // post-decrypt cross-check (`OriginHashMismatch`) — same

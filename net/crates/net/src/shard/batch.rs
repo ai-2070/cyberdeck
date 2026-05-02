@@ -79,7 +79,7 @@ impl AdaptiveBatcher {
             }
         }
 
-        // BUG #65: also cap the deque by sample COUNT. Pre-fix the
+        // Also cap the deque by sample COUNT. Pre-fix the
         // bound was time-only, so at 100k events/s with a 100 ms
         // velocity_window the deque could grow to ~10 000 entries
         // before time-eviction caught up, costing ~240 KiB per
@@ -243,7 +243,7 @@ impl BatchWorker {
     /// "true no-op on empty input" must check `events.is_empty()`
     /// themselves before calling.
     ///
-    /// BUG #66: pre-fix this side effect was not documented and
+    /// Pre-fix this side effect was not documented and
     /// surprised callers expecting `add_events([])` to be inert.
     /// The fix is documentation only — the BatchWorker's timeout
     /// flush relies on this behavior, so removing the side effect
@@ -473,7 +473,7 @@ mod tests {
         assert_eq!(batch3.sequence_start, 150);
     }
 
-    /// Regression for BUG #153 — every `flush` must publish the
+    /// Regression: every `flush` must publish the
     /// post-flush `next_sequence` to the shared atomic so
     /// `bus::remove_shard_internal` can read it after awaiting the
     /// worker and use it as the stranded-flush `sequence_start`.
@@ -526,8 +526,8 @@ mod tests {
     /// atomic. `bus::remove_shard_internal` uses this value as a
     /// `sequence_start`; if it ever overflowed back to 0 the
     /// stranded batch's msg-ids would collide with the worker's
-    /// first batch — the exact JetStream-dedup hazard BUG #153
-    /// names.
+    /// first batch — the exact JetStream-dedup hazard the
+    /// stranded-flush path is designed to avoid.
     #[test]
     fn flush_publishes_saturating_max_on_overflow() {
         let config = BatchConfig::default();

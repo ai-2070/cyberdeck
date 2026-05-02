@@ -211,7 +211,7 @@ impl ShardMetricsCollector {
     /// producers that the window-reset `events_in_window` counter
     /// can race past.
     ///
-    /// BUG #38: pre-fix used `Ordering::Relaxed`, but the writer
+    /// Pre-fix used `Ordering::Relaxed`, but the writer
     /// side (`set_draining(true)`) resets the counter under
     /// `SeqCst`. On weakly-ordered hardware (ARM), a Relaxed
     /// reader could observe a stale counter and `finalize_draining`
@@ -376,7 +376,7 @@ pub struct ShardMapper {
     ring_buffer_capacity: usize,
     /// Last scaling operation timestamp.
     ///
-    /// BUG #72: this RwLock is **logically** scoped to the
+    /// This RwLock is **logically** scoped to the
     /// outer `shards.write()` lock — `scale_up`, `scale_down`,
     /// and `scale_up_provisioning` all read this field and write
     /// to it while holding `shards.write()`. The cooldown gate
@@ -537,7 +537,7 @@ impl ShardMapper {
         if candidates.is_empty() {
             return active[0].id;
         }
-        // BUG #56: pre-fix used `(event_hash as usize) % candidates.len()`,
+        // Pre-fix used `(event_hash as usize) % candidates.len()`,
         // which biases low-bucket indices when `candidates.len()`
         // is not a power of two. With u64 hashes the bias is small
         // but non-zero and accumulates over time as a sustained
@@ -792,7 +792,7 @@ impl ShardMapper {
     /// Bumps `active_count` and notifies the `on_shard_created`
     /// callback exactly once per real transition.
     ///
-    /// BUG #35: pre-fix this returned `Result<(), ScalingError>`,
+    /// Pre-fix this returned `Result<(), ScalingError>`,
     /// so callers (notably `ShardManager::activate_shard`) could
     /// not tell whether they had bumped the live count or not and
     /// double-incremented their own `num_shards` on every
@@ -1130,7 +1130,7 @@ mod tests {
         assert!(!selected.is_empty());
     }
 
-    /// BUG #56: `select_shard`'s candidate-index computation must
+    /// `select_shard`'s candidate-index computation must
     /// be unbiased across the u64 hash space. Pre-fix used
     /// `hash as usize % candidates.len()`, which over-weights low
     /// indices when `candidates.len()` is not a power of two.
@@ -1167,7 +1167,7 @@ mod tests {
             assert!(
                 pct < 5.0,
                 "shard {} bucket has {} hits ({:.2}% off expected {}); \
-                 BUG #56 bias would drift higher on certain shards",
+                 modulo bias would drift higher on certain shards",
                 id,
                 count,
                 pct,
@@ -1456,7 +1456,7 @@ mod tests {
         );
     }
 
-    /// BUG #64: multiple `scale_up_provisioning(1)` calls must
+    /// Multiple `scale_up_provisioning(1)` calls must
     /// never push `active_count` past `max_shards` via subsequent
     /// `activate()` calls. Pre-fix the budget gate
     /// (`check_scale_up_budget`) only counted ALREADY-active
@@ -1493,7 +1493,7 @@ mod tests {
         // Second activate must REFUSE — it would push past max.
         let err = mapper
             .activate(ids_b[0])
-            .expect_err("second activate must reject (BUG #64)");
+            .expect_err("second activate must reject");
         assert!(
             matches!(err, ScalingError::AtMaxShards),
             "expected AtMaxShards, got {:?}",
@@ -1831,7 +1831,7 @@ mod tests {
 
         // Across many hashes, `select_shard` must never pick id 2.
         // Spread the input hashes across the u64 range so the
-        // unbiased Lemire-style mapping (BUG #56) actually
+        // unbiased Lemire-style mapping actually
         // distributes — sequential small ids would all map to
         // index 0 because `(small * len) >> 64 = 0`. Production
         // callers pass `xxh3_64`-hashed event payloads, which
@@ -2105,7 +2105,7 @@ mod tests {
         assert_eq!(observed[0].1, Some(ShardState::Stopped));
     }
 
-    /// BUG #35: `activate` must signal whether a state transition
+    /// `activate` must signal whether a state transition
     /// actually occurred so callers can avoid double-counting.
     /// Pre-fix it returned `Result<(), _>`, so a caller that
     /// invoked `activate` twice on the same shard incremented its
@@ -2127,7 +2127,7 @@ mod tests {
         let first = mapper.activate(2).unwrap();
         assert!(
             first,
-            "first activate on a Provisioning shard must return true (BUG #35)"
+            "first activate on a Provisioning shard must return true"
         );
         assert_eq!(mapper.active_shard_count(), 3);
 
@@ -2136,7 +2136,7 @@ mod tests {
         let second = mapper.activate(2).unwrap();
         assert!(
             !second,
-            "activate on an already-Active shard must return false (BUG #35); \
+            "activate on an already-Active shard must return false; \
              pre-fix this returned Ok(()) and the caller couldn't tell"
         );
         // active_count must NOT have moved.

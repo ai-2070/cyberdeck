@@ -158,7 +158,7 @@ impl NetBuilder {
             // run and `node_id` / `entity_id` would drift across
             // restarts.
             //
-            // BUG #5: pre-fix this unconditionally overwrote
+            // Pre-fix this unconditionally overwrote
             // `net_cfg.entity_keypair`. A caller who configured the
             // adapter via `.mesh(NetAdapterConfig::initiator(...).with_entity_keypair(kp_a))`
             // and ALSO called `.identity(id_b)` got `id_b` silently
@@ -268,7 +268,7 @@ mod tests {
         );
     }
 
-    /// BUG #5: when both `NetAdapterConfig::with_entity_keypair`
+    /// When both `NetAdapterConfig::with_entity_keypair`
     /// and `NetBuilder::identity` are set with DIFFERENT entity
     /// IDs, build_config must error rather than silently picking
     /// one. Both inputs are caller-supplied; both are load-bearing
@@ -289,7 +289,7 @@ mod tests {
             .identity(identity_b)
             .build_config()
             .expect_err(
-                "build_config must reject conflicting keypairs (BUG #5); \
+                "build_config must reject conflicting keypairs; \
                  pre-fix it silently let identity() win",
             );
 
@@ -301,7 +301,7 @@ mod tests {
         );
     }
 
-    /// BUG #5 corollary: setting the SAME keypair on both sides is
+    /// Setting the SAME keypair on both sides is
     /// idempotent and must build cleanly. Documents the
     /// "identical key material, no-op" path.
     #[test]
@@ -328,7 +328,7 @@ mod tests {
         );
     }
 
-    /// BUG #5 corollary: setting the keypair via the adapter only
+    /// Setting the keypair via the adapter only
     /// (no `.identity()` call) preserves the adapter's choice —
     /// the build path must NOT overwrite it with a default.
     #[test]

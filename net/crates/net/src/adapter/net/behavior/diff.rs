@@ -1216,7 +1216,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #138: from_bytes must reject oversized / op-flooded payloads
+    // from_bytes must reject oversized / op-flooded payloads
     // ========================================================================
 
     /// A wire-format diff larger than `MAX_DIFF_BYTES` is rejected
@@ -1272,7 +1272,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #125: apply_with_version must reject diffs against stale state
+    // apply_with_version must reject diffs against stale state
     // ========================================================================
 
     /// `apply_with_version` rejects when the live version doesn't
@@ -1308,7 +1308,7 @@ mod tests {
     /// stationary diff (`base=5 → new=5`) would otherwise apply
     /// the ops while leaving the receiver's tracked version at
     /// or behind where it started — silent state divergence
-    /// across replicas, identical in shape to the BUG #125
+    /// across replicas, identical in shape to the silent-rollback
     /// hazard `apply_with_version` was originally introduced to
     /// fix. `validate_chain` catches this in bulk; the single-
     /// call apply path now catches it too.
@@ -1377,7 +1377,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #151: SetField/UnsetField are silent no-ops despite documentation
+    // SetField/UnsetField are silent no-ops despite documentation
     // ========================================================================
 
     /// Strict-mode `apply` of a `SetField` diff returns
@@ -1445,7 +1445,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #152: validate_chain must reject diffs with new_version <= base_version
+    // validate_chain must reject diffs with new_version <= base_version
     // ========================================================================
 
     /// A diff with `base_version=5, new_version=3` is rejected by
@@ -1458,7 +1458,7 @@ mod tests {
         backwards.timestamp_ns = 1_000_000;
         assert!(
             !DiffEngine::validate_chain(&[backwards]),
-            "validate_chain must reject new_version < base_version (BUG #152)",
+            "validate_chain must reject new_version < base_version",
         );
     }
 
@@ -1649,7 +1649,7 @@ mod tests {
             found,
             "CR-15 regression: DiffEngine::apply must carry #[deprecated]; \
              the version-naive entry point should warn callers off the \
-             BUG #125 silent-rollback hazard. Definition at diff.rs:{}",
+             silent-rollback hazard. Definition at diff.rs:{}",
             apply_lineno + 1
         );
     }

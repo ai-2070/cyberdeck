@@ -515,7 +515,7 @@ where
             let recoverable_decode = err.is_recoverable_decode();
             match policy {
                 FoldErrorPolicy::Stop if !recoverable_decode => {
-                    // BUG #30: pre-fix this halt branch returned
+                    // Pre-fix, this halt branch returned
                     // without firing notify_waiters or
                     // changes_tx.send. Subscribers using
                     // `changes_with_lag()` to track the live tail
@@ -658,7 +658,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #134: open must reject FromSeq(n>0) / LiveOnly
+    // open must reject FromSeq(n>0) / LiveOnly
     // ========================================================================
 
     /// `open` rejects `StartPosition::FromSeq(n)` for n > 0
@@ -680,7 +680,7 @@ mod tests {
         );
         assert!(
             matches!(result, Err(CortexAdapterError::InvalidStartPosition(_))),
-            "open must reject FromSeq(n>0) (BUG #134), got {:?}",
+            "open must reject FromSeq(n>0), got {:?}",
             result.map(|_| "Ok"),
         );
     }
@@ -702,13 +702,13 @@ mod tests {
         );
         assert!(
             matches!(result, Err(CortexAdapterError::InvalidStartPosition(_))),
-            "open must reject LiveOnly (BUG #134), got {:?}",
+            "open must reject LiveOnly, got {:?}",
             result.map(|_| "Ok"),
         );
     }
 
     // ========================================================================
-    // BUG #141: Stop policy must skip-and-continue on per-event Decode errors
+    // Stop policy must skip-and-continue on per-event Decode errors
     // ========================================================================
 
     struct FailDecodeAtSeq(u64);
@@ -718,7 +718,7 @@ mod tests {
                 // Decode-class error: simulates a corrupt postcard
                 // tail / EventMeta shape mismatch / checksum miss
                 // — exactly what the cortex fold paths surface as
-                // RedexError::Decode after BUG #141.
+                // RedexError::Decode.
                 Err(RedexError::Decode(format!(
                     "deliberate decode failure at seq {}",
                     ev.entry.seq
@@ -761,7 +761,7 @@ mod tests {
         // halt it. fold_errors counts the one bad event.
         assert!(
             adapter.is_running(),
-            "Stop policy must NOT halt on RedexError::Decode (BUG #141)"
+            "Stop policy must NOT halt on RedexError::Decode"
         );
         assert_eq!(adapter.fold_errors(), 1);
         // Seqs 0,1,2,4,5,6,7,8,9 folded; seq 3 skipped.
@@ -769,9 +769,9 @@ mod tests {
     }
 
     /// `Encode` errors (storage / user-fold-level) STILL halt
-    /// under `Stop` — pins the conservative boundary so the BUG
-    /// #141 carve-out is strictly limited to per-event decode
-    /// failures. The pre-existing `test_stop_policy_halts_on_first_error`
+    /// under `Stop` — pins the conservative boundary so the
+    /// recoverable-decode carve-out is strictly limited to per-event
+    /// decode failures. The pre-existing `test_stop_policy_halts_on_first_error`
     /// already exercises this with `RedexError::Encode`, but we
     /// pin the contract explicitly here so a future expansion of
     /// `is_recoverable_decode` (e.g. accidentally including
@@ -788,7 +788,7 @@ mod tests {
 
     /// `FromSeq(0)` is equivalent to `FromBeginning` (no events
     /// skipped) and must still be accepted — pins the boundary so
-    /// the BUG #134 guard doesn't accidentally lock out the
+    /// the start-position guard doesn't accidentally lock out the
     /// degenerate-but-valid `FromSeq(0)` form.
     #[tokio::test]
     async fn open_accepts_from_seq_zero() {
@@ -806,7 +806,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #144: changes_with_lag must surface BroadcastStream::Lagged
+    // changes_with_lag must surface BroadcastStream::Lagged
     // ========================================================================
 
     /// `changes_with_lag` yields a `ChangeEvent::Lagged(n)` when a
@@ -866,7 +866,7 @@ mod tests {
         }
         assert!(
             saw_lagged,
-            "subscriber that fell behind {} events must observe Lagged (BUG #144)",
+            "subscriber that fell behind {} events must observe Lagged",
             CHANGES_BROADCAST_CAP + 16,
         );
         assert!(

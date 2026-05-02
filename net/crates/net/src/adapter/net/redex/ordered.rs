@@ -61,8 +61,7 @@ impl OrderedAppender {
     /// seqs are strictly contiguous within the batch AND strictly
     /// ordered relative to other ordered writers.
     ///
-    /// BUG #27 corollary: returns `Some(first_seq)` on non-empty
-    /// input, `None` on empty.
+    /// Returns `Some(first_seq)` on non-empty input, `None` on empty.
     pub fn append_batch(&self, payloads: &[Bytes]) -> Result<Option<u64>, RedexError> {
         self.file.append_batch_ordered(payloads)
     }

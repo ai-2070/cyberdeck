@@ -442,7 +442,7 @@ impl Adapter for RedisAdapter {
 
         // Fetch one extra to detect has_more.
         //
-        // BUG #71: pre-fix `limit + 1` panicked in debug or wrapped
+        // Pre-fix `limit + 1` panicked in debug or wrapped
         // to 0 in release on `limit == usize::MAX`, silently
         // returning an empty result with no error. The FFI
         // poll-request JSON path does `usize::try_from` but doesn't
@@ -477,7 +477,7 @@ impl Adapter for RedisAdapter {
             return false;
         }
 
-        // BUG #41: pre-fix, the PING relied entirely on the
+        // Pre-fix, the PING relied entirely on the
         // `ConnectionManager`'s configured request timeout. If
         // that's unset or large, a network partition leaves the
         // health check blocked indefinitely, making the adapter

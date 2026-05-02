@@ -153,7 +153,7 @@ mod tests {
     use super::*;
 
     /// Smoke test: PyO3 surface answers the same way as the Rust
-    /// helper for the canonical BUG #57 producer-retry scenario.
+    /// helper for the canonical producer-retry scenario.
     ///
     /// CR-35 wraps the calls in `Python::attach` because
     /// `is_duplicate` and `clear` now take a `Python<'_>` token

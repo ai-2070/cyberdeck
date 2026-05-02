@@ -18,7 +18,7 @@
 //! All FFI functions are thread-safe. The event bus handle can be shared
 //! across threads.
 //!
-//! # Tokio runtime restriction (BUG #70)
+//! # Tokio runtime restriction
 //!
 //! Internal FFI ops (`net_poll`, `net_flush`, `net_shutdown`,
 //! `net_redex_*`, `net_mesh_new`, the cortex FFI, the mesh FFI)

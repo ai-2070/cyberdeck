@@ -57,7 +57,7 @@ impl SubscribeOpts {
 
     /// Set the base poll interval.
     ///
-    /// BUG #16: pre-fix, `Duration::ZERO` was accepted verbatim,
+    /// Pre-fix, `Duration::ZERO` was accepted verbatim,
     /// and combined with a zero `max_backoff` the doubling loop
     /// at `current_interval = (current_interval * 2).min(max_backoff)`
     /// resolved to zero forever. The poll-then-zero-sleep-then-
@@ -72,7 +72,7 @@ impl SubscribeOpts {
 
     /// Set the maximum backoff interval.
     ///
-    /// BUG #16: see `poll_interval` — the same zero-collapse hazard
+    /// See `poll_interval` — the same zero-collapse hazard
     /// applies. Clamped to a minimum of 1 ns so the doubling loop
     /// always parks the task on a real timer rather than spinning.
     pub fn max_backoff(mut self, max: Duration) -> Self {
@@ -175,7 +175,7 @@ impl Stream for EventStream {
                 this.inflight = None;
                 if response.events.is_empty() {
                     // Backoff: double the interval, up to max.
-                    // BUG #34: `current_interval * 2` panics on
+                    // `current_interval * 2` panics on
                     // Duration overflow if a caller passed a
                     // pathological `poll_interval` (close to
                     // `Duration::MAX`). `saturating_mul` clamps to
@@ -261,7 +261,7 @@ impl<T: serde::de::DeserializeOwned + Unpin> Stream for TypedEventStream<T> {
 mod tests {
     use super::*;
 
-    /// BUG #16: `SubscribeOpts::default().poll_interval(ZERO)`
+    /// `SubscribeOpts::default().poll_interval(ZERO)`
     /// must not store `Duration::ZERO`. Pre-fix the doubling
     /// loop at `current_interval * 2` would resolve to zero
     /// forever, the sleep would resolve immediately, and the
@@ -271,23 +271,23 @@ mod tests {
         let opts = SubscribeOpts::default().poll_interval(Duration::ZERO);
         assert!(
             opts.poll_interval > Duration::ZERO,
-            "poll_interval(ZERO) must clamp above zero (BUG #16); got {:?}",
+            "poll_interval(ZERO) must clamp above zero; got {:?}",
             opts.poll_interval
         );
     }
 
-    /// BUG #16: same clamp on `max_backoff`.
+    /// Same clamp on `max_backoff`.
     #[test]
     fn max_backoff_clamps_zero_to_minimum() {
         let opts = SubscribeOpts::default().max_backoff(Duration::ZERO);
         assert!(
             opts.max_backoff > Duration::ZERO,
-            "max_backoff(ZERO) must clamp above zero (BUG #16); got {:?}",
+            "max_backoff(ZERO) must clamp above zero; got {:?}",
             opts.max_backoff
         );
     }
 
-    /// BUG #16: setting both to zero (the worst case from the
+    /// Setting both to zero (the worst case from the
     /// audit) must still produce a non-zero effective interval.
     #[test]
     fn both_zero_still_has_nonzero_intervals() {
@@ -302,12 +302,12 @@ mod tests {
         let doubled = opts.poll_interval.saturating_mul(2).min(opts.max_backoff);
         assert!(
             doubled > Duration::ZERO,
-            "post-clamp doubled interval must be > 0 to avoid spin (BUG #16); got {:?}",
+            "post-clamp doubled interval must be > 0 to avoid spin; got {:?}",
             doubled
         );
     }
 
-    /// BUG #34: `current_interval * 2` panics on Duration
+    /// `current_interval * 2` panics on Duration
     /// overflow. `saturating_mul(2)` clamps to `Duration::MAX`.
     #[test]
     fn saturating_mul_does_not_panic_on_huge_interval() {
@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(
             doubled,
             Duration::MAX,
-            "saturating_mul must clamp to Duration::MAX, not panic (BUG #34)"
+            "saturating_mul must clamp to Duration::MAX, not panic"
         );
     }
 

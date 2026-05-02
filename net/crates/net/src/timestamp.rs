@@ -48,7 +48,7 @@ pub struct TimestampGenerator {
     /// created" rather than the unspecified "ns since the
     /// quanta::Clock's internal calibration".
     ///
-    /// BUG #58: pre-fix the next() call did
+    /// Pre-fix the next() call did
     /// `clock.delta_as_nanos(0, raw)`. quanta's calibration is
     /// per-Clock and the "0" baseline doesn't correspond to any
     /// meaningful real-world time — the returned ns counts were
@@ -99,7 +99,7 @@ impl TimestampGenerator {
     #[inline(always)]
     pub fn next(&self) -> u64 {
         // Read TSC (no syscall) and convert to nanoseconds against
-        // the construction-time baseline (BUG #58).
+        // the construction-time baseline.
         let raw = self.clock.raw();
         let now = self.clock.delta_as_nanos(self.baseline_raw, raw);
 
@@ -110,7 +110,7 @@ impl TimestampGenerator {
             // Guard against u64::MAX exhaustion: saturating_add(1) at MAX
             // would return MAX again, breaking strict monotonicity.
             //
-            // BUG #61: pre-fix, at `last == u64::MAX - 1` we'd return
+            // Pre-fix, at `last == u64::MAX - 1` we'd return
             // `u64::MAX` (via `.max()` clamp) and the NEXT call
             // would panic on `checked_add(1)`. That gap leaves the
             // generator briefly stalled at MAX before failure —
@@ -400,7 +400,7 @@ mod tests {
         );
     }
 
-    /// BUG #58: a fresh generator's first `next()` value must be
+    /// A fresh generator's first `next()` value must be
     /// small (close to "ns since this generator was created"),
     /// not "ns since system uptime started" or some other
     /// arbitrary baseline. Pre-fix the baseline was `0` against
@@ -419,7 +419,7 @@ mod tests {
         assert!(
             first < ten_ms_ns,
             "first next() returned {first} ns; expected < {ten_ms_ns} ns. \
-             Pre-fix this would be ~uptime in ns (BUG #58)."
+             Pre-fix this would be ~uptime in ns."
         );
     }
 }

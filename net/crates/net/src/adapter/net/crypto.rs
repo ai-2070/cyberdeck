@@ -470,7 +470,7 @@ impl ReplayWindow {
         if shift == 0 {
             return;
         }
-        // BUG #37: pre-fix this branch silently zeroed the bitmap
+        // Pre-fix this branch silently zeroed the bitmap
         // when a legitimate jump exceeded `WINDOW_SIZE` (1024
         // packets). `MAX_FORWARD` is 65_536, so a single packet
         // accepted with `received - rx_counter > 1024` clears the

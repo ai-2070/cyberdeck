@@ -738,9 +738,9 @@ impl ScalingPolicy {
     /// `max_shards` is capped at `u16::MAX` (65 535) because shard
     /// ids are 16-bit. On hosts with more than 32 767 CPUs the
     /// "2× CPU count" target saturates rather than wraps — this is
-    /// the intended behavior (BUG #62: pre-fix this was just an
-    /// implicit `saturating_mul` artifact; the cap is now
-    /// documented and the saturation is explicit).
+    /// the intended behavior (pre-fix this was just an implicit
+    /// `saturating_mul` artifact; the cap is now documented and
+    /// the saturation is explicit).
     pub fn high_throughput() -> Self {
         let cpus = num_cpus();
         Self {
@@ -998,7 +998,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #63: validate() must reject NaN / ±inf thresholds
+    // validate() must reject NaN / ±inf thresholds
     // ========================================================================
 
     /// `validate()` rejects `f64::NaN` for both threshold fields.
@@ -1015,7 +1015,7 @@ mod tests {
         };
         assert!(
             policy.validate().is_err(),
-            "NaN fill_ratio_threshold must be rejected (BUG #63)",
+            "NaN fill_ratio_threshold must be rejected",
         );
     }
 
@@ -1027,7 +1027,7 @@ mod tests {
         };
         assert!(
             policy.validate().is_err(),
-            "NaN underutilized_threshold must be rejected (BUG #63)",
+            "NaN underutilized_threshold must be rejected",
         );
     }
 
@@ -1200,7 +1200,7 @@ mod tests {
         assert!(result.is_err(), "jetstream replicas == 0 must reject");
     }
 
-    /// BUG #68: `JetStreamAdapterConfig::validate` rejects negative
+    /// `JetStreamAdapterConfig::validate` rejects negative
     /// `max_messages` / `max_bytes`. NATS rejects negatives at
     /// stream-create time, so without validate-time enforcement the
     /// misconfig surfaces as a runtime adapter error minutes later.

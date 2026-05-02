@@ -156,7 +156,7 @@ impl CorrelatedFailureDetector {
 
         // Count unique failures in the window.
         //
-        // BUG #15: pre-fix this collected through a `HashSet<u64>`
+        // Pre-fix this collected through a `HashSet<u64>`
         // and converted back to `Vec`, which exposed the HashSet's
         // randomized iteration order to downstream consumers.
         // `window_failures` flows verbatim into
@@ -506,7 +506,7 @@ mod tests {
         }
     }
 
-    /// BUG #15: `failed_nodes` in the verdict (sourced from
+    /// `failed_nodes` in the verdict (sourced from
     /// `window_failures` after dedup) must be sorted, not in
     /// arbitrary HashSet iteration order. Pre-fix the same input
     /// could produce different orderings on each run / process,
@@ -532,7 +532,7 @@ mod tests {
             sorted.sort_unstable();
             assert_eq!(
                 failed_nodes, &sorted,
-                "BUG #15: MassFailure.failed_nodes must be in canonical \
+                "MassFailure.failed_nodes must be in canonical \
                  (sorted) order; pre-fix it leaked HashSet iteration order \
                  and varied per process"
             );

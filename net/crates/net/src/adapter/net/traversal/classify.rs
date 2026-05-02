@@ -415,7 +415,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #107: wildcard bind IP must not block Open detection
+    // wildcard bind IP must not block Open detection
     // ========================================================================
 
     /// When the daemon binds to `0.0.0.0:9001` (the common
@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(
             fsm.classify(bind),
             NatClass::Open,
-            "wildcard bind must classify port-matching reflex as Open (BUG #107)"
+            "wildcard bind must classify port-matching reflex as Open"
         );
     }
 
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(
             fsm.classify(bind),
             NatClass::Open,
-            "wildcard v6 bind must classify port-matching reflex as Open (BUG #107)"
+            "wildcard v6 bind must classify port-matching reflex as Open"
         );
     }
 

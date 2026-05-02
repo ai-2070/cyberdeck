@@ -681,7 +681,7 @@ mod tests {
         );
     }
 
-    /// BUG #127: when the caller passes `Some(expected)`, an
+    /// When the caller passes `Some(expected)`, an
     /// envelope built by a different source identity is rejected
     /// EARLY (before any cryptographic work) with
     /// `EnvelopeError::InvalidSignerKey`. Pre-fix the primitive

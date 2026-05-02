@@ -73,7 +73,7 @@ impl RedexEntry {
     ///
     /// Panics if `flags` includes `RedexFlags::INLINE`.
     ///
-    /// BUG #24: pre-fix this silently accepted the INLINE flag. The
+    /// Pre-fix, this silently accepted the INLINE flag. The
     /// resulting entry's `is_inline()` returned true but
     /// `payload_offset` / `payload_len` were real heap fields
     /// rather than payload bytes. `materialize` would then call
@@ -86,7 +86,7 @@ impl RedexEntry {
     pub fn new_heap(seq: u64, offset: u32, len: u32, flags: u32, checksum: u32) -> Self {
         assert!(
             flags & RedexFlags::INLINE == 0,
-            "BUG #24: new_heap rejects flags=INLINE; use new_inline for inline payloads"
+            "new_heap rejects flags=INLINE; use new_inline for inline payloads"
         );
         Self {
             seq,
@@ -245,21 +245,21 @@ mod tests {
         assert!(e.inline_payload().is_none());
     }
 
-    /// BUG #24: passing `RedexFlags::INLINE` to `new_heap` must
+    /// Passing `RedexFlags::INLINE` to `new_heap` must
     /// panic. Pre-fix it silently accepted the flag and produced
     /// an entry where `is_inline()` returned true but `payload_offset`
     /// / `payload_len` carried real heap fields, leading to
     /// silent corruption when `materialize` reinterpreted them
     /// as inline payload bytes.
     #[test]
-    #[should_panic(expected = "BUG #24")]
+    #[should_panic(expected = "rejects flags=INLINE")]
     fn new_heap_with_inline_flag_panics() {
         // offset/len/checksum are arbitrary; the assertion fires
         // before they're used.
         let _ = RedexEntry::new_heap(0, 4, 100, RedexFlags::INLINE, 0);
     }
 
-    /// BUG #24 corollary: TOMBSTONE (a non-INLINE flag) must
+    /// TOMBSTONE (a non-INLINE flag) must
     /// still go through cleanly.
     #[test]
     fn new_heap_with_tombstone_flag_succeeds() {

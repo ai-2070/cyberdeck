@@ -123,7 +123,7 @@ impl PacketBuilder {
     /// # Panics
     ///
     /// Panics if `events.len() > NetHeader::MAX_EVENTS_PER_PACKET`.
-    /// BUG #36: pre-fix this performed `events.len() as u16` and
+    /// Pre-fix this performed `events.len() as u16` and
     /// silently wrapped on overflow. A caller passing `>65 535`
     /// events stored `len % 65 536` in the wire `event_count`
     /// field; the receiver mis-parsed the payload because the
@@ -145,7 +145,7 @@ impl PacketBuilder {
     ) -> Bytes {
         assert!(
             events.len() <= NetHeader::MAX_EVENTS_PER_PACKET as usize,
-            "BUG #36: PacketBuilder::build called with {} events; \
+            "PacketBuilder::build called with {} events; \
              MAX_EVENTS_PER_PACKET is {}. The batching layer must \
              split before calling build().",
             events.len(),
@@ -214,7 +214,7 @@ impl PacketBuilder {
     /// # Panics
     ///
     /// Panics on `events.len() > NetHeader::MAX_EVENTS_PER_PACKET` —
-    /// see [`Self::build`] for the BUG #36 rationale.
+    /// see [`Self::build`] for the rationale.
     #[inline]
     pub fn build_subprotocol(
         &mut self,
@@ -226,7 +226,7 @@ impl PacketBuilder {
     ) -> Bytes {
         assert!(
             events.len() <= NetHeader::MAX_EVENTS_PER_PACKET as usize,
-            "BUG #36: PacketBuilder::build_subprotocol called with {} events; \
+            "PacketBuilder::build_subprotocol called with {} events; \
              MAX_EVENTS_PER_PACKET is {}",
             events.len(),
             NetHeader::MAX_EVENTS_PER_PACKET,
@@ -1242,12 +1242,12 @@ mod tests {
         );
     }
 
-    /// BUG #36: passing more than `MAX_EVENTS_PER_PACKET` events to
+    /// Passing more than `MAX_EVENTS_PER_PACKET` events to
     /// `build` must panic, not silently wrap on the `events.len()
     /// as u16` cast. A wrapped value below the receiver's cap
     /// would otherwise pass `validate()` and corrupt frame parsing.
     #[test]
-    #[should_panic(expected = "BUG #36")]
+    #[should_panic(expected = "PacketBuilder::build called with")]
     fn build_panics_on_event_count_exceeding_cap() {
         let key = [0x42u8; 32];
         let session_id = 0xCAFEu64;
@@ -1262,9 +1262,9 @@ mod tests {
         let _ = builder.build(0, 0, &too_many, PacketFlags::NONE);
     }
 
-    /// BUG #36 corollary: `build_subprotocol` shares the same cap.
+    /// `build_subprotocol` shares the same cap.
     #[test]
-    #[should_panic(expected = "BUG #36")]
+    #[should_panic(expected = "PacketBuilder::build_subprotocol called with")]
     fn build_subprotocol_panics_on_event_count_exceeding_cap() {
         let key = [0x42u8; 32];
         let session_id = 0xBABEu64;
@@ -1276,7 +1276,7 @@ mod tests {
         let _ = builder.build_subprotocol(0, 0, &too_many, PacketFlags::NONE, 1);
     }
 
-    /// BUG #36 boundary: exactly `MAX_EVENTS_PER_PACKET` events
+    /// Boundary: exactly `MAX_EVENTS_PER_PACKET` events
     /// must be accepted without panic (and without silent
     /// truncation since 2027 fits in `u16`).
     #[test]

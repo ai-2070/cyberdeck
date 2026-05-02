@@ -745,7 +745,7 @@ mod tests {
 
     /// Pin that `Batch::with_nonce` writes the passed value into the
     /// `process_nonce` field. The bus relies on this to stamp the
-    /// loaded persistent nonce on every emitted batch (BUG #56);
+    /// loaded persistent nonce on every emitted batch;
     /// a future refactor that ignored the parameter would silently
     /// regress JetStream cross-restart dedup.
     #[test]

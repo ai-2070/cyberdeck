@@ -46,7 +46,7 @@ impl SubnetId {
 
     /// Fallible variant of [`Self::new`].
     ///
-    /// BUG #9: pre-existing `new` panics on `levels.len() >
+    /// Pre-existing `new` panics on `levels.len() >
     /// MAX_DEPTH`. Returns [`super::SubnetError::TooManyLevels`]
     /// instead so a malformed config doesn't crash the daemon
     /// loader.
@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(SubnetId::mask_for_depth(4), 0xFFFFFFFF);
     }
 
-    /// BUG #9: too many levels must surface as `Err(...)`, not
+    /// Too many levels must surface as `Err(...)`, not
     /// panic. SubnetId values typically come from config / FFI /
     /// JSON; a malformed entry must not crash the daemon loader.
     #[test]

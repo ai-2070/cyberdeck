@@ -2061,15 +2061,15 @@ mod tests {
         // `total_consumed` field of an authoritative grant. The
         // function bumps both `consumed` and `granted` by `bytes`
         // — receive-time accounting, see `RxCreditState` rustdoc
-        // and BUG #84 in BUG_AUDIT_2026_04_30_CORE.md.
+        // and BUG_AUDIT_2026_04_30_CORE.md.
         let state = StreamState::new_full(false, 1, 100);
         assert_eq!(state.on_bytes_consumed(60), Some(60));
         assert_eq!(state.on_bytes_consumed(14), Some(74));
         assert_eq!(state.on_bytes_consumed(1), Some(75));
     }
 
-    /// Regression: the v2 receive-time-accounting design (BUG #84
-    /// resolution) keeps `outstanding = granted - consumed`
+    /// Regression: the v2 receive-time-accounting design
+    /// keeps `outstanding = granted - consumed`
     /// pinned at the initial window size. The credit window is
     /// for kernel-buffer protection — application-side throttling
     /// is provided by per-shard queue-depth limits, not this
@@ -2499,7 +2499,7 @@ mod tests {
     /// CR-12: pin that no `tx_key` method exists on `NetSession`.
     /// This is a source-string tripwire — if a future maintainer
     /// reintroduces the accessor, the test fires loudly. The hazard
-    /// it gates (BUG #97/#106 cross-pool nonce reuse) is dormant
+    /// it gates (cross-pool nonce reuse) is dormant
     /// unless someone calls a `tx_key()` method, so a behavioural
     /// test would not catch the regression in time. We assemble
     /// the forbidden token at runtime so the test's OWN source

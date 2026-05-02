@@ -384,7 +384,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #149: from_registry must produce deterministic byte output
+    // from_registry must produce deterministic byte output
     // ========================================================================
 
     /// `from_registry().to_bytes()` is deterministic across
@@ -427,7 +427,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #131: from_registry must NOT advertise forwarding-only descriptors
+    // from_registry must NOT advertise forwarding-only descriptors
     // ========================================================================
 
     /// A forwarding-only descriptor (registered via
@@ -462,7 +462,7 @@ mod tests {
         assert!(ids.contains(&0x0400), "real handler must be advertised",);
         assert!(
             !ids.contains(&0x1000),
-            "forwarding-only entry must NOT be advertised (BUG #131)",
+            "forwarding-only entry must NOT be advertised",
         );
     }
 
@@ -507,8 +507,8 @@ mod tests {
 
     /// CR-31: tighten the cross-channel parity. The HashSet
     /// comparison above pins which subprotocols are advertised
-    /// but NOT the order in which they're advertised. BUG #149's
-    /// fix made `from_registry` deterministically sorted by id,
+    /// but NOT the order in which they're advertised. The
+    /// determinism fix made `from_registry` deterministically sorted by id,
     /// but if `capability_tags()` consumed downstream as an
     /// ordered byte stream (e.g. fed into a hash for "same caps?
     /// skip re-announce" optimisation), divergence between the
@@ -565,7 +565,7 @@ mod tests {
 
         assert_eq!(
             manifest_ids, expected_sorted,
-            "from_registry must emit entries in ascending id order (BUG #149)"
+            "from_registry must emit entries in ascending id order"
         );
         assert_eq!(
             tag_ids, expected_sorted,
@@ -573,7 +573,7 @@ mod tests {
              match from_registry. Pre-fix this test sorted tag_ids before \
              comparing, which silently let an unordered capability_tags() \
              pass. Once both channels' bytes are consumed by a downstream \
-             digest optimisation (CR-31 / BUG #131), order divergence \
+             digest optimisation (CR-31), order divergence \
              becomes a silent dedup-bypass.\nGot:      {:?}\nExpected: {:?}",
             tag_ids, expected_sorted
         );

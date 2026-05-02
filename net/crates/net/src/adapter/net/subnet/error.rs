@@ -1,6 +1,6 @@
 //! Errors returned by fallible subnet constructors.
 //!
-//! BUG #9: pre-existing `SubnetPolicy::add_rule`, `SubnetRule::map`,
+//! Pre-existing `SubnetPolicy::add_rule`, `SubnetRule::map`,
 //! and `SubnetId::new` panic on out-of-range input. Subnet
 //! configuration typically comes from config / FFI / JSON and a
 //! malformed entry should not crash the daemon loader. The

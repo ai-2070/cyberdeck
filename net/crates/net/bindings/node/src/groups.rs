@@ -390,7 +390,7 @@ pub(crate) async fn spawn_standby_group(
 // ReplicaGroup
 // =========================================================================
 
-// BUG #33: pre-fix this struct (and ForkGroup, StandbyGroup
+// Pre-fix this struct (and ForkGroup, StandbyGroup
 // below) carried a `kind: String` field that was captured at
 // spawn but never read on `self.kind` anywhere. The
 // `Arc<SdkReplicaGroup>` (and friends) hold their own copy of
@@ -489,7 +489,7 @@ impl ReplicaGroup {
 #[napi]
 pub struct ForkGroup {
     inner: Arc<SdkForkGroup>,
-    // BUG #33: removed unused `kind` field; see ReplicaGroup.
+    // Removed unused `kind` field; see ReplicaGroup.
 }
 
 #[napi]
@@ -577,7 +577,7 @@ impl ForkGroup {
 #[napi]
 pub struct StandbyGroup {
     inner: Arc<SdkStandbyGroup>,
-    // BUG #33: removed unused `kind` field; see ReplicaGroup.
+    // Removed unused `kind` field; see ReplicaGroup.
 }
 
 #[napi]
@@ -665,7 +665,7 @@ impl StandbyGroup {
 
     /// `"active"` | `"standby"` | `null` (out-of-range index).
     ///
-    /// BUG #4: pre-fix, `index as u8` silently wrapped — a JS caller
+    /// Pre-fix, `index as u8` silently wrapped — a JS caller
     /// passing 256 expected null (out-of-range) but received the role
     /// for member 0. `u8::try_from` returns `Err` on overflow, which
     /// we map to `None` for the documented contract.
@@ -681,7 +681,7 @@ impl StandbyGroup {
     /// Returns the highest event sequence the standby member at
     /// `index` has acknowledged, or `null` if `index` is out of range.
     ///
-    /// BUG #4: same wrapping hazard as `member_role`. A JS caller
+    /// Same wrapping hazard as `member_role`. A JS caller
     /// polling sync progress for index 257 would silently get the
     /// lag of member 1 and could make an incorrect failover decision.
     #[napi]

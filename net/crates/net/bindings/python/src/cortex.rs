@@ -320,7 +320,7 @@ impl PyRedexFile {
     /// or `None` if `payloads` was empty (no events appended).
     /// Subsequent events are `first + 0, first + 1, ...`.
     ///
-    /// BUG #27 cascade: the underlying `RedexFile::append_batch`
+    /// The underlying `RedexFile::append_batch`
     /// returns `Result<Option<u64>>` so callers can distinguish
     /// "wrote zero" from "wrote one with seq N". The Python
     /// signature mirrors that — `int | None`.
