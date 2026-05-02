@@ -5,7 +5,7 @@
 //! - Event consumption (async polling with filtering)
 //! - Lifecycle management
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,7 +89,14 @@ pub struct EventBus {
     /// where a producer that observed `shutdown=false` could push
     /// *after* the drain worker's last `pop_batch_into` returned
     /// zero, leaving the event stranded in the ring buffer.
-    in_flight_ingests: AtomicU32,
+    /// BUG #59: pre-fix this was `AtomicU32`. A 4-billion-in-flight
+    /// wrap is not realistic in production, but the counter
+    /// participates in the shutdown protocol — a wrap to 0 would
+    /// trick the wait-for-zero loop into thinking shutdown was
+    /// safe to proceed while producers were still mid-push.
+    /// Widened to `AtomicU64` so the wrap is astronomical
+    /// (1.8e19 in-flight ingests).
+    in_flight_ingests: AtomicU64,
     /// Set to `true` after `shutdown()` runs to completion. `Drop`
     /// uses this to detect "dropped without an awaited shutdown" —
     /// in that case events still in the ring buffers / mpsc channels
@@ -333,7 +340,7 @@ impl EventBus {
             batch_senders: parking_lot::RwLock::new(batch_senders),
             shutdown,
             drain_finalize_ready,
-            in_flight_ingests: AtomicU32::new(0),
+            in_flight_ingests: AtomicU64::new(0),
             shutdown_completed: AtomicBool::new(false),
             config,
             stats,
