@@ -1,0 +1,23 @@
+net/crates/net/docs/misc/REVIEW_BUGFIXES_8_2026_05_02.md
+  63be1075fb99b31c 1-374
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "475eec9263dedd58229a91a30cb2f03abde282ef",
+  "prompts": {
+    "63be1075fb99b31c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d6d2034e-1bea-4689-9b92-5dede9a5b494",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 374,
+      "total_deletions": 0,
+      "accepted_lines": 374,
+      "overriden_lines": 0
+    }
+  }
+}
