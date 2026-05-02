@@ -114,14 +114,59 @@ fn compare_values(
     right: &serde_json::Value,
 ) -> Option<std::cmp::Ordering> {
     match (left, right) {
-        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
-            let a = a.as_f64()?;
-            let b = b.as_f64()?;
-            a.partial_cmp(&b)
-        }
+        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => compare_numbers(a, b),
         (serde_json::Value::String(a), serde_json::Value::String(b)) => Some(a.cmp(b)),
         _ => None,
     }
+}
+
+/// Compare two `serde_json::Number` values without losing precision
+/// when both fit in an integer type.
+///
+/// BUG #7: pre-fix, `compare_values` always reduced both sides to
+/// `f64` via `as_f64()`. For integer fields above `2^53` (e.g. byte
+/// counts, ns timestamps, monotonic sequence numbers) the cast was
+/// lossy: two adjacent values like `9_007_199_254_740_992` and
+/// `9_007_199_254_740_993` compared `Equal`, so a `Gt` rule guarding
+/// a quota silently failed to fire. NaN/Infinity (legal under
+/// `arbitrary_precision`, though we don't enable it) yielded `None`,
+/// silently masking the bug.
+///
+/// Post-fix:
+///   1. Both i64 → exact i64 compare (handles negatives).
+///   2. Both u64 → exact u64 compare (handles values > i64::MAX).
+///   3. Mixed signed-i64 / large-u64 → resolved by sign:
+///      a negative i64 is always less than any u64; a u64 above
+///      i64::MAX is always greater than any negative i64.
+///   4. At least one is a float → f64 fallback with the documented
+///      lossy semantics.
+fn compare_numbers(
+    a: &serde_json::Number,
+    b: &serde_json::Number,
+) -> Option<std::cmp::Ordering> {
+    // 1. Both fit in i64.
+    if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
+        return Some(ai.cmp(&bi));
+    }
+    // 2. Both fit in u64. Order matters: i64 takes precedence above
+    //    so non-negative integers that fit in both types use the
+    //    signed compare; only this branch handles values > i64::MAX.
+    if let (Some(au), Some(bu)) = (a.as_u64(), b.as_u64()) {
+        return Some(au.cmp(&bu));
+    }
+    // 3. Mixed: one is a negative i64 (as_u64 returned None for it)
+    //    and the other is a u64 above i64::MAX (as_i64 returned None
+    //    for it). The negative side is always less than the
+    //    non-negative side.
+    if a.as_i64().is_some() && b.as_u64().is_some() {
+        return Some(std::cmp::Ordering::Less);
+    }
+    if a.as_u64().is_some() && b.as_i64().is_some() {
+        return Some(std::cmp::Ordering::Greater);
+    }
+    // 4. Float fallback. NaN → None, which collapses comparing-to-
+    //    NaN rules to the existing `partial_cmp` semantics.
+    a.as_f64()?.partial_cmp(&b.as_f64()?)
 }
 
 /// Logical operators for combining conditions
@@ -1295,6 +1340,84 @@ mod tests {
         assert!(
             CompareOp::In.evaluate(&serde_json::json!("a"), &serde_json::json!(["a", "b", "c"]))
         );
+    }
+
+    /// BUG #7: pre-fix, both sides were reduced to f64 via
+    /// `as_f64()`. Two adjacent u64 values above 2^53 round to
+    /// the same f64 — `9_007_199_254_740_992` and
+    /// `9_007_199_254_740_993` both become `9007199254740992.0`,
+    /// so `Gt` incorrectly returned false (they compared Equal).
+    /// Real-world impact: rules guarding ns timestamps or byte
+    /// counts silently failed to fire.
+    #[test]
+    fn gt_compares_large_u64_without_loss_of_precision() {
+        // 2^53 + 1: just past the f64 mantissa boundary.
+        let small = serde_json::json!(9_007_199_254_740_992u64);
+        let big = serde_json::json!(9_007_199_254_740_993u64);
+
+        // Sanity — pre-fix this would have failed (both round to
+        // the same f64).
+        assert!(
+            CompareOp::Gt.evaluate(&big, &small),
+            "Gt must distinguish u64 values one apart at the f64 boundary (BUG #7)"
+        );
+        assert!(
+            !CompareOp::Gt.evaluate(&small, &big),
+            "Gt must NOT report the smaller value as greater (BUG #7)"
+        );
+        assert!(
+            CompareOp::Lt.evaluate(&small, &big),
+            "Lt must distinguish at the f64 boundary (BUG #7)"
+        );
+        assert!(
+            !CompareOp::Eq.evaluate(&small, &big),
+            "Eq must NOT collapse two distinct u64 values (BUG #7); \
+             pre-fix these compared equal because both round to the same f64"
+        );
+    }
+
+    /// BUG #7: very large u64 values (> i64::MAX) must still
+    /// compare correctly even though as_i64() returns None for
+    /// them.
+    #[test]
+    fn gt_compares_u64_values_above_i64_max() {
+        let a = serde_json::json!(u64::MAX);
+        let b = serde_json::json!(u64::MAX - 1);
+        assert!(CompareOp::Gt.evaluate(&a, &b));
+        assert!(CompareOp::Lt.evaluate(&b, &a));
+    }
+
+    /// BUG #7: comparing a negative i64 against a u64 above
+    /// i64::MAX must always say "negative is less". Pre-fix the
+    /// f64 fallback could happen to give a numerically correct
+    /// answer here (negatives < positives in f64), but only by
+    /// accident — the helper's contract is now explicit.
+    #[test]
+    fn compares_negative_i64_against_huge_u64_correctly() {
+        let neg = serde_json::json!(-1i64);
+        let huge = serde_json::json!(u64::MAX);
+        assert!(CompareOp::Lt.evaluate(&neg, &huge));
+        assert!(CompareOp::Gt.evaluate(&huge, &neg));
+    }
+
+    /// BUG #7 corollary: floats still work via the f64 fallback.
+    #[test]
+    fn float_comparisons_still_work_via_fallback() {
+        let a = serde_json::json!(1.5);
+        let b = serde_json::json!(2.5);
+        assert!(CompareOp::Lt.evaluate(&a, &b));
+        assert!(CompareOp::Gt.evaluate(&b, &a));
+    }
+
+    /// BUG #7 corollary: integer-vs-float comparison falls back
+    /// to f64 (with the documented loss of precision for huge
+    /// integers, which is unavoidable when one side is a float).
+    #[test]
+    fn integer_vs_float_uses_f64_fallback() {
+        let i = serde_json::json!(5i64);
+        let f = serde_json::json!(4.5);
+        assert!(CompareOp::Gt.evaluate(&i, &f));
+        assert!(CompareOp::Lt.evaluate(&f, &i));
     }
 
     #[test]
