@@ -93,6 +93,13 @@ pub struct RedisStreamDedup {
 }
 
 impl RedisStreamDedup {
+    /// Upper bound on the LRU capacity. Beyond this, [`Self::with_capacity`]
+    /// clamps. `1 << 24` (~16.7 M ids) is far above any realistic
+    /// dedup window and below the point where pre-allocation would
+    /// dominate the process heap (~256 MiB just for the
+    /// `HashSet` + `VecDeque` reservations).
+    pub const MAX_CAPACITY: usize = 1 << 24;
+
     /// Create a helper with the given LRU capacity.
     ///
     /// `capacity == 0` is treated as 1 — the LRU still works
@@ -100,8 +107,13 @@ impl RedisStreamDedup {
     /// effectively a single-id rolling window. Callers that want
     /// "no dedup at all" should not construct this helper in the
     /// first place.
+    ///
+    /// BUG #42: pre-fix, `capacity` had no upper clamp. A
+    /// misconfigured `usize::MAX` pre-allocated the `VecDeque`
+    /// and `HashSet` and OOMed on construction. Capacity is now
+    /// clamped to [`Self::MAX_CAPACITY`].
     pub fn with_capacity(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
+        let capacity = capacity.max(1).min(Self::MAX_CAPACITY);
         Self {
             order: VecDeque::with_capacity(capacity),
             seen: HashSet::with_capacity(capacity),
@@ -414,5 +426,35 @@ mod tests {
                 "retry-path observation of {id} should be filtered as a duplicate",
             );
         }
+    }
+
+    /// BUG #42: a misconfigured `capacity == usize::MAX` must not
+    /// OOM at construction. Pre-fix, `with_capacity(usize::MAX)`
+    /// pre-allocated `VecDeque` + `HashSet` for the full range and
+    /// the process aborted before the helper was even usable.
+    #[test]
+    fn with_capacity_clamps_usize_max() {
+        let d = RedisStreamDedup::with_capacity(usize::MAX);
+        assert_eq!(
+            d.capacity,
+            RedisStreamDedup::MAX_CAPACITY,
+            "BUG #42: capacity must be clamped at MAX_CAPACITY",
+        );
+        // The clamp value must be small enough to actually pre-
+        // allocate without OOMing on a development machine — the
+        // mere fact that this test reached this assertion proves
+        // it.
+        assert!(
+            RedisStreamDedup::MAX_CAPACITY < usize::MAX,
+            "MAX_CAPACITY must strictly bound usize::MAX",
+        );
+    }
+
+    #[test]
+    fn with_capacity_preserves_in_range_values() {
+        let d = RedisStreamDedup::with_capacity(1024);
+        assert_eq!(d.capacity, 1024);
+        let d_zero = RedisStreamDedup::with_capacity(0);
+        assert_eq!(d_zero.capacity, 1, "0 must clamp UP to 1, not down");
     }
 }
