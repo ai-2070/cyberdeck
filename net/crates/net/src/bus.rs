@@ -896,6 +896,33 @@ impl EventBus {
     /// Poll events from the bus.
     ///
     /// This retrieves events from storage according to the request parameters.
+    ///
+    /// # Topology-change visibility (BUG #50)
+    ///
+    /// `ArcSwap::load()` snapshots the current `PollMerger` for
+    /// the duration of this call. A concurrent `add_shard` /
+    /// `remove_shard_internal` that `.store()`s a fresh merger
+    /// only affects **subsequent** polls — this poll continues
+    /// against the loaded snapshot's shard list.
+    ///
+    /// The implications:
+    ///   - **add_shard mid-poll:** events ingested into the new
+    ///     shard between the merger swap and our return are
+    ///     invisible to this call. They appear on the next poll.
+    ///   - **remove_shard_internal mid-poll:** the stale merger
+    ///     still has the removed shard in its id list. Adapters
+    ///     that lazy-create streams on `poll_shard` (JetStream
+    ///     in particular) may recreate the stream and return
+    ///     empty/stale data. The drained events are dispatched
+    ///     to durable storage by `remove_shard_internal` itself
+    ///     before this poll's adapter call lands; the next poll
+    ///     loads the new merger and sees the correct shard set.
+    ///
+    /// In both cases the loss is transient and self-healing:
+    /// pagination via `next_id` and the next poll's cursor pick
+    /// up where we left off. Callers requiring strict
+    /// "topology-stable" semantics should serialize their polls
+    /// against scaling operations externally.
     pub async fn poll(&self, request: ConsumeRequest) -> Result<ConsumeResponse, ConsumerError> {
         let merger = self.poll_merger.load();
         merger.poll(request).await
