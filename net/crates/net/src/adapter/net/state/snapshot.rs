@@ -601,11 +601,22 @@ impl SnapshotStore {
             }
         }
 
+        // Real linearization point: the snapshots-side entry
+        // guard. Two concurrent `store(seq=N)` calls can each pass
+        // the high_water check above (the read-then-write isn't
+        // CAS), but only one wins the entry guard — the loser's
+        // `new_seq > slot.get().through_seq` is then false (slot
+        // already at N) and it returns `false`. The high_water
+        // write that happens here is therefore best-effort: the
+        // surviving value is whichever store committed the
+        // snapshot, not the loser's identical seq. The "freshness"
+        // invariant — "stored snapshot has the largest seq we ever
+        // saw" — is preserved by the snapshots-side guard alone;
+        // the high_water table only bounds *future* stores from
+        // rewinding.
         match self.snapshots.entry(key) {
             Entry::Vacant(slot) => {
                 slot.insert(snapshot);
-                // Update high_water unconditionally on insert —
-                // we just verified new_seq is > prev high_water.
                 self.high_water.insert(key, new_seq);
                 true
             }
