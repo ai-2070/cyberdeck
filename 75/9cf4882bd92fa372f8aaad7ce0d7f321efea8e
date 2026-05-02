@@ -1,0 +1,33 @@
+net/crates/net/bindings/node/src/identity.rs
+  7cd1aa3948e2e296 57,234-239,246-247
+net/crates/net/bindings/python/src/identity.rs
+  7cd1aa3948e2e296 54,234-237,244-245
+net/crates/net/src/adapter/net/identity/token.rs
+  7cd1aa3948e2e296 187-197,710-718,732,771-816,841-845,850,853-855,858-860,863,1233-1235,1241
+net/crates/net/sdk/src/identity.rs
+  7cd1aa3948e2e296 139-143,152-171
+net/crates/net/tests/channel_auth.rs
+  7cd1aa3948e2e296 191-193,199
+net/crates/net/src/ffi/mesh.rs
+  7cd1aa3948e2e296 143-149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "759cf4882bd92fa372f8aaad7ce0d7f321efea8e",
+  "prompts": {
+    "7cd1aa3948e2e296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad152adb-b4ac-4388-af9c-44b44434d029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3177,
+      "total_deletions": 19,
+      "accepted_lines": 1162,
+      "overriden_lines": 0
+    }
+  }
+}
