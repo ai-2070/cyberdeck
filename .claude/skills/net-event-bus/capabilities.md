@@ -169,8 +169,8 @@ peers = node.find_nodes({
 
 Both have the **full** surface (announce + find_nodes + find_nodes_scoped + find_best_node + find_best_node_scoped). Headers / signatures:
 
-- **Go:** `bindings/go/net/capabilities.go` — `MeshNode.AnnounceCapabilities`, `FindNodes`, `FindNodesScoped`, `FindBestNode`, `FindBestNodeScoped`. `FindBestNode` returns `(uint64, bool, error)` — the bool disambiguates "no match" from `nodeId == 0` (a valid id).
-- **C:** `bindings/go/net/net.h:722-771` — `net_mesh_announce_capabilities`, `net_mesh_find_nodes`, `net_mesh_find_nodes_scoped`, `net_mesh_find_best_node`, `net_mesh_find_best_node_scoped`. JSON in / JSON out; free returned strings via `net_free_string`.
+- **Go:** `go/capabilities.go` — `MeshNode.AnnounceCapabilities`, `FindNodes`, `FindNodesScoped`, `FindBestNode`, `FindBestNodeScoped`. `FindBestNode` returns `(uint64, bool, error)` — the bool disambiguates "no match" from `nodeId == 0` (a valid id).
+- **C:** `go/net.h` — `net_mesh_announce_capabilities`, `net_mesh_find_nodes`, `net_mesh_find_nodes_scoped`, `net_mesh_find_best_node`, `net_mesh_find_best_node_scoped`. JSON in / JSON out; free returned strings via `net_free_string`.
 
 Both also expose `net_normalize_gpu_vendor` / `NormalizeGpuVendor` (see § GPU vendor normalization below).
 

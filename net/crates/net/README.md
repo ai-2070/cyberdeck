@@ -17,7 +17,7 @@ npm install @ai2070/net-sdk @ai2070/net
 pip install ai2070-net-sdk
 
 # Go binding
-go get github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net
+go get github.com/ai-2070/net/go
 ```
 
 Lower-level packages (skip the SDK ergonomics, talk directly to the engine):
@@ -376,7 +376,7 @@ Identity, capability announcements, subnet visibility, and channel authenticatio
 - **Subnets.** A `SubnetId` is a 4-level u32; `SubnetPolicy` derives each peer's subnet from their capability tags so every node in the mesh agrees on the geometry without a central directory. `Visibility` on a channel gates publish fan-out and subscribe authorization against that geometry.
 - **Channel authentication.** `ChannelConfig` carries `publish_caps`, `subscribe_caps`, and `require_token`. Publishers check their own caps before fan-out; subscribers present a `PermissionToken` whose subject matches their entity id. Successful subscribes populate the `AuthGuard` fast path (4 KB bloom filter + verified-subscribe cache) so every subsequent publish packet admits or drops the subscriber in constant time. A periodic token-expiry sweep (default 30 s) evicts subscribers whose tokens age out; a per-peer auth-failure rate limiter (default 16 failures per 60 s window, 30 s throttle) short-circuits bad-token storms before ed25519 verification runs. Any denial surfaces as `Unauthorized` / `RateLimited` at the subscribe gate or as a `PublishReport` miss on the publish side.
 
-Full staging, wire formats, and rationale: [`docs/SDK_SECURITY_SURFACE_PLAN.md`](docs/SDK_SECURITY_SURFACE_PLAN.md). Per-binding parity details: [`docs/SDK_PYTHON_PARITY_PLAN.md`](docs/SDK_PYTHON_PARITY_PLAN.md), [`docs/SDK_GO_PARITY_PLAN.md`](docs/SDK_GO_PARITY_PLAN.md). Runnable examples in idiomatic form: [Rust](sdk/README.md#security-identity-tokens-capabilities-subnets) · [TypeScript](sdk-ts/README.md#security-identity-tokens-capabilities-subnets) · [Python](bindings/python/README.md#security-surface-stage-ae) · [Go](bindings/go/README.md#security-surface-stage-ae).
+Full staging, wire formats, and rationale: [`docs/SDK_SECURITY_SURFACE_PLAN.md`](docs/SDK_SECURITY_SURFACE_PLAN.md). Per-binding parity details: [`docs/SDK_PYTHON_PARITY_PLAN.md`](docs/SDK_PYTHON_PARITY_PLAN.md), [`docs/SDK_GO_PARITY_PLAN.md`](docs/SDK_GO_PARITY_PLAN.md). Runnable examples in idiomatic form: [Rust](sdk/README.md#security-identity-tokens-capabilities-subnets) · [TypeScript](sdk-ts/README.md#security-identity-tokens-capabilities-subnets) · [Python](bindings/python/README.md#security-surface-stage-ae) · [Go](../../../go/README.md#security-surface-stage-ae).
 
 ## Daemons
 
@@ -407,7 +407,7 @@ The full chain runs autonomously over `SUBPROTOCOL_MIGRATION` (0x0500); no manua
 
 The daemon's causal chain continues unbroken on the new host. During migration, a `SuperpositionState` tracks which phase the daemon is in — it exists on both nodes briefly, then collapses to the new host.
 
-Every binding — Rust, TypeScript, Python, Go — surfaces `DaemonRuntime`, the `MeshDaemon` trait / interface, and the `start_migration` orchestrator with the same lifecycle gate and the same stable error vocabulary (`daemon: migration: <kind>[: detail]`, where `<kind>` matches the `MigrationFailureReason` enum). Staging, dispatcher design, and per-binding parity notes: [`docs/SDK_COMPUTE_SURFACE_PLAN.md`](docs/SDK_COMPUTE_SURFACE_PLAN.md) and [`docs/DAEMON_RUNTIME_READINESS_PLAN.md`](docs/DAEMON_RUNTIME_READINESS_PLAN.md). Runnable examples in idiomatic form: [Rust](sdk/README.md#compute-daemons--migration) · [TypeScript](sdk-ts/README.md#compute-daemons--migration) · [Python](bindings/python/README.md#compute-daemons--migration) · [Go](bindings/go/README.md#compute-daemons--migration).
+Every binding — Rust, TypeScript, Python, Go — surfaces `DaemonRuntime`, the `MeshDaemon` trait / interface, and the `start_migration` orchestrator with the same lifecycle gate and the same stable error vocabulary (`daemon: migration: <kind>[: detail]`, where `<kind>` matches the `MigrationFailureReason` enum). Staging, dispatcher design, and per-binding parity notes: [`docs/SDK_COMPUTE_SURFACE_PLAN.md`](docs/SDK_COMPUTE_SURFACE_PLAN.md) and [`docs/DAEMON_RUNTIME_READINESS_PLAN.md`](docs/DAEMON_RUNTIME_READINESS_PLAN.md). Runnable examples in idiomatic form: [Rust](sdk/README.md#compute-daemons--migration) · [TypeScript](sdk-ts/README.md#compute-daemons--migration) · [Python](bindings/python/README.md#compute-daemons--migration) · [Go](../../../go/README.md#compute-daemons--migration).
 
 For daemons that need horizontal scale rather than mobility, `ReplicaGroup` manages N copies as a logical unit. Each replica gets a deterministic identity derived from `group_seed + index` — the same index always produces the same keypair, making replacement idempotent. The group load-balances inbound events across replicas (round-robin, least-connections, consistent hash — any `LoadBalancer` strategy), tracks group-level health (alive as long as one replica is healthy), and spreads placement across nodes for failure-domain isolation. When a node fails, the group re-spawns the affected replicas on new nodes with the same deterministic identity — no migration protocol needed for stateless daemons. Scaling is `scale_to(n)`: scale up appends new replicas, scale down removes the highest-index ones deterministically.
 
@@ -417,7 +417,7 @@ For stateful daemons that need fault tolerance without duplicate compute, `Stand
 
 All three group types share coordination logic via `GroupCoordinator` — health tracking, member management, and placement work identically. Any member of any group is a normal daemon in the `DaemonRegistry`, so MIKOSHI can migrate it without knowing it belongs to a group.
 
-Every binding — Rust, TypeScript, Python, Go — surfaces all three groups with the same coordination semantics and the same stable error vocabulary (`daemon: group: <kind>[: detail]`, where `<kind>` is one of `not-ready | factory-not-found | no-healthy-member | placement-failed | registry-failed | invalid-config | daemon`). Staging, wire formats, and design notes: [`docs/SDK_GROUPS_SURFACE_PLAN.md`](docs/SDK_GROUPS_SURFACE_PLAN.md). Runnable examples in idiomatic form: [Rust](sdk/README.md#groups-replica--fork--standby) · [TypeScript](sdk-ts/README.md#groups-replica--fork--standby) · [Python](bindings/python/README.md#compute-groups-replica--fork--standby) · [Go](bindings/go/README.md#compute-groups-replica--fork--standby).
+Every binding — Rust, TypeScript, Python, Go — surfaces all three groups with the same coordination semantics and the same stable error vocabulary (`daemon: group: <kind>[: detail]`, where `<kind>` is one of `not-ready | factory-not-found | no-healthy-member | placement-failed | registry-failed | invalid-config | daemon`). Staging, wire formats, and design notes: [`docs/SDK_GROUPS_SURFACE_PLAN.md`](docs/SDK_GROUPS_SURFACE_PLAN.md). Runnable examples in idiomatic form: [Rust](sdk/README.md#groups-replica--fork--standby) · [TypeScript](sdk-ts/README.md#groups-replica--fork--standby) · [Python](bindings/python/README.md#compute-groups-replica--fork--standby) · [Go](../../../go/README.md#compute-groups-replica--fork--standby).
 
 ## Safety & Autonomy
 
@@ -764,7 +764,7 @@ All SDKs wrap the same Rust core. Every language gets the same performance.
 | **Rust** | [`ai2070-net-sdk`](https://crates.io/crates/ai2070-net-sdk) | `cargo add ai2070-net-sdk` | Builder pattern, async streams, typed subscriptions |
 | **TypeScript** | [`@ai2070/net-sdk`](https://www.npmjs.com/package/@ai2070/net-sdk) | `npm install @ai2070/net-sdk @ai2070/net` | AsyncIterator, typed channels, Zod support |
 | **Python** | [`ai2070-net-sdk`](https://pypi.org/project/ai2070-net-sdk/) | `pip install ai2070-net-sdk` | Generators, dataclass/Pydantic, context manager |
-| **Go** | [`net`](bindings/go/) | `go get github.com/ai-2070/net/net/crates/net/bindings/go/net` | CGO bindings, zero allocations on raw ingest |
+| **Go** | [`go`](../../../go/) | `go get github.com/ai-2070/net/go` | CGO bindings, zero allocations on raw ingest |
 | **C** | [`net.h`](include/net.h) | `cargo build --release --features ffi,net` then bundle the header | One header, structured types, zero JSON overhead |
 
 The Rust SDK imports as `use net_sdk::...`; the TypeScript SDK as `from '@ai2070/net-sdk'`; the Python SDK as `from net_sdk import ...`. The Rust core (`ai2070-net`), Node binding (`@ai2070/net`), and Python binding (`ai2070-net`) are the lower-level packages — useful when you want to skip the SDK ergonomics. Crate / module names inside the code (`net::`, `net._net`) stayed stable across the rename via package aliasing.

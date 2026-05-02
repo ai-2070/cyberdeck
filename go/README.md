@@ -9,27 +9,29 @@ High-performance Go bindings for the Net event bus.
 
 ## Building
 
-First, build the Net shared library:
+First, build the Net shared library. Run from the Cargo workspace root (`net/crates/net/`):
 
 ```bash
-# From the repository root
+cd net/crates/net
 cargo build --release
 
 # To include CortEX + RedEX support (required for the cortex.go surface below),
 # build with the extended feature set:
 cargo build --release --features "netdb redex-disk"
 
-# The library will be at:
-# - Linux: target/release/libnet.so
-# - macOS: target/release/libnet.dylib
+# The library will be at (relative to the Cargo workspace root):
+# - Linux:   target/release/libnet.so
+# - macOS:   target/release/libnet.dylib
 # - Windows: target/release/net.dll
 ```
 
 ## Installation
 
 ```bash
-go get github.com/ai-2070/net/net/crates/net/bindings/go/net
+go get github.com/ai-2070/net/go
 ```
+
+The package imports as `import "github.com/ai-2070/net/go"`. The default identifier inside Go source is `net` (declared via `package net` in the binding files), so usage looks like `net.New(...)`, `net.NewMeshNode(...)`, etc. — no rename trick required.
 
 ## Usage
 
@@ -40,7 +42,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/ai-2070/net/net/crates/net/bindings/go/net"
+    "github.com/ai-2070/net/go"
 )
 
 func main() {
@@ -124,7 +126,7 @@ Net provides encrypted point-to-point UDP transport for high-performance scenari
 import (
     "crypto/rand"
     "encoding/hex"
-    "github.com/ai-2070/net/net/crates/net/bindings/go/net"
+    "github.com/ai-2070/net/go"
 )
 
 // Generate keypair for responder
@@ -211,7 +213,7 @@ import (
     "log"
     "strings"
 
-    "github.com/ai-2070/net/net/crates/net/bindings/go/net"
+    "github.com/ai-2070/net/go"
 )
 
 func main() {
@@ -392,7 +394,7 @@ import (
     "log"
     "time"
 
-    "github.com/ai-2070/net/net/crates/net/bindings/go/net"
+    "github.com/ai-2070/net/go"
 )
 
 func main() {
@@ -511,7 +513,7 @@ logical event becomes filterable at consume time.
 ```go
 import (
     "fmt"
-    netbinding "github.com/ai-2070/net/net/crates/net/bindings/go/net"
+    netbinding "github.com/ai-2070/net/go"
     "github.com/redis/go-redis/v9"
 )
 
@@ -590,9 +592,9 @@ A `runtime.SetFinalizer` is wired up as a backstop, but explicit
 The Go bindings ship the same identity / capabilities / subnets /
 channel-auth story as the Rust SDK and the TS / Python SDKs. Full
 staging and rationale:
-[`docs/SDK_SECURITY_SURFACE_PLAN.md`](../../docs/SDK_SECURITY_SURFACE_PLAN.md).
+[`docs/SDK_SECURITY_SURFACE_PLAN.md`](../net/crates/net/docs/SDK_SECURITY_SURFACE_PLAN.md).
 Go-binding parity details:
-[`docs/SDK_GO_PARITY_PLAN.md`](../../docs/SDK_GO_PARITY_PLAN.md).
+[`docs/SDK_GO_PARITY_PLAN.md`](../net/crates/net/docs/SDK_GO_PARITY_PLAN.md).
 
 ### Identity + permission tokens
 
@@ -681,7 +683,7 @@ oemNodes, _ := mesh.FindNodesScoped(
 `Regions`). Strictest scope wins — `scope:subnet-local` dominates
 tenant/region tags on the same set. Untagged peers resolve to
 `Global` and stay visible under permissive queries. Full design:
-[`docs/SCOPED_CAPABILITIES_PLAN.md`](../../docs/SCOPED_CAPABILITIES_PLAN.md).
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../net/crates/net/docs/SCOPED_CAPABILITIES_PLAN.md).
 
 #### Scored placement (`FindBestNode`)
 
@@ -727,7 +729,7 @@ Capability propagation is multi-hop, bounded by
 `MAX_CAPABILITY_HOPS = 16` with `(origin, version)` dedup on every
 forwarder. `CapabilityGCIntervalMs` controls both the index TTL
 sweep and the dedup cache eviction. See
-[`docs/MULTIHOP_CAPABILITY_PLAN.md`](../../docs/MULTIHOP_CAPABILITY_PLAN.md).
+[`docs/MULTIHOP_CAPABILITY_PLAN.md`](../net/crates/net/docs/MULTIHOP_CAPABILITY_PLAN.md).
 
 ### Subnets
 
@@ -801,8 +803,8 @@ publish admits the subscriber in constant time. An expiry sweep
 (default 30 s) evicts subscribers whose tokens age out; a per-
 peer auth-failure rate limiter throttles bad-token storms.
 Cross-SDK behaviour is fixed by the Rust integration suite; see
-[`tests/channel_auth.rs`](../../tests/channel_auth.rs) and
-[`tests/channel_auth_hardening.rs`](../../tests/channel_auth_hardening.rs).
+[`tests/channel_auth.rs`](../net/crates/net/tests/channel_auth.rs) and
+[`tests/channel_auth_hardening.rs`](../net/crates/net/tests/channel_auth_hardening.rs).
 
 ## Compute (daemons + migration)
 
@@ -817,7 +819,7 @@ runtime registry without releasing ownership of the Go pointer.
 Build the cdylib with `--features compute` (already on when you
 use the `netdb redex-disk net compute` bundle) and import from
 `net`. Full design notes:
-[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../../docs/SDK_COMPUTE_SURFACE_PLAN.md).
+[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../net/crates/net/docs/SDK_COMPUTE_SURFACE_PLAN.md).
 
 ```go
 package main
@@ -825,7 +827,7 @@ package main
 import (
     "log"
 
-    "github.com/ai-2070/net/net/crates/net/bindings/go/net"
+    "github.com/ai-2070/net/go"
 )
 
 type echoDaemon struct{}
@@ -1027,20 +1029,20 @@ reaches the underlying daemon-level error for callers that only
 care about the broader type.
 
 Full staging, wire formats, and rationale:
-[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../../docs/SDK_GROUPS_SURFACE_PLAN.md).
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../net/crates/net/docs/SDK_GROUPS_SURFACE_PLAN.md).
 Core semantics:
-[`../../README.md#daemons`](../../README.md#daemons).
+[`../../README.md#daemons`](../net/crates/net/README.md#daemons).
 
 ## Running the Example
 
 ```bash
-cd bindings/go/example
+cd go/example
 
 # Set library path (Linux)
-export LD_LIBRARY_PATH=../../../target/release:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=../../net/crates/net/target/release:$LD_LIBRARY_PATH
 
 # Set library path (macOS)
-export DYLD_LIBRARY_PATH=../../../target/release:$DYLD_LIBRARY_PATH
+export DYLD_LIBRARY_PATH=../../net/crates/net/target/release:$DYLD_LIBRARY_PATH
 
 go run main.go
 ```

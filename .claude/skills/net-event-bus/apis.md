@@ -17,7 +17,7 @@ If any count drops, the SDK has churned underneath this doc — re-verify from s
 | Rust | `net/crates/net/sdk/` | `src/net.rs`, `examples/channels.rs`, `examples/stream.rs`, `examples/backpressure.rs` |
 | TypeScript | `net/crates/net/sdk-ts/` | `src/node.ts`, `src/channel.ts`, `src/stream.ts` |
 | Python | `net/crates/net/sdk-py/` | `src/net_sdk/node.py`, `src/net_sdk/channel.py`, `src/net_sdk/stream.py` |
-| Go | `net/crates/net/bindings/go/` | the package's main file + `README.md` |
+| Go | `go/` | the package's main file + `README.md` |
 | C | `net/crates/net/include/` | `net.h` |
 
 ---
@@ -162,10 +162,10 @@ async fn main() -> net_sdk::error::Result<()> {
 - Convenience presets on the builder: `.high_throughput()`, `.low_latency()`, `.batch(BatchConfig)`, `.scaling(ScalingPolicy)`, `.adapter_timeout(Duration)`.
 - Reference: `net/crates/net/sdk/examples/channels.rs` is the canonical typed-emit example.
 
-## Go (`bindings/go/net`)
+## Go (`github.com/ai-2070/net/go`)
 
 ```go
-import "github.com/ai-2070/net/net/crates/net/bindings/go/net"
+import "github.com/ai-2070/net/go"
 
 bus, err := net.New(&net.Config{NumShards: 4})
 if err != nil { log.Fatal(err) }

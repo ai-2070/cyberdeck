@@ -9,7 +9,7 @@
 package net
 
 /*
-#cgo LDFLAGS: -L${SRCDIR}/../../../target/release -lnet_compute
+#cgo LDFLAGS: -L${SRCDIR}/../net/crates/net/target/release -lnet_compute
 #include "net.h"
 #include <stdlib.h>
 */

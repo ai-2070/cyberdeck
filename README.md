@@ -21,7 +21,7 @@ npm install @ai2070/net-sdk @ai2070/net
 pip install ai2070-net-sdk
 
 # Go
-go get github.com/ai-2070/net/net/crates/net/bindings/go/net
+go get github.com/ai-2070/net/go
 ```
 
 The Rust crate, npm scope, and PyPI dist all publish under `ai2070-net*` / `@ai2070/net*`. Source-level imports stay as `net_sdk` / `@ai2070/net-sdk` / `from net_sdk import ...`. See [SDKs](#sdks) for the lower-level core packages and full per-language usage.
@@ -497,7 +497,7 @@ All SDKs wrap the same Rust core. The SDK is the developer experience, the engin
 | **TypeScript** | [`@ai2070/net-sdk`](https://www.npmjs.com/package/@ai2070/net-sdk) ([source](net/crates/net/sdk-ts)) | `npm install @ai2070/net-sdk @ai2070/net` |
 | **Python** | [`ai2070-net-sdk`](https://pypi.org/project/ai2070-net-sdk/) ([source](net/crates/net/sdk-py)) | `pip install ai2070-net-sdk` |
 | **C** | [`net.h`](net/crates/net/include/net.h) | `cargo build --release --features ffi,net` (build cdylib + bundle the header) |
-| **Go** | [`net`](net/crates/net/bindings/go) | `go get github.com/ai-2070/net/net/crates/net/bindings/go/net` |
+| **Go** | [`go`](go/) | `go get github.com/ai-2070/net/go` |
 
 Lower-level bindings (skip the SDK ergonomics, talk directly to the engine):
 

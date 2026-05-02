@@ -65,7 +65,7 @@ If the user's design language conflicts with any of these (e.g. "the broker", "t
    - Rust: `net/crates/net/sdk/src/` and `net/crates/net/sdk/examples/`
    - TypeScript: `net/crates/net/sdk-ts/src/`
    - Python: `net/crates/net/sdk-py/src/net_sdk/`
-   - Go: `net/crates/net/bindings/go/`
+   - Go: `go/`
    - C: `net/crates/net/include/net.h`
    These are authoritative. The README is a good intro; the source is ground truth.
 
