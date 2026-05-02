@@ -518,21 +518,54 @@ impl EventBus {
             //    the drain worker breaks. The batch worker's
             //    `Ok(None)` arm then runs after both senders
             //    are dropped and flushes any pending batch.
+            // Bound each JoinHandle await so a worker that's
+            // parked inside a slow adapter call (e.g. drain worker
+            // mid-`sender.send().await` against a backpressured
+            // channel because the batch worker is itself blocked
+            // in the adapter) cannot pin rollback indefinitely.
+            // 2x `adapter_timeout` is the natural ceiling: the
+            // batch worker uses `adapter_timeout` per dispatch and
+            // is expected to wake within that window. A timeout
+            // here leaks the JoinHandle — acceptable because
+            // step 1 already removed the bus-side sender, so the
+            // detached task can't observe new work and will exit
+            // on its next loop iteration.
             let workers = self.batch_workers.lock().remove(&new_id);
             let final_next_sequence = if let Some(workers) = workers {
-                if let Err(err) = workers.drain.await {
-                    tracing::warn!(
-                        shard_id = new_id,
-                        error = %err,
-                        "drain worker JoinHandle errored on activate-failure rollback"
-                    );
+                let bound = self.config.adapter_timeout.saturating_mul(2);
+                match tokio::time::timeout(bound, workers.drain).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            shard_id = new_id,
+                            error = %err,
+                            "drain worker JoinHandle errored on activate-failure rollback"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            shard_id = new_id,
+                            timeout_ms = bound.as_millis() as u64,
+                            "drain worker did not exit within timeout on activate-failure rollback; detaching"
+                        );
+                    }
                 }
-                if let Err(err) = workers.batch.await {
-                    tracing::warn!(
-                        shard_id = new_id,
-                        error = %err,
-                        "BatchWorker JoinHandle errored on activate-failure rollback"
-                    );
+                match tokio::time::timeout(bound, workers.batch).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            shard_id = new_id,
+                            error = %err,
+                            "BatchWorker JoinHandle errored on activate-failure rollback"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            shard_id = new_id,
+                            timeout_ms = bound.as_millis() as u64,
+                            "BatchWorker did not exit within timeout on activate-failure rollback; detaching"
+                        );
+                    }
                 }
                 workers.next_sequence.load(AtomicOrdering::Acquire)
             } else {
