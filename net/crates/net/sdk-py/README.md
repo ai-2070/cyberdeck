@@ -302,7 +302,7 @@ token = identity.issue_token(
     subject=grantee.entity_id,
     scope=["subscribe"],
     channel="sensors/temp",
-    ttl_seconds=300,
+    ttl_seconds=300,    # `0` raises TokenError (zero TTL would mint a born-expired token)
 )
 
 # Publisher gates the channel on tokens; subscribers attach them.

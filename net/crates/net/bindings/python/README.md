@@ -270,6 +270,11 @@ file = redex.open_file(
 
 # Append (or batch-append).
 seq = file.append(b'{"url": "/home"}')
+# `append_batch` returns the first-seq int of the batch, or `None`
+# for an empty input. The `None` return is the explicit "I
+# appended nothing" signal — pre-`bugfixes-8` it returned `0`,
+# which collided with the legitimate "first event of a non-empty
+# batch landed at seq 0" return.
 first = file.append_batch([b'{"a": 1}', b'{"a": 2}'])
 
 # Tail — backfills the retained range, then streams live appends.
@@ -382,7 +387,10 @@ alice = Identity.generate()
 bob = Identity.generate()
 
 # Alice issues Bob a subscribe+delegate token good for 5 min, with
-# one re-delegation hop remaining.
+# one re-delegation hop remaining. `ttl_seconds=0` raises
+# `TokenError` — a zero TTL would mint a born-expired token that
+# every receiver would reject as `Expired`, leaving the issuer to
+# diagnose the misuse from receiver-side log lines.
 token = alice.issue_token(
     subject=bob.entity_id,
     scope=["subscribe", "delegate"],

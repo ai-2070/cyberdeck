@@ -247,6 +247,12 @@ let stream = node.open_stream(
 // Three canonical daemon patterns:
 
 // 1. Drop on pressure — best for telemetry / sampled streams.
+//
+// `SdkError` is `#[non_exhaustive]`. Always include a wildcard arm
+// when matching: future variant additions (e.g. `Sampled`, `Unrouted`)
+// will be a minor-version change, but a closed match would stop
+// compiling. Match by variant where the remediation differs;
+// fall through with `Err(e)` for the rest.
 match node.send_on_stream(&stream, &[Bytes::from_static(b"{}")]).await {
     Ok(()) => {}
     Err(SdkError::Backpressure) => metrics::inc("stream.backpressure_drops"),
@@ -305,6 +311,10 @@ let token = id.issue_token(
     Duration::from_secs(300),
     0, // delegation depth — 0 forbids re-delegation
 );
+// `issue_token` soft-clamps `Duration::ZERO` to 1 second (and
+// `debug_assert!`s in dev so the misuse is loud in tests). Callers
+// that need to *reject* zero-TTL inputs at the boundary should use
+// `id.try_issue_token(...)`, which returns `TokenError::ZeroTtl`.
 // Token is a signed, transport-ready blob.
 assert_eq!(token.to_bytes().len(), net_sdk::PermissionToken::WIRE_SIZE);
 
@@ -560,7 +570,7 @@ let token = publisher_identity.issue_token(
     subscriber_identity.entity_id().clone(),
     TokenScope::SUBSCRIBE,
     &name,
-    Duration::from_secs(300),
+    Duration::from_secs(300), // zero is soft-clamped to 1s; use try_issue_token to reject
     0,
 );
 
@@ -970,6 +980,13 @@ domains) live in [`../README.md#daemons`](../README.md#daemons).
 | `flush()` | Flush pending batches |
 | `shutdown()` | Graceful shutdown |
 | `bus()` | Access underlying `EventBus` |
+
+`SdkError` is `#[non_exhaustive]`; structured ingestion failures
+(`Sampled`, `Unrouted`, `Backpressure`) and stream-side rejections
+(`ChannelRejected`) surface as their own variants rather than being
+funnelled through `Ingestion(String)`. Always include a wildcard
+arm when matching so a future variant addition is a minor-version
+change, not a breaking one.
 
 ### Channel surface (feature `net`)
 

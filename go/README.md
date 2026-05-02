@@ -614,6 +614,10 @@ token, _ := alice.IssueToken(net.IssueTokenRequest{
     Subject:         bobID,
     Scope:           []string{"subscribe", "delegate"},
     Channel:         "sensors/temp",
+    // `TTLSeconds: 0` returns a non-nil error — a zero TTL would
+    // mint a born-expired token that every receiver would reject
+    // as `Expired`, leaving the issuer to diagnose the misuse from
+    // receiver-side log lines.
     TTLSeconds:      300,
     DelegationDepth: 1,
 })

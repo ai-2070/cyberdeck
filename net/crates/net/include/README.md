@@ -220,47 +220,53 @@ here is a stability commitment.
 The mesh transport (encrypted peer sessions, channels, NAT
 traversal, capability discovery) is implemented in the same
 shared library but lives behind a **separate, broader header**:
-[`bindings/go/net/net.h`](../bindings/go/net/net.h). That header is
-written for the Go cgo bindings and is the de-facto reference for
-C consumers who want the mesh API. Symbols are stable in practice
-but not committed in the same way as `include/net.h`.
+[`go/net.h`](../../../../go/net.h) at the repo root, which the Go
+cgo bindings cargo-include directly. That header is the
+de-facto reference for C consumers who want the mesh API. Symbols
+are stable in practice but not committed in the same way as
+`include/net.h`. An identical-content mirror lives in this
+directory at [`net.go.h`](./net.go.h) — it exists so the parity
+test (`cr22_c_header_parity_with_rust_neterror`) can `include_str!`
+both headers without escaping the crate root, and it's a
+convenient drop-in for C consumers who want a copy that ships
+with the crate.
 
-**One header per translation unit.** Both files use the same
-`#ifndef NET_SDK_H` include guard, so including both in the same
-`.c` file silently drops the second include — symbols only declared
-there will fail to compile. The two headers are also **not a strict
-superset of each other**:
+**One header per translation unit.** All three files use the same
+`#ifndef NET_SDK_H` include guard, so including more than one in
+the same `.c` file silently drops the second include — symbols
+only declared there will fail to compile. The narrow / broad
+split is also **not a strict superset**:
 
 - `include/net.h` declares `net_ingest_raw_ex`, `net_poll_ex`,
-  `net_stats_ex` (structured no-JSON paths) that
-  `bindings/go/net/net.h` does not.
-- `bindings/go/net/net.h` declares the entire mesh surface
-  (sessions, streams, channels, capabilities, NAT) that
-  `include/net.h` does not.
+  `net_stats_ex` (structured no-JSON paths) that the broader
+  mesh header does not.
+- `go/net.h` (and its `net.go.h` mirror) declares the entire
+  mesh surface (sessions, streams, channels, capabilities, NAT)
+  that `include/net.h` does not.
 
 Pick the header that matches the surface your translation unit
 actually uses. If a single program needs both — the structured
 `_ex` poll path *and* the mesh API — split them across translation
 units: one `.c` file includes `include/net.h` and exposes a thin
-internal API to the rest of your program, another includes
-`bindings/go/net/net.h`. The resulting object files link against
-the same `libnet.{so,dylib,dll}` regardless of which header
-declared each symbol.
+internal API to the rest of your program, another includes the
+mesh header. The resulting object files link against the same
+`libnet.{so,dylib,dll}` regardless of which header declared each
+symbol.
 
 A mesh node is its own handle (`net_meshnode_t*`), created via
 `net_mesh_new` and torn down via `net_mesh_shutdown` — independent
 of the bus handle (`net_handle_t`). A single process can hold both
 simultaneously regardless of how the headers are included.
 
-The Go bindings (`bindings/go/net/`) wrap this surface; their
+The Go bindings (under repo-root `go/`) wrap this surface; their
 README has runnable examples for every function family. The
 section below is a function inventory — for usage prose, see
-[`bindings/go/README.md`](../bindings/go/README.md).
+[`go/README.md`](../../../../go/README.md).
 
 ### Quick start (mesh)
 
 ```c
-#include "../bindings/go/net/net.h"   /* broader header */
+#include "net.go.h"   /* broader header — adjacent to net.h in this directory */
 
 net_meshnode_t* mesh = NULL;
 const char* cfg =
@@ -354,9 +360,10 @@ net_mesh_stream_t   // Opaque per-peer stream handle.
 
 ### Where to look for full prose
 
-- [`net.h`](../bindings/go/net/net.h) — every function has a doc-comment
+- [`net.go.h`](./net.go.h) (or the repo-root [`go/net.h`](../../../../go/net.h)
+  — identical content) — every function has a doc-comment
   with input shapes, error codes, and ownership rules.
-- [`bindings/go/README.md`](../bindings/go/README.md) — runnable
+- [`go/README.md`](../../../../go/README.md) — runnable
   examples for the full mesh surface (the Go bindings are a thin
   wrapper over `net.h`, so the example translation back to C is
   near-1:1).
