@@ -1,0 +1,23 @@
+net/crates/net/src/ffi/mod.rs
+  7cd1aa3948e2e296 1576,1588-1596,1600
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "5583b3df30069fb41ba650d36153b4faedb018af",
+  "prompts": {
+    "7cd1aa3948e2e296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad152adb-b4ac-4388-af9c-44b44434d029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 13,
+      "total_deletions": 2,
+      "accepted_lines": 1267,
+      "overriden_lines": 0
+    }
+  }
+}
