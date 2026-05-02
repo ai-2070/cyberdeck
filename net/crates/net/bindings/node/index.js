@@ -77,8 +77,8 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-android-arm64')
         const bindingPackageVersion = require('@ai2070/net-android-arm64/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -93,8 +93,8 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-android-arm-eabi')
         const bindingPackageVersion = require('@ai2070/net-android-arm-eabi/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -114,8 +114,8 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-win32-x64-gnu')
         const bindingPackageVersion = require('@ai2070/net-win32-x64-gnu/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -130,9 +130,9 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-win32-x64-msvc')
         const bindingPackageVersion = require('@ai2070/net-win32-x64-msvc/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0        }
         return binding
       } catch (e) {
         loadErrors.push(e)
@@ -147,9 +147,9 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-win32-ia32-msvc')
         const bindingPackageVersion = require('@ai2070/net-win32-ia32-msvc/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0        }
         return binding
       } catch (e) {
         loadErrors.push(e)
@@ -163,8 +163,8 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-win32-arm64-msvc')
         const bindingPackageVersion = require('@ai2070/net-win32-arm64-msvc/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -182,9 +182,9 @@ function requireNative() {
     try {
       const binding = require('@ai2070/net-darwin-universal')
       const bindingPackageVersion = require('@ai2070/net-darwin-universal/package.json').version
-      if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-        throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-      }
+      if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+        throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0      }
       return binding
     } catch (e) {
       loadErrors.push(e)
@@ -198,9 +198,9 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-darwin-x64')
         const bindingPackageVersion = require('@ai2070/net-darwin-x64/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0        }
         return binding
       } catch (e) {
         loadErrors.push(e)
@@ -214,9 +214,9 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-darwin-arm64')
         const bindingPackageVersion = require('@ai2070/net-darwin-arm64/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0        }
         return binding
       } catch (e) {
         loadErrors.push(e)
@@ -234,9 +234,9 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-freebsd-x64')
         const bindingPackageVersion = require('@ai2070/net-freebsd-x64/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0        }
         return binding
       } catch (e) {
         loadErrors.push(e)
@@ -250,9 +250,9 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-freebsd-arm64')
         const bindingPackageVersion = require('@ai2070/net-freebsd-arm64/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0        }
         return binding
       } catch (e) {
         loadErrors.push(e)
@@ -271,9 +271,9 @@ function requireNative() {
         try {
           const binding = require('@ai2070/net-linux-x64-musl')
           const bindingPackageVersion = require('@ai2070/net-linux-x64-musl/package.json').version
-          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-          }
+          if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0          }
           return binding
         } catch (e) {
           loadErrors.push(e)
@@ -287,9 +287,9 @@ function requireNative() {
         try {
           const binding = require('@ai2070/net-linux-x64-gnu')
           const bindingPackageVersion = require('@ai2070/net-linux-x64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-          }
+          if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0          }
           return binding
         } catch (e) {
           loadErrors.push(e)
@@ -305,9 +305,9 @@ function requireNative() {
         try {
           const binding = require('@ai2070/net-linux-arm64-musl')
           const bindingPackageVersion = require('@ai2070/net-linux-arm64-musl/package.json').version
-          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-          }
+          if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0          }
           return binding
         } catch (e) {
           loadErrors.push(e)
@@ -321,9 +321,9 @@ function requireNative() {
         try {
           const binding = require('@ai2070/net-linux-arm64-gnu')
           const bindingPackageVersion = require('@ai2070/net-linux-arm64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-          }
+          if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0          }
           return binding
         } catch (e) {
           loadErrors.push(e)
@@ -339,9 +339,9 @@ function requireNative() {
         try {
           const binding = require('@ai2070/net-linux-arm-musleabihf')
           const bindingPackageVersion = require('@ai2070/net-linux-arm-musleabihf/package.json').version
-          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-          }
+          if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0          }
           return binding
         } catch (e) {
           loadErrors.push(e)
@@ -355,9 +355,9 @@ function requireNative() {
         try {
           const binding = require('@ai2070/net-linux-arm-gnueabihf')
           const bindingPackageVersion = require('@ai2070/net-linux-arm-gnueabihf/package.json').version
-          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-          }
+          if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0          }
           return binding
         } catch (e) {
           loadErrors.push(e)
@@ -373,9 +373,9 @@ function requireNative() {
         try {
           const binding = require('@ai2070/net-linux-loong64-musl')
           const bindingPackageVersion = require('@ai2070/net-linux-loong64-musl/package.json').version
-          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-          }
+          if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0          }
           return binding
         } catch (e) {
           loadErrors.push(e)
@@ -389,9 +389,9 @@ function requireNative() {
         try {
           const binding = require('@ai2070/net-linux-loong64-gnu')
           const bindingPackageVersion = require('@ai2070/net-linux-loong64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-          }
+          if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0          }
           return binding
         } catch (e) {
           loadErrors.push(e)
@@ -407,9 +407,9 @@ function requireNative() {
         try {
           const binding = require('@ai2070/net-linux-riscv64-musl')
           const bindingPackageVersion = require('@ai2070/net-linux-riscv64-musl/package.json').version
-          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-          }
+          if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0          }
           return binding
         } catch (e) {
           loadErrors.push(e)
@@ -423,9 +423,9 @@ function requireNative() {
         try {
           const binding = require('@ai2070/net-linux-riscv64-gnu')
           const bindingPackageVersion = require('@ai2070/net-linux-riscv64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-          }
+          if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0          }
           return binding
         } catch (e) {
           loadErrors.push(e)
@@ -440,9 +440,9 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-linux-ppc64-gnu')
         const bindingPackageVersion = require('@ai2070/net-linux-ppc64-gnu/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0        }
         return binding
       } catch (e) {
         loadErrors.push(e)
@@ -456,9 +456,9 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-linux-s390x-gnu')
         const bindingPackageVersion = require('@ai2070/net-linux-s390x-gnu/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0        }
         return binding
       } catch (e) {
         loadErrors.push(e)
@@ -476,9 +476,9 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-openharmony-arm64')
         const bindingPackageVersion = require('@ai2070/net-openharmony-arm64/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0        }
         return binding
       } catch (e) {
         loadErrors.push(e)
@@ -492,9 +492,9 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-openharmony-x64')
         const bindingPackageVersion = require('@ai2070/net-openharmony-x64/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0        }
         return binding
       } catch (e) {
         loadErrors.push(e)
@@ -508,9 +508,9 @@ function requireNative() {
       try {
         const binding = require('@ai2070/net-openharmony-arm')
         const bindingPackageVersion = require('@ai2070/net-openharmony-arm/package.json').version
-        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
+        if (bindingPackageVersion !== '0.9.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.9.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+0.9.00.9.0        }
         return binding
       } catch (e) {
         loadErrors.push(e)
