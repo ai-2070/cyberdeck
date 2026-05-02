@@ -1617,10 +1617,15 @@ async fn dispatch_batch(
             Ok(Ok(())) => return true,
             Ok(Err(e)) => {
                 if !e.is_retryable() {
+                    // BUG #52: tag with a `reason` field so this
+                    // distinct drop cause is separately filterable
+                    // from retry-exhausted and timeout in
+                    // observability tools.
                     tracing::error!(
                         shard_id,
                         error = %e,
                         attempt,
+                        reason = "non_retryable",
                         "Non-retryable error from adapter, dropping batch"
                     );
                     return false;
@@ -1634,14 +1639,33 @@ async fn dispatch_batch(
         tokio::time::sleep(retry_backoff(shard_id, attempt)).await;
     }
 
+    // BUG #52: pre-fix the final attempt collapsed every drop into
+    // one log line ("Failed to dispatch batch, dropping"), making
+    // it impossible to tell retry-exhausted from fatal-non-
+    // retryable from timeout in metrics. The non-retryable case
+    // already has its own log inside the retry loop above (early
+    // return); here we tag retry-exhausted vs timeout-after-
+    // retries with distinct `reason` fields so log-based
+    // observability tools can break the drops out by cause.
     match tokio::time::timeout(timeout, adapter.on_batch(batch)).await {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
-            tracing::error!(shard_id, error = %e, "Failed to dispatch batch, dropping");
+            tracing::error!(
+                shard_id,
+                error = %e,
+                reason = "retry_exhausted",
+                attempts = retries + 1,
+                "Failed to dispatch batch after exhausting retries, dropping"
+            );
             false
         }
         Err(_) => {
-            tracing::error!(shard_id, "Adapter on_batch timed out, dropping batch");
+            tracing::error!(
+                shard_id,
+                reason = "timeout",
+                attempts = retries + 1,
+                "Adapter on_batch timed out on final attempt, dropping batch"
+            );
             false
         }
     }
