@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/contested/correlation.rs
+  7cd1aa3948e2e296 157-168,173-174,511-543
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b6dafe0f80b682da3d1e77788feb748ce04e439a",
+  "prompts": {
+    "7cd1aa3948e2e296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad152adb-b4ac-4388-af9c-44b44434d029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 591,
+      "total_deletions": 4,
+      "accepted_lines": 1073,
+      "overriden_lines": 0
+    }
+  }
+}
