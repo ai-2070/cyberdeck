@@ -1286,6 +1286,23 @@ impl EventBus {
         // `pop_batch_into`. Promote to SeqCst so the load-bearing
         // happens-before is explicit at this site, not derived
         // from another atomic's ordering choice.
+        //
+        // Caveat: the SeqCst happens-before above only covers the
+        // *non-deadline* exit from the spin (the loop condition
+        // observed `in_flight_ingests == 0`). On the deadline-break
+        // path the loop exits with `in_flight_ingests > 0` — the
+        // outstanding producer pushes have NOT been observed
+        // synchronized-with this thread, and the SeqCst store below
+        // does not retroactively create a happens-before with
+        // pushes that are still mid-flight. Those events are
+        // exactly the "stranded" events accounted via
+        // `events_dropped` and `shutdown_was_lossy`; the contract
+        // is "every observed-pre-shutdown push is visible to the
+        // final sweep on the happy path; on the deadline path,
+        // up to `stranded` events past the gate are surfaced as
+        // dropped". The flag at line 1271 (`shutdown_was_lossy`)
+        // is the operator-visible signal that this contract was
+        // exercised on the lossy branch.
         self.drain_finalize_ready
             .store(true, AtomicOrdering::SeqCst);
 
