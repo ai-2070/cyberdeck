@@ -235,9 +235,11 @@ export class RedexFile {
     }
   }
 
-  /** Append a batch atomically. Returns the seq of the first event;
-   *  subsequent events are `first + 0, first + 1, ...`. */
-  appendBatch(payloads: Buffer[]): bigint {
+  /** Append a batch atomically. Returns the seq of the first event
+   *  (subsequent events are `first + 0, first + 1, ...`), or `null`
+   *  for an empty batch (no seq is allocated when there's nothing to
+   *  append). */
+  appendBatch(payloads: Buffer[]): bigint | null {
     try {
       return this.napi.appendBatch(payloads);
     } catch (e) {

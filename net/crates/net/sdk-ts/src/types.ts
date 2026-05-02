@@ -87,12 +87,18 @@ export interface PollResponseData {
   hasMore: boolean;
 }
 
-/** Ingestion statistics. */
+/** Ingestion statistics.
+ *
+ * Counters cross the napi boundary as `bigint` because a long-running
+ * bus can outrun `Number.MAX_SAFE_INTEGER` (2^53) over weeks at high
+ * event rates. Use `Number(stats.eventsIngested)` for display when you
+ * know the value fits; keep as `bigint` for arithmetic.
+ */
 export interface Stats {
   /** Total events ingested. */
-  eventsIngested: number;
+  eventsIngested: bigint;
   /** Events dropped due to backpressure. */
-  eventsDropped: number;
+  eventsDropped: bigint;
 }
 
 /** Options for subscribing to events. */
