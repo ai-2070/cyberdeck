@@ -2,13 +2,48 @@
 
 use thiserror::Error;
 
+/// Unified SDK error.
+///
+/// Marked `#[non_exhaustive]` so adding a new variant is a minor-version
+/// change — external `match` statements must include a wildcard arm.
+/// The most recent variant additions (`Sampled`, `Unrouted`) tightened
+/// `From<IngestionError>` so structured backpressure / sampling /
+/// no-route signals stop being funnelled into a stringly-typed
+/// `Ingestion(String)`. Callers that previously matched on the
+/// string content of `Ingestion` need to be updated to match the
+/// new variants.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum SdkError {
     #[error("node has been shut down")]
     Shutdown,
 
+    /// Generic ingestion failure that doesn't map to a more
+    /// specific variant.
+    ///
+    /// Pre-fix, every `IngestionError` was funnelled here
+    /// — `Backpressure`, `Sampled`, `Unrouted`, and shutdown all
+    /// became `Ingestion("…")` and callers had to string-match to
+    /// pick a remediation. Today's `From<IngestionError>` impl
+    /// routes the structured variants below; this `String` variant
+    /// stays as a fallback for any future `IngestionError`
+    /// addition and for callers that already pattern-match on it.
     #[error("ingestion failed: {0}")]
     Ingestion(String),
+
+    /// Event was deliberately dropped by a sampling / decimation
+    /// policy. Retrying is pointless — the producer should accept
+    /// the drop or change the sampling rate.
+    #[error("event dropped due to sampling")]
+    Sampled,
+
+    /// No routable shard for the event. Typically a topology-
+    /// transient state (a concurrent scale-down removed the
+    /// hashed shard id, or the shard is still provisioning).
+    /// Retry once topology stabilizes; back-off-and-retry on
+    /// `Backpressure` semantics is the wrong remediation.
+    #[error("event has no routable shard")]
+    Unrouted,
 
     #[error("poll failed: {0}")]
     Poll(String),
@@ -84,7 +119,22 @@ impl From<net::adapter::net::StreamError> for SdkError {
 
 impl From<net::error::IngestionError> for SdkError {
     fn from(e: net::error::IngestionError) -> Self {
-        SdkError::Ingestion(e.to_string())
+        use net::error::IngestionError;
+        // Pre-fix this stringified every variant into
+        // `SdkError::Ingestion(String)`, forcing callers to match
+        // on the message text to distinguish "ring buffer full,
+        // retry with backoff" (Backpressure) from "event dropped
+        // by sampling, retry futile" (Sampled) from "no routable
+        // shard, retry once topology stabilizes" (Unrouted).
+        // Each maps to a structured SdkError variant so the
+        // remediation choice is encoded in the type system.
+        match e {
+            IngestionError::Backpressure => SdkError::Backpressure,
+            IngestionError::Sampled => SdkError::Sampled,
+            IngestionError::Unrouted => SdkError::Unrouted,
+            IngestionError::ShuttingDown => SdkError::Shutdown,
+            IngestionError::Serialization(err) => SdkError::Serialization(err),
+        }
     }
 }
 
@@ -111,3 +161,69 @@ impl From<net::adapter::net::traversal::TraversalError> for SdkError {
 }
 
 pub type Result<T> = std::result::Result<T, SdkError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use net::error::IngestionError;
+
+    /// Each `IngestionError` variant must map to a
+    /// structured `SdkError` so callers don't have to string-
+    /// match the message text to pick a remediation.
+    #[test]
+    fn ingestion_backpressure_maps_to_structured_backpressure() {
+        let sdk: SdkError = IngestionError::Backpressure.into();
+        assert!(
+            matches!(sdk, SdkError::Backpressure),
+            "Backpressure must map to SdkError::Backpressure, got {:?}",
+            sdk
+        );
+    }
+
+    #[test]
+    fn ingestion_sampled_maps_to_structured_sampled() {
+        let sdk: SdkError = IngestionError::Sampled.into();
+        assert!(
+            matches!(sdk, SdkError::Sampled),
+            "Sampled must map to SdkError::Sampled so callers \
+             know retry is pointless; got {:?}",
+            sdk
+        );
+    }
+
+    #[test]
+    fn ingestion_unrouted_maps_to_structured_unrouted() {
+        let sdk: SdkError = IngestionError::Unrouted.into();
+        assert!(
+            matches!(sdk, SdkError::Unrouted),
+            "Unrouted must map to SdkError::Unrouted so callers \
+             know to wait for topology to stabilize; got {:?}",
+            sdk
+        );
+    }
+
+    #[test]
+    fn ingestion_shutdown_maps_to_structured_shutdown() {
+        let sdk: SdkError = IngestionError::ShuttingDown.into();
+        assert!(
+            matches!(sdk, SdkError::Shutdown),
+            "ShuttingDown must reuse SdkError::Shutdown, got {:?}",
+            sdk
+        );
+    }
+
+    #[test]
+    fn ingestion_serialization_preserves_structured_serialization() {
+        // Construct an IngestionError::Serialization carrying a
+        // real serde_json error so the From conversion has
+        // something to unwrap.
+        let parse_err: serde_json::Error =
+            serde_json::from_str::<serde_json::Value>("{ this is not json").unwrap_err();
+        let sdk: SdkError = IngestionError::Serialization(parse_err).into();
+        assert!(
+            matches!(sdk, SdkError::Serialization(_)),
+            "Serialization must keep its #[from] serde_json::Error, got {:?}",
+            sdk
+        );
+    }
+}

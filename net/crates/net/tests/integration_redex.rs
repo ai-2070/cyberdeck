@@ -229,7 +229,7 @@ async fn test_ordered_appender_inline_and_batch() {
             Bytes::from_static(b"three"),
         ])
         .unwrap();
-    assert_eq!(first, 2);
+    assert_eq!(first, Some(2));
     assert_eq!(f.next_seq(), 5);
 
     let events = f.read_range(0, 5);
@@ -1035,7 +1035,7 @@ async fn test_redex_append_batch_atomic_seq() {
             Bytes::from_static(b"c"),
         ])
         .unwrap();
-    assert_eq!(first, 0);
+    assert_eq!(first, Some(0));
     assert_eq!(f.next_seq(), 3);
 
     // Interleave with a plain append then another batch.
@@ -1043,7 +1043,7 @@ async fn test_redex_append_batch_atomic_seq() {
     let next = f
         .append_batch(&[Bytes::from_static(b"y"), Bytes::from_static(b"z")])
         .unwrap();
-    assert_eq!(next, 4);
+    assert_eq!(next, Some(4));
 
     let events = f.read_range(0, 6);
     let payloads: Vec<&[u8]> = events.iter().map(|e| e.payload.as_ref()).collect();

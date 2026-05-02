@@ -80,28 +80,50 @@ use std::sync::Arc;
 /// nanoseconds extra per new id, dwarfed by the heap allocation
 /// that already dominates insert cost.
 pub struct RedisStreamDedup {
-    /// Insertion-ordered queue, used for LRU eviction. Each entry
+    /// Insertion-ordered queue, used for FIFO eviction. Each entry
     /// is `Arc::clone`-shared with `seen` so we don't pay a second
     /// allocation per insert.
+    ///
+    /// Pre-fix doc-comments described this as
+    /// "LRU eviction" but `is_duplicate` doesn't move re-observed
+    /// ids to the back of the queue — re-observation is a no-op
+    /// and the queue stays strictly insertion-ordered. The
+    /// eviction is FIFO, not LRU. Functionally it's a sliding
+    /// dedup window: any id older than `capacity` insertions ago
+    /// is forgotten, regardless of how often it's been observed.
+    /// Frequently-observed ids do NOT stay tracked longer than
+    /// rarely-observed ones. Docstrings updated for accuracy.
     order: VecDeque<Arc<str>>,
     /// Lookup index. Shares its `Arc<str>` entries with `order` —
     /// every id lives in exactly one heap allocation, refcounted.
     seen: HashSet<Arc<str>>,
     /// Maximum number of distinct ids tracked. Older ids are
-    /// evicted on insert when the set is at capacity.
+    /// evicted on insert when the set is at capacity (FIFO order).
     capacity: usize,
 }
 
 impl RedisStreamDedup {
+    /// Upper bound on the dedup capacity. Beyond this,
+    /// [`Self::with_capacity`] clamps. `1 << 24` (~16.7 M ids) is
+    /// far above any realistic dedup window and below the point
+    /// where pre-allocation would dominate the process heap
+    /// (~256 MiB just for the `HashSet` + `VecDeque` reservations).
+    pub const MAX_CAPACITY: usize = 1 << 24;
+
     /// Create a helper with the given LRU capacity.
     ///
-    /// `capacity == 0` is treated as 1 — the LRU still works
-    /// (every insert evicts the prior id) but the dedup window is
-    /// effectively a single-id rolling window. Callers that want
-    /// "no dedup at all" should not construct this helper in the
-    /// first place.
+    /// `capacity == 0` is treated as 1 — the FIFO eviction still
+    /// works (every insert evicts the prior id) but the dedup
+    /// window is effectively a single-id rolling window. Callers
+    /// that want "no dedup at all" should not construct this
+    /// helper in the first place.
+    ///
+    /// Pre-fix, `capacity` had no upper clamp. A
+    /// misconfigured `usize::MAX` pre-allocated the `VecDeque`
+    /// and `HashSet` and OOMed on construction. Capacity is now
+    /// clamped to [`Self::MAX_CAPACITY`].
     pub fn with_capacity(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
+        let capacity = capacity.clamp(1, Self::MAX_CAPACITY);
         Self {
             order: VecDeque::with_capacity(capacity),
             seen: HashSet::with_capacity(capacity),
@@ -383,7 +405,7 @@ mod tests {
         assert_eq!(g.len(), 4 * 16);
     }
 
-    /// Pin the canonical use case: BUG #57 producer-side dup
+    /// Pin the canonical use case: producer-side dup
     /// scenario. Two `XADD`s of the same logical event produce
     /// stream entries with distinct server-generated `*` ids but
     /// IDENTICAL `dedup_id` fields. The dedup helper filters the
@@ -414,5 +436,36 @@ mod tests {
                 "retry-path observation of {id} should be filtered as a duplicate",
             );
         }
+    }
+
+    /// A misconfigured `capacity == usize::MAX` must not
+    /// OOM at construction. Pre-fix, `with_capacity(usize::MAX)`
+    /// pre-allocated `VecDeque` + `HashSet` for the full range and
+    /// the process aborted before the helper was even usable.
+    #[test]
+    fn with_capacity_clamps_usize_max() {
+        let d = RedisStreamDedup::with_capacity(usize::MAX);
+        assert_eq!(
+            d.capacity,
+            RedisStreamDedup::MAX_CAPACITY,
+            "capacity must be clamped at MAX_CAPACITY",
+        );
+        // The clamp value must be small enough to actually pre-
+        // allocate without OOMing on a development machine — the
+        // mere fact that this test reached this assertion proves
+        // it. Const-block assert so clippy doesn't flag it as
+        // a runtime check on a constant.
+        const _: () = assert!(
+            RedisStreamDedup::MAX_CAPACITY < usize::MAX,
+            "MAX_CAPACITY must strictly bound usize::MAX",
+        );
+    }
+
+    #[test]
+    fn with_capacity_preserves_in_range_values() {
+        let d = RedisStreamDedup::with_capacity(1024);
+        assert_eq!(d.capacity, 1024);
+        let d_zero = RedisStreamDedup::with_capacity(0);
+        assert_eq!(d_zero.capacity, 1, "0 must clamp UP to 1, not down");
     }
 }

@@ -533,6 +533,26 @@ impl StateSnapshot {
 /// Keyed by full EntityId (32 bytes) to avoid origin_hash collisions.
 pub struct SnapshotStore {
     snapshots: dashmap::DashMap<[u8; 32], StateSnapshot>,
+    /// Per-entity highest `through_seq` ever observed. Survives
+    /// `remove` so a stale producer that races AFTER retention
+    /// drops the live entry cannot rewind state by re-storing an
+    /// older snapshot.
+    ///
+    /// Pre-fix the store had no such record. After
+    /// `remove`, ANY snapshot — including one with a
+    /// `through_seq` lower than the just-removed value — was
+    /// accepted. A stale producer racing retention could
+    /// re-store an older snapshot under the same `entity_id`
+    /// and downstream readers observed a state rollback (ABA on
+    /// the snapshot lineage). Now `store` rejects any snapshot
+    /// whose `through_seq` is `<=` the high-water mark even when
+    /// no live entry exists.
+    ///
+    /// Callers that legitimately need to rebind the entity at a
+    /// lower `through_seq` (e.g. wiping for a fresh
+    /// reconstruction) must call `forget` to clear the high-water
+    /// mark before storing.
+    high_water: dashmap::DashMap<[u8; 32], u64>,
 }
 
 impl SnapshotStore {
@@ -540,6 +560,7 @@ impl SnapshotStore {
     pub fn new() -> Self {
         Self {
             snapshots: dashmap::DashMap::new(),
+            high_water: dashmap::DashMap::new(),
         }
     }
 
@@ -564,20 +585,79 @@ impl SnapshotStore {
     pub fn store(&self, snapshot: StateSnapshot) -> bool {
         use dashmap::mapref::entry::Entry;
         let key = *snapshot.entity_id.as_bytes();
+        let new_seq = snapshot.through_seq;
+
+        // Gate on the per-entity high-water mark first.
+        // The high-water survives `remove`, so a stale producer
+        // racing retention can't rewind state. Order: check
+        // high_water under its own shard guard, then check the
+        // live snapshot. The DashMap shard for high_water is
+        // distinct from the shard for snapshots, so this is two
+        // brief lock acquires rather than one held across both
+        // operations — fine for a non-hot path.
+        if let Some(prev_seq) = self.high_water.get(&key).map(|v| *v) {
+            if new_seq <= prev_seq {
+                return false;
+            }
+        }
+
+        // Real linearization point: the snapshots-side entry
+        // guard. Two concurrent `store(seq=N)` calls can each pass
+        // the high_water check above (the read-then-write isn't
+        // CAS), but only one wins the entry guard — the loser's
+        // `new_seq > slot.get().through_seq` is then false (slot
+        // already at N) and it returns `false`. The high_water
+        // write that happens here is therefore best-effort: the
+        // surviving value is whichever store committed the
+        // snapshot, not the loser's identical seq. The "freshness"
+        // invariant — "stored snapshot has the largest seq we ever
+        // saw" — is preserved by the snapshots-side guard alone;
+        // the high_water table only bounds *future* stores from
+        // rewinding.
         match self.snapshots.entry(key) {
             Entry::Vacant(slot) => {
                 slot.insert(snapshot);
+                self.high_water.insert(key, new_seq);
                 true
             }
             Entry::Occupied(mut slot) => {
-                if snapshot.through_seq > slot.get().through_seq {
+                if new_seq > slot.get().through_seq {
                     slot.insert(snapshot);
+                    self.high_water.insert(key, new_seq);
                     true
                 } else {
                     false
                 }
             }
         }
+    }
+
+    /// Clear the per-entity high-water mark.
+    ///
+    /// Use this when the entity is being legitimately rebound for
+    /// a fresh reconstruction (e.g. wiping for a daemon migration
+    /// from a known-clean snapshot at a lower `through_seq`). No
+    /// effect on the snapshot itself — call `remove` separately
+    /// if you also want to evict the live entry.
+    ///
+    /// `pub(crate)` rather than `pub`: `forget` is the escape
+    /// hatch that defeats the high-water-mark anti-rewind
+    /// guarantee that `store` upholds. An external caller able to
+    /// invoke it arbitrarily can stage stale snapshots over fresh
+    /// ones, undermining the rebind-safety invariant the
+    /// high_water table exists to enforce. Internal call sites
+    /// (migration / rebind paths) may use it; external SDK
+    /// surfaces should not.
+    ///
+    /// Currently only exercised by unit tests; reserved for the
+    /// migration-rebind path that the high_water mark itself was
+    /// added to support. The `#[allow(dead_code)]` is intentional
+    /// — removing the function entirely would force whoever
+    /// wires up the rebind callsite to re-derive the threat
+    /// model.
+    #[allow(dead_code)]
+    pub(crate) fn forget(&self, entity_id: &EntityId) {
+        self.high_water.remove(entity_id.as_bytes());
     }
 
     /// Get the latest snapshot for an entity.
@@ -715,7 +795,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #122: store() must reject older snapshots (no rewind)
+    // store() must reject older snapshots (no rewind)
     // ========================================================================
 
     /// Building snapshots via the chain helper makes the
@@ -795,8 +875,17 @@ mod tests {
     /// the right move is to add a per-entity high-water-mark cache
     /// that survives `remove` — but that's a separate audit
     /// entry. For now: this test documents the gap.
+    /// CR-17: post-fix, the store maintains a
+    /// per-entity high-water mark that survives `remove`. A stale
+    /// producer racing retention can no longer rewind state by
+    /// re-storing an older snapshot under the same entity_id.
+    ///
+    /// Pre-fix this test pinned the broken behavior ("stale
+    /// snapshot is accepted post-remove"); post-fix the same
+    /// scenario is rejected, and the test asserts the stored
+    /// snapshot stays at the high-water value.
     #[test]
-    fn cr17_remove_does_not_carry_forward_through_seq_high_water_mark() {
+    fn bug8_remove_preserves_through_seq_high_water_mark() {
         let store = SnapshotStore::new();
         let kp = EntityKeypair::generate();
         let entity_id = kp.entity_id().clone();
@@ -810,8 +899,8 @@ mod tests {
         assert_eq!(high.through_seq, 3);
         assert!(store.store(high));
 
-        // Older snapshot at seq=1 is correctly rejected against
-        // the live high-water mark.
+        // Older snapshot at seq=1 is rejected against the live
+        // high-water mark.
         let mut older_builder = CausalChainBuilder::new(kp.origin_hash());
         older_builder.append(Bytes::from_static(b"e"), 0).unwrap();
         let older = snap_at(entity_id.clone(), &mut older_builder, b"stale");
@@ -822,29 +911,64 @@ mod tests {
         );
 
         // Now retention removes the entry. `remove` returns the
-        // stored snapshot but does NOT cache its through_seq.
+        // stored snapshot but the high-water mark survives.
         let removed = store.remove(&entity_id);
         assert!(removed.is_some(), "remove must return the stored snapshot");
 
-        // CR-17: a stale producer that races AFTER the retention
-        // remove succeeds in storing the older snapshot. There
-        // is no "max-ever-seen seq per entity" record. This is
-        // the documented behavior — pin it so a future fix has
-        // to also update this test.
-        let stale_accepted = store.store(older);
+        // A stale producer that races AFTER retention tries to
+        // re-store the older snapshot. Post-fix this is rejected
+        // by the high-water gate.
+        let stale_rejected = !store.store(older.clone());
         assert!(
-            stale_accepted,
-            "CR-17: post-`remove`, an older snapshot is accepted because \
-             the store does not cache the prior through_seq high-water \
-             mark across removes. This is the documented behavior; if \
-             you're 'fixing' this, ensure a follow-up audit entry tracks \
-             the design change."
+            stale_rejected,
+            "post-`remove`, an older snapshot must be rejected \
+             because the high-water mark survives remove. Pre-fix this \
+             would accept and rewind state."
         );
 
-        // The store now has the OLDER snapshot — caller-visible
-        // rollback. Documented as a `remove` precondition.
-        let retrieved = store.get(&entity_id).unwrap();
-        assert_eq!(retrieved.state, Bytes::from_static(b"stale"));
+        // Live entry stays empty (we removed it and didn't accept
+        // the stale write).
+        assert!(
+            store.get(&entity_id).is_none(),
+            "live entry must remain empty — neither the original (removed) \
+             nor the stale (rejected) snapshot is present"
+        );
+    }
+
+    /// `forget` clears the high-water so a legitimate rebind at
+    /// a lower through_seq is possible. Use this when the entity
+    /// is being reconstructed from scratch.
+    #[test]
+    fn bug8_forget_clears_high_water_to_allow_rebind() {
+        let store = SnapshotStore::new();
+        let kp = EntityKeypair::generate();
+        let entity_id = kp.entity_id().clone();
+
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+        for _ in 0..3 {
+            builder.append(Bytes::from_static(b"e"), 0).unwrap();
+        }
+        let high = snap_at(entity_id.clone(), &mut builder, b"high");
+        assert!(store.store(high));
+        store.remove(&entity_id);
+
+        // Without forget, a lower-seq snapshot is rejected.
+        let mut older_builder = CausalChainBuilder::new(kp.origin_hash());
+        older_builder.append(Bytes::from_static(b"e"), 0).unwrap();
+        let older = snap_at(entity_id.clone(), &mut older_builder, b"rebind");
+        assert!(!store.store(older.clone()));
+
+        // forget() then store() succeeds.
+        store.forget(&entity_id);
+        assert!(
+            store.store(older),
+            "after forget(), the high-water mark is cleared and an \
+             older snapshot can be stored — the legitimate rebind path"
+        );
+        assert_eq!(
+            store.get(&entity_id).unwrap().state,
+            Bytes::from_static(b"rebind")
+        );
     }
 
     /// Equal `through_seq` is rejected too — a re-emission from a
@@ -882,7 +1006,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #128: try_to_bytes must NOT panic on oversized state / bindings
+    // try_to_bytes must NOT panic on oversized state / bindings
     // ========================================================================
 
     /// `try_to_bytes` returns `SnapshotError::ExceedsWireFormat`
@@ -1254,7 +1378,7 @@ mod tests {
             .open_identity_envelope(&target_priv)
             .expect_err("impostor envelope must be rejected");
         use crate::adapter::net::identity::EnvelopeError;
-        // BUG #127: post-fix the early `expected_signer_pub` check
+        // Post-fix the early `expected_signer_pub` check
         // fires first (before any cryptographic work) and surfaces
         // `InvalidSignerKey`. The pre-fix rejection was at the
         // post-decrypt cross-check (`OriginHashMismatch`) — same

@@ -46,6 +46,24 @@ def test_append_batch_returns_first_seq() -> None:
     assert [bytes(e.payload) for e in events] == [b"a", b"b", b"c"]
 
 
+def test_append_batch_empty_returns_none() -> None:
+    """Pin the breaking-change semantics from the Rust core:
+    `append_batch([])` returns `None` rather than `0`. Pre-fix the
+    Rust side returned `0` (the first seq that *would have been*
+    assigned), which collided with the legitimate "first event of a
+    non-empty batch is seq 0" return — callers couldn't distinguish
+    "I appended nothing" from "I appended one event at seq 0". The
+    Node binding pins this with its own
+    `'append_batch returns null on empty input'` test in
+    `bindings/node/test/redex.test.ts`; this is the Python parity.
+    """
+    redex = Redex()
+    file = redex.open_file("test/batch-empty")
+    first = file.append_batch([])
+    assert first is None
+    assert len(file) == 0
+
+
 def test_repeat_open_returns_same_handle() -> None:
     redex = Redex()
     a = redex.open_file("test/shared")

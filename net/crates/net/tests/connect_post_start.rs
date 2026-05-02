@@ -84,7 +84,7 @@ async fn initiator_connect_after_start_completes_handshake() {
     // before A starts emitting packets.
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // BUG #86: A's dispatcher is now running. Without the fix,
+    // A's dispatcher is now running. Without the fix,
     // A's `recv_from` inside `try_handshake_initiator` races the
     // dispatch loop and either may swallow B's msg2.
     a.start();

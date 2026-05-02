@@ -18,6 +18,39 @@
 //! All FFI functions are thread-safe. The event bus handle can be shared
 //! across threads.
 //!
+//! # Tokio runtime restriction
+//!
+//! Internal FFI ops (`net_poll`, `net_flush`, `net_shutdown`,
+//! `net_redex_*`, `net_mesh_new`, the cortex FFI, the mesh FFI)
+//! drive the bus's tokio runtime via `Runtime::block_on`. That
+//! function panics with "Cannot start a runtime from within a
+//! runtime" if the calling thread is already inside a tokio
+//! runtime context. The functions are `extern "C"`, so a panic
+//! unwinds across the FFI boundary into C / Go-cgo / Python /
+//! NAPI — undefined behavior.
+//!
+//! **The common-case C / Go / Python caller has no Rust tokio
+//! runtime, so this is unreachable for them.** The narrow path is:
+//!
+//! - A **Rust** caller loads the cdylib and calls these
+//!   functions from inside its own `#[tokio::main]` (or any
+//!   thread that has called `Runtime::enter()`).
+//! - A non-Rust caller embeds a Rust library that runs its own
+//!   tokio runtime and forwards calls into this cdylib on the
+//!   same thread.
+//!
+//! Both forms are unusual but reachable. **Do not call any FFI
+//! op from a thread that already holds a tokio runtime
+//! context.** If you must, spawn the FFI call on a fresh OS
+//! thread that doesn't carry a runtime guard, or wrap the call
+//! with `tokio::task::spawn_blocking(|| net_xxx(...))` to escape
+//! the worker pool.
+//!
+//! `net_init` (`mod.rs:284-316`) hardens against this for runtime
+//! *construction*; the steady-state ops do not, since the cost
+//! of a `Handle::try_current()` check on every poll would be
+//! measurable for the common path that doesn't hit the bug.
+//!
 //! # Memory Management
 //!
 //! - Handles returned by `net_init` must be freed with `net_shutdown`
@@ -1540,8 +1573,7 @@ mod tests {
     }
 
     /// CR-22: pin parity between the Rust-side `NetError` enum and
-    /// the two C-header copies (`include/net.h` and
-    /// `bindings/go/net/net.h`). The Rust enum is the source of
+    /// the two C-header copies. The Rust enum is the source of
     /// truth; C / Go consumers `errors.Is` against the named codes.
     /// Pre-CR-22 the headers were missing `-9` (IntOverflow) and
     /// `-10` (MismatchedHandles); a consumer receiving those values
@@ -1553,10 +1585,19 @@ mod tests {
     /// that each Rust-side value is present in BOTH headers. The
     /// test does NOT verify symbolic names; the sealing
     /// constraint is the numeric value alone.
+    ///
+    /// Both `include_str!` paths point inside `net/crates/net/`.
+    /// `include/net.go.h` is a manually-synced mirror of the
+    /// repo-root `go/net.h`. Reaching outside the crate root
+    /// (`include_str!("../../../../../go/net.h")`) breaks
+    /// `cargo publish` and any out-of-repo vendoring of this
+    /// crate, so the in-crate copy is the supported source. A
+    /// drift between the two surfaces here as a parity-test
+    /// failure: one of them will be missing the new value.
     #[test]
     fn cr22_c_header_parity_with_rust_neterror() {
         let primary = include_str!("../../include/net.h");
-        let go_copy = include_str!("../../bindings/go/net/net.h");
+        let go_copy = include_str!("../../include/net.go.h");
 
         // The Rust enum's full set of values (mirrors `pub enum
         // NetError` above). When a new variant is added in the

@@ -734,6 +734,13 @@ impl ScalingPolicy {
 
     /// Create a policy optimized for high-throughput GPU workloads.
     /// Uses more aggressive scaling with higher max shard count.
+    ///
+    /// `max_shards` is capped at `u16::MAX` (65 535) because shard
+    /// ids are 16-bit. On hosts with more than 32 767 CPUs the
+    /// "2× CPU count" target saturates rather than wraps — this is
+    /// the intended behavior (pre-fix this was just an implicit
+    /// `saturating_mul` artifact; the cap is now documented and
+    /// the saturation is explicit).
     pub fn high_throughput() -> Self {
         let cpus = num_cpus();
         Self {
@@ -741,7 +748,9 @@ impl ScalingPolicy {
             push_latency_threshold_ns: 3,
             flush_latency_threshold_us: 500,
             min_shards: 4.min(cpus),
-            max_shards: cpus.saturating_mul(2), // Allow up to 2x CPU count for GPU workloads
+            // `saturating_mul` clamps at u16::MAX (65 535).
+            // Documented cap; not silently wrapped.
+            max_shards: cpus.saturating_mul(2),
             cooldown: Duration::from_millis(500),
             scale_down_delay: Duration::from_secs(30),
             underutilized_threshold: 0.05,
@@ -989,7 +998,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #63: validate() must reject NaN / ±inf thresholds
+    // validate() must reject NaN / ±inf thresholds
     // ========================================================================
 
     /// `validate()` rejects `f64::NaN` for both threshold fields.
@@ -1006,7 +1015,7 @@ mod tests {
         };
         assert!(
             policy.validate().is_err(),
-            "NaN fill_ratio_threshold must be rejected (BUG #63)",
+            "NaN fill_ratio_threshold must be rejected",
         );
     }
 
@@ -1018,7 +1027,7 @@ mod tests {
         };
         assert!(
             policy.validate().is_err(),
-            "NaN underutilized_threshold must be rejected (BUG #63)",
+            "NaN underutilized_threshold must be rejected",
         );
     }
 
@@ -1191,7 +1200,7 @@ mod tests {
         assert!(result.is_err(), "jetstream replicas == 0 must reject");
     }
 
-    /// BUG #68: `JetStreamAdapterConfig::validate` rejects negative
+    /// `JetStreamAdapterConfig::validate` rejects negative
     /// `max_messages` / `max_bytes`. NATS rejects negatives at
     /// stream-create time, so without validate-time enforcement the
     /// misconfig surfaces as a runtime adapter error minutes later.

@@ -216,16 +216,53 @@ impl PersistentProducerNonce {
             p.set_file_name(name);
             p
         };
-        fs::write(&tmp_path, buf)?;
-
-        // Best-effort fsync of the file before rename. On Windows
-        // `File::sync_all` is supported but the rename-durability
-        // guarantee is weaker than POSIX; production callers that
-        // need strict durability should use a filesystem with
-        // appropriate ordering. We do the fsync regardless because
-        // it's the ceiling-set part of the contract.
-        if let Ok(f) = fs::File::open(&tmp_path) {
-            let _ = f.sync_all();
+        // Pre-fix, the write/sync split was
+        //   fs::write(&tmp_path, buf)?;        // (a) write + close
+        //   if let Ok(f) = fs::File::open(&tmp_path) {
+        //       let _ = f.sync_all();          // (b) sync_all on
+        //                                      //     a read-only handle
+        //   }
+        // Two distinct hazards:
+        //   #40 — `let _ = f.sync_all()` swallowed disk-full / I/O
+        //         errors; the producer-nonce file was reported as
+        //         "saved" while still being only in the kernel
+        //         page cache. A power loss between rename and the
+        //         OS's own background flush left the nonce file
+        //         partial / undurable, breaking cross-restart
+        //         dedup on next start.
+        //   #68 — On Windows, `fs::File::open(&path)` opens
+        //         read-only. `File::sync_all` calls
+        //         `FlushFileBuffers`, which returns
+        //         `ERROR_ACCESS_DENIED` on a read-only handle —
+        //         the entire fsync was a silent no-op on every
+        //         Windows install.
+        //
+        // Post-fix uses a single writable handle for write+sync
+        // and propagates both errors. `OpenOptions` with
+        // `create_new(true)` matches the per-call-unique tmp_path
+        // contract.
+        //
+        // Pre-emptively remove any zombie tempfile at this exact
+        // path. The path hash mixes pid + tid + nanos + freshly-
+        // sampled nonce, so a same-named file can only be a
+        // crashed prior run of the SAME process+thread that
+        // happened to land on the identical nanos+nonce — vanishingly
+        // unlikely, but observable in practice if a system clock
+        // rewinds across a crash. Without this, `create_new` fails
+        // with `AlreadyExists` and there is no retry path; every
+        // subsequent save then errors out and the producer nonce
+        // never persists. `remove_file().ok()` is safe because no
+        // concurrent caller can be holding this exact path (the
+        // hash is unique per-call by construction).
+        let _ = fs::remove_file(&tmp_path);
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
         }
         // `fs::rename` is `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` on
         // Windows / `rename(2)` on Unix — atomic replace on POSIX,

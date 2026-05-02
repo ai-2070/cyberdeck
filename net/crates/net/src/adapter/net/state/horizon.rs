@@ -374,9 +374,9 @@ mod tests {
         ));
     }
 
-    // ---- BUG #130 regression coverage ----
+    // ---- regression coverage ----
 
-    /// BUG #130: pre-fix the bloom was 16 bits with k=2, saturating
+    /// Pre-fix the bloom was 16 bits with k=2, saturating
     /// after ~6-8 inserted origins. Post-fix it's 64 bits with k=3,
     /// usable up to ~16 origins at <50 % FPR. Pin the BLOOM-INVARIANT
     /// directly — every inserted origin must report `true`. False
@@ -399,7 +399,7 @@ mod tests {
         }
     }
 
-    /// BUG #130: probabilistic FPR pin at small cardinality. With
+    /// Probabilistic FPR pin at small cardinality. With
     /// m=64, k=3, n=8, expected FPR ≈ 13 %. Test draws 1000 random
     /// non-inserted origins and asserts the empirical FPR stays
     /// below a generous 25 % ceiling — well under the pre-fix

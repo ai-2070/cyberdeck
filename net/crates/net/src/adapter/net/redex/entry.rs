@@ -68,7 +68,26 @@ impl RedexEntry {
     /// `flags` is masked to the high nibble and `checksum` is masked to
     /// the low 28 bits, so callers can't accidentally corrupt one by
     /// overloading the other.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `flags` includes `RedexFlags::INLINE`.
+    ///
+    /// Pre-fix, this silently accepted the INLINE flag. The
+    /// resulting entry's `is_inline()` returned true but
+    /// `payload_offset` / `payload_len` were real heap fields
+    /// rather than payload bytes. `materialize` would then call
+    /// `inline_payload()` and reinterpret the offset/length as
+    /// data, returning corrupt bytes that *match* a (different)
+    /// checksum recomputation — silent corruption. Currently no
+    /// caller passes a non-zero `flags`, but unguarded the API
+    /// is a future footgun. Reject INLINE explicitly so any
+    /// future caller surfaces the misuse as a clear panic.
     pub fn new_heap(seq: u64, offset: u32, len: u32, flags: u32, checksum: u32) -> Self {
+        assert!(
+            flags & RedexFlags::INLINE == 0,
+            "new_heap rejects flags=INLINE; use new_inline for inline payloads"
+        );
         Self {
             seq,
             payload_offset: offset,
@@ -224,5 +243,27 @@ mod tests {
     fn test_non_inline_entry_reports_no_inline_payload() {
         let e = RedexEntry::new_heap(0, 4, 100, 0, 0);
         assert!(e.inline_payload().is_none());
+    }
+
+    /// Passing `RedexFlags::INLINE` to `new_heap` must
+    /// panic. Pre-fix it silently accepted the flag and produced
+    /// an entry where `is_inline()` returned true but `payload_offset`
+    /// / `payload_len` carried real heap fields, leading to
+    /// silent corruption when `materialize` reinterpreted them
+    /// as inline payload bytes.
+    #[test]
+    #[should_panic(expected = "rejects flags=INLINE")]
+    fn new_heap_with_inline_flag_panics() {
+        // offset/len/checksum are arbitrary; the assertion fires
+        // before they're used.
+        let _ = RedexEntry::new_heap(0, 4, 100, RedexFlags::INLINE, 0);
+    }
+
+    /// TOMBSTONE (a non-INLINE flag) must
+    /// still go through cleanly.
+    #[test]
+    fn new_heap_with_tombstone_flag_succeeds() {
+        let e = RedexEntry::new_heap(0, 4, 100, RedexFlags::TOMBSTONE, 0);
+        assert!(!e.is_inline());
     }
 }

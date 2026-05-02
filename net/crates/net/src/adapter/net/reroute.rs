@@ -428,7 +428,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #117: on_recovery must match by node_id, not next_hop addr,
+    // on_recovery must match by node_id, not next_hop addr,
     // so NAT rebinds / reconnects on different ports still restore.
     // ========================================================================
 
@@ -477,7 +477,7 @@ mod tests {
         assert_eq!(
             rt.lookup(0x5555).unwrap(),
             addr_b_new,
-            "BUG #117: recovery after NAT rebind must restore the route to the NEW addr"
+            "recovery after NAT rebind must restore the route to the NEW addr"
         );
         assert_eq!(
             policy.active_reroutes(),

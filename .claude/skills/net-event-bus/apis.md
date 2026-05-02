@@ -1,13 +1,15 @@
 # Net SDK API Reference
 
-Verified against `net-sdk` v0.8.0 (Rust) / `@ai2070/net-sdk` ≥ 0.8.0 peer (TS) / `net-sdk` Python (current `main`). Last full pass: 2026-04-25.
+Verified against `net-sdk` v0.8.0 (Rust) / `@ai2070/net-sdk` ≥ 0.8.0 peer (TS) / `net-sdk` Python (current `main`). Last full pass: 2026-04-25. SdkError variant set re-verified 2026-05-02 after the `bugfixes-8` `Sampled` / `Unrouted` additions.
 
 **Drift check before trusting these signatures:**
 ```bash
 # Rust: confirms emit/emit_raw/emit_str/emit_batch/emit_raw_batch are still exported (expect 5)
 grep -cE "^\s*pub fn emit" net/crates/net/sdk/src/net.rs
-# Rust: confirms the SdkError variant set this skill enumerates (expect 11)
-grep -cE "^\s*(Shutdown|Ingestion|Poll|Adapter|Serialization|Config|NoMesh|Backpressure|NotConnected|ChannelRejected|Traversal)" net/crates/net/sdk/src/error.rs
+# Rust: confirms the SdkError variant set this skill enumerates (expect 13).
+# `SdkError` is `#[non_exhaustive]` — count drift can also mean a *new*
+# variant was added that this skill hasn't documented yet.
+grep -cE "^\s*(Shutdown|Ingestion|Sampled|Unrouted|Poll|Adapter|Serialization|Config|NoMesh|Backpressure|NotConnected|ChannelRejected|Traversal)\b" net/crates/net/sdk/src/error.rs
 ```
 
 If any count drops, the SDK has churned underneath this doc — re-verify from source. If anything else looks wrong, **read the SDK source directly** — it is authoritative. The README is a good intro; the source is ground truth.
@@ -227,7 +229,7 @@ These bite people regardless of language. Internalize them.
 - **JSON everywhere.** The wire format is JSON bytes. There is no schema registry. The JSON either parses on the consumer or it doesn't.
 - **Shutdown is required.** Don't rely on process exit. Call `shutdown()` / `Shutdown()` / `net_shutdown()`. The ring buffer needs a clean drain.
 - **Subscribe is hot.** A subscriber sees events emitted *after* it subscribed, plus whatever's still in the ring buffer. No replay-from-zero. If the user wants replay, they need RedEX or an adapter — not the bus.
-- **Backpressure is silent under `drop_*` modes; under `fail_producer` it surfaces per-language.** Always also watch `stats().events_dropped`. Per-SDK error shapes are detailed in each SDK's "Key facts" above and in `runtime.md` § Errors — don't duplicate the matrix here. The one-line summary: Rust returns `SdkError::Ingestion`, TS throws on the `emit*` path / returns `false`/short on the `publish*`/`fire*` path, Python raises from the binding, Go/C return error codes.
+- **Backpressure is silent under `drop_*` modes; under `fail_producer` it surfaces per-language.** Always also watch `stats().events_dropped`. Per-SDK error shapes are detailed in each SDK's "Key facts" above and in `runtime.md` § Errors — don't duplicate the matrix here. The one-line summary: Rust returns `SdkError::Backpressure` / `Sampled` / `Unrouted` / `Ingestion(_)` (all four are structured causes since `bugfixes-8`; pre-`bugfixes-8` everything came through `Ingestion(String)`), TS throws on the `emit*` path / returns `false`/short on the `publish*`/`fire*` path, Python raises from the binding, Go/C return error codes.
 - **`_channel` is reserved** in TS/Python channel payloads. Don't put your own field there.
 - **Transport is set at construction.** A node can have only one transport. To bridge transports, run two nodes in the same process and forward between them.
 - **`shards` is a parallelism knob, not a partitioning scheme.** It does not give you Kafka-style ordered partitions. It just parallelizes ingestion. Default is fine for most workloads.

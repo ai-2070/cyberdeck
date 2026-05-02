@@ -440,8 +440,18 @@ impl Adapter for RedisAdapter {
             .map(|id| format!("({}", id)) // Exclusive: "(1702123456789-0"
             .unwrap_or_else(|| "-".to_string()); // "-" = from beginning
 
-        // Fetch one extra to detect has_more
-        let fetch_limit = limit + 1;
+        // Fetch one extra to detect has_more.
+        //
+        // Pre-fix `limit + 1` panicked in debug or wrapped
+        // to 0 in release on `limit == usize::MAX`, silently
+        // returning an empty result with no error. The FFI
+        // poll-request JSON path does `usize::try_from` but doesn't
+        // bound the value, so this is reachable from an
+        // attacker-controlled cursor. `saturating_add(1)` clamps
+        // at `usize::MAX`; Redis accepts the COUNT arg as i64 and
+        // will simply cap to its own maximum, returning whatever
+        // is in the stream.
+        let fetch_limit = limit.saturating_add(1);
 
         // XRANGE key start + COUNT limit
         // Returns array of [id, [field, value, field, value, ...]]
@@ -467,11 +477,22 @@ impl Adapter for RedisAdapter {
             return false;
         }
 
+        // Pre-fix, the PING relied entirely on the
+        // `ConnectionManager`'s configured request timeout. If
+        // that's unset or large, a network partition leaves the
+        // health check blocked indefinitely, making the adapter
+        // appear "pending" rather than "unhealthy" — a real risk
+        // for liveness probes in orchestrators that treat slow
+        // health responses as "OK". Wrap explicitly in
+        // `command_timeout` so an unhealthy backend always
+        // returns `false` within a bounded window.
         if let Ok(mut conn) = self.get_conn().await {
-            redis::cmd("PING")
-                .query_async::<String>(&mut conn)
-                .await
-                .is_ok()
+            let cmd = redis::cmd("PING");
+            let fut = cmd.query_async::<String>(&mut conn);
+            matches!(
+                tokio::time::timeout(self.config.command_timeout, fut).await,
+                Ok(Ok(_))
+            )
         } else {
             false
         }

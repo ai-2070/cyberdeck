@@ -119,6 +119,22 @@ impl PacketBuilder {
     /// 5. Assembles the final packet
     ///
     /// Returns the complete packet as `Bytes`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `events.len() > NetHeader::MAX_EVENTS_PER_PACKET`.
+    /// Pre-fix this performed `events.len() as u16` and
+    /// silently wrapped on overflow. A caller passing `>65 535`
+    /// events stored `len % 65 536` in the wire `event_count`
+    /// field; the receiver mis-parsed the payload because the
+    /// stored count no longer matched the encoded frames. Worse,
+    /// a wrapped value below the receiver's `MAX_EVENTS_PER_PACKET`
+    /// cap (e.g. caller passed 67 562 → wrapped 32 026, which is
+    /// `> 2027` → noisy reject; but caller passed 65 537 → wrapped
+    /// 1, which is `<= 2027` → silent corruption). The batching
+    /// layer above must already enforce the cap; this is a
+    /// defense-in-depth `panic!` so a missed cap surfaces
+    /// immediately instead of silently corrupting frames.
     #[inline]
     pub fn build(
         &mut self,
@@ -127,6 +143,15 @@ impl PacketBuilder {
         events: &[Bytes],
         flags: PacketFlags,
     ) -> Bytes {
+        assert!(
+            events.len() <= NetHeader::MAX_EVENTS_PER_PACKET as usize,
+            "PacketBuilder::build called with {} events; \
+             MAX_EVENTS_PER_PACKET is {}. The batching layer must \
+             split before calling build().",
+            events.len(),
+            NetHeader::MAX_EVENTS_PER_PACKET,
+        );
+
         // Reset buffers (no allocation)
         self.payload.clear();
         self.packet.clear();
@@ -185,6 +210,11 @@ impl PacketBuilder {
     ///
     /// Same as `build()` but sets `subprotocol_id` in the Net header,
     /// which is included in the AEAD authenticated data.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `events.len() > NetHeader::MAX_EVENTS_PER_PACKET` —
+    /// see [`Self::build`] for the rationale.
     #[inline]
     pub fn build_subprotocol(
         &mut self,
@@ -194,6 +224,14 @@ impl PacketBuilder {
         flags: PacketFlags,
         subprotocol_id: u16,
     ) -> Bytes {
+        assert!(
+            events.len() <= NetHeader::MAX_EVENTS_PER_PACKET as usize,
+            "PacketBuilder::build_subprotocol called with {} events; \
+             MAX_EVENTS_PER_PACKET is {}",
+            events.len(),
+            NetHeader::MAX_EVENTS_PER_PACKET,
+        );
+
         self.payload.clear();
         self.packet.clear();
 
@@ -1202,5 +1240,68 @@ mod tests {
             all_nonces.len(),
             "nonces must not collide across key rotations"
         );
+    }
+
+    /// Passing more than `MAX_EVENTS_PER_PACKET` events to
+    /// `build` must panic, not silently wrap on the `events.len()
+    /// as u16` cast. A wrapped value below the receiver's cap
+    /// would otherwise pass `validate()` and corrupt frame parsing.
+    #[test]
+    #[should_panic(expected = "PacketBuilder::build called with")]
+    fn build_panics_on_event_count_exceeding_cap() {
+        let key = [0x42u8; 32];
+        let session_id = 0xCAFEu64;
+        let pool = ThreadLocalPool::new(2, &key, session_id);
+        let mut builder = pool.get();
+        // Fabricate `MAX_EVENTS_PER_PACKET + 1` empty events. The
+        // payload bytes don't matter for the cap check — `build`
+        // must reject before any frame writing.
+        let too_many: Vec<Bytes> = (0..=NetHeader::MAX_EVENTS_PER_PACKET as usize)
+            .map(|_| Bytes::new())
+            .collect();
+        let _ = builder.build(0, 0, &too_many, PacketFlags::NONE);
+    }
+
+    /// `build_subprotocol` shares the same cap.
+    #[test]
+    #[should_panic(expected = "PacketBuilder::build_subprotocol called with")]
+    fn build_subprotocol_panics_on_event_count_exceeding_cap() {
+        let key = [0x42u8; 32];
+        let session_id = 0xBABEu64;
+        let pool = ThreadLocalPool::new(2, &key, session_id);
+        let mut builder = pool.get();
+        let too_many: Vec<Bytes> = (0..=NetHeader::MAX_EVENTS_PER_PACKET as usize)
+            .map(|_| Bytes::new())
+            .collect();
+        let _ = builder.build_subprotocol(0, 0, &too_many, PacketFlags::NONE, 1);
+    }
+
+    /// Boundary: exactly `MAX_EVENTS_PER_PACKET` events
+    /// must be accepted without panic (and without silent
+    /// truncation since 2027 fits in `u16`).
+    #[test]
+    fn build_accepts_exactly_max_events_per_packet() {
+        let key = [0x42u8; 32];
+        let session_id = 0x4242u64;
+        let pool = ThreadLocalPool::new(2, &key, session_id);
+        let mut builder = pool.get();
+        // The actual event payload size matters because
+        // `EventFrame::write_events` will run; use empty events
+        // to keep the test cheap. The receiver's `validate()`
+        // would reject an event count above `MAX_EVENTS_PER_PACKET`,
+        // but the boundary value is inclusive in both the cap
+        // and the validator.
+        //
+        // We test with 1 event (well under the cap, sanity) and
+        // also confirm the boundary value would not panic by
+        // constructing a vector of zero-byte events at the cap.
+        let one_event = vec![Bytes::from_static(b"hi")];
+        let _ = builder.build(0, 0, &one_event, PacketFlags::NONE);
+
+        let cap_events: Vec<Bytes> = (0..NetHeader::MAX_EVENTS_PER_PACKET as usize)
+            .map(|_| Bytes::new())
+            .collect();
+        // No panic — boundary inclusive.
+        let _ = builder.build(0, 1, &cap_events, PacketFlags::NONE);
     }
 }

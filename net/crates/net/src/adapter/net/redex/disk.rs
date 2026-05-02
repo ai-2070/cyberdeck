@@ -193,14 +193,14 @@ pub(super) struct DiskSegment {
     fail_next_sync: AtomicBool,
     /// Test-only injection: when set, the next `compact_to` returns
     /// `RedexError::Io` before touching any file. Used to exercise
-    /// the `sweep_retention` rollback path (BUG #95) — verifies
+    /// the `sweep_retention` rollback path — verifies
     /// that a failed disk compaction leaves in-memory state
     /// untouched so reopen replays a consistent picture.
     #[cfg(test)]
     fail_next_compact: AtomicBool,
     /// Test-only injection: when set, the next `idx.metadata()`
     /// call inside an append path returns `RedexError::Io`. Used
-    /// to exercise the BUG #94 rollback path — that an idx
+    /// to exercise the append rollback path — that an idx
     /// metadata failure after a successful dat write rolls the
     /// dat back rather than leaving orphan bytes on disk. The
     /// flag is consumed on the next idx-metadata call (success
@@ -209,7 +209,7 @@ pub(super) struct DiskSegment {
     fail_next_idx_metadata: AtomicBool,
     /// Test-only injection: when set, the next `ts.metadata()`
     /// call inside an append path returns `RedexError::Io`. Used
-    /// to exercise the BUG #94 rollback path — that a ts metadata
+    /// to exercise the append rollback path — that a ts metadata
     /// failure after successful dat + idx writes rolls both back.
     #[cfg(test)]
     fail_next_ts_metadata: AtomicBool,
@@ -1081,7 +1081,7 @@ impl DiskSegment {
 
     /// Test-only: arm a one-shot failure on the next `compact_to`
     /// call. Used to verify the `sweep_retention` rollback path
-    /// (BUG #95) — that a failed disk compaction leaves in-memory
+    /// — that a failed disk compaction leaves in-memory
     /// state untouched. The flag is consumed on the next
     /// `compact_to` (success or failure clears it).
     #[cfg(test)]
@@ -1091,7 +1091,7 @@ impl DiskSegment {
 
     /// Test-only: arm a one-shot failure on the next idx
     /// `metadata()` call inside an append path. Used to exercise
-    /// the BUG #94 rollback path — verifies that a metadata error
+    /// the append rollback path — verifies that a metadata error
     /// after a successful dat write rolls the dat back instead of
     /// leaving orphan bytes on disk.
     #[cfg(test)]
@@ -1101,7 +1101,7 @@ impl DiskSegment {
 
     /// Test-only: arm a one-shot failure on the next ts
     /// `metadata()` call inside an append path. Used to exercise
-    /// the BUG #94 rollback path — verifies that a metadata error
+    /// the append rollback path — verifies that a metadata error
     /// after successful dat + idx writes rolls both back.
     #[cfg(test)]
     pub(super) fn arm_next_ts_metadata_failure(&self) {
@@ -2424,7 +2424,7 @@ mod tests {
     /// exist, even a path that is not a directory. This pins the
     /// no-op contract so a future "let's fail closed on Windows"
     /// change has to also update this test (and consider whether
-    /// the change actually closes the BUG #93 hazard or just
+    /// the change actually closes the durability hazard or just
     /// trades durability gap for crash-on-bad-path).
     ///
     /// The compact_to caller covers the per-file durability via

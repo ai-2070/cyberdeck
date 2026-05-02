@@ -2278,7 +2278,7 @@ mod tests {
         );
     }
 
-    /// CR-21 / BUG #150: pin that this module's `random_usize`
+    /// CR-21: pin that this module's `random_usize`
     /// uses the abort-on-fail pattern, NOT `expect()` or
     /// `.unwrap()`. A getrandom panic here would unwind across
     /// any `extern "C"` FFI frame that called into the load-

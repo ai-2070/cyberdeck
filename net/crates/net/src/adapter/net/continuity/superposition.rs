@@ -272,7 +272,7 @@ mod tests {
 
         let proof = state.continuity_proof();
         assert_eq!(proof.origin_hash, 0xAAAA);
-        // BUG #99 fix: the proof anchors at `head.sequence - 1` so
+        // The proof anchors at `head.sequence - 1` so
         // the verifier (`compute_parent_hash` of the event AT that
         // seq) sees the same hash bytes that `head.parent_hash`
         // carries. Pre-fix the seqs were 105 / 110 and the hashes

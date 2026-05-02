@@ -53,7 +53,11 @@ impl<T: Serialize> TypedRedexFile<T> {
 
     /// Serialize a batch and append atomically (all entries land in
     /// the index contiguously or none do).
-    pub fn append_batch(&self, values: &[T]) -> Result<u64, RedexError> {
+    ///
+    /// Returns `Some(first_seq)` on non-empty input, `None` on empty
+    /// input — propagates the underlying `RedexFile::append_batch`
+    /// contract.
+    pub fn append_batch(&self, values: &[T]) -> Result<Option<u64>, RedexError> {
         let mut buffers: Vec<Bytes> = Vec::with_capacity(values.len());
         for v in values {
             let bytes = postcard::to_allocvec(v)

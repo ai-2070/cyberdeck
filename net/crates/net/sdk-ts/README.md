@@ -339,7 +339,7 @@ const token = identity.issueToken({
   subject: grantee.entityId,
   scope: ['subscribe'],
   channel: 'sensors/temp',
-  ttlSeconds: 300,
+  ttlSeconds: 300,             // `0` throws — zero TTL would mint a born-expired token
   delegationDepth: 0,          // 0 forbids re-delegation
 });
 
@@ -688,7 +688,12 @@ const file = redex.openFile('analytics/clicks', {
 
 // Append (or batch-append).
 const seq = file.append(Buffer.from(JSON.stringify({ url: '/home' })));
-file.appendBatch(payloadBuffers);
+// `appendBatch` returns the first-seq `bigint` of the batch, or
+// `null` for an empty input. The `null` return is the explicit
+// "I appended nothing" signal — pre-`bugfixes-8` it returned `0n`,
+// which collided with the legitimate "first event of a non-empty
+// batch landed at seq 0" return.
+const firstSeq = file.appendBatch(payloadBuffers);
 
 // Tail — backfills the retained range, then streams live appends.
 const stream = await file.tail(0n);

@@ -6,9 +6,11 @@
 //! visibility policy at subnet boundaries.
 
 mod assignment;
+mod error;
 mod gateway;
 mod id;
 
 pub use assignment::{SubnetPolicy, SubnetRule};
+pub use error::SubnetError;
 pub use gateway::{DropReason, ForwardDecision, SubnetGateway};
 pub use id::SubnetId;

@@ -7766,16 +7766,6 @@ mod heartbeat_aead_tests {
         assert_eq!(router.routing_table().lookup(peer_id), Some(fresh));
     }
 
-    // BUG #106: removed test
-    // `packet_pool_and_thread_local_pool_have_independent_counters`.
-    // The pre-fix test pinned the BUG state — that the two pools
-    // had independent counters, the very condition that produced
-    // the cross-pool nonce-reuse hazard. Since the BUG #106 fix
-    // REMOVED the `packet_pool` field and getter from
-    // `NetSession`, the test no longer compiles and is no longer
-    // meaningful: the data path uses `thread_local_pool`
-    // exclusively for tx AEAD operations.
-
     /// Regression for BUG_AUDIT_2026_04_30_CORE.md #97: the
     /// production heartbeat path must (a) build with the
     /// session's actual TX key — not `&[0u8; 32]` — and (b) use a
@@ -7844,7 +7834,7 @@ mod heartbeat_aead_tests {
         );
     }
 
-    /// BUG #106 invariant: heartbeats and data-path packets share a
+    /// Invariant: heartbeats and data-path packets share a
     /// single TX counter via `thread_local_pool`. Pre-#106-fix,
     /// `NetSession` exposed two pools (`packet_pool` and
     /// `thread_local_pool`) with the same key but independent
@@ -7912,7 +7902,7 @@ mod heartbeat_aead_tests {
             assert!(
                 window[0] < window[1],
                 "tx counters must be strictly increasing across heartbeat/data \
-                 interleave; got {:?} (BUG #106 regression: heartbeats and data \
+                 interleave; got {:?} (regression: heartbeats and data \
                  are drawing from independent counters)",
                 counters
             );
@@ -7921,7 +7911,7 @@ mod heartbeat_aead_tests {
 
     /// CR-8: source-level tripwire pinning that no dispatch
     /// branch uses `events.into_iter().next()` to drop multi-event
-    /// frames. The original BUG #147 fix only patched
+    /// frames. The original fix only patched
     /// `SUBPROTOCOL_STREAM_WINDOW`; CR-8 extended the same fix to
     /// the migration / channel-membership / capability-ann / reflex
     /// / rendezvous branches. This test scans the file source for

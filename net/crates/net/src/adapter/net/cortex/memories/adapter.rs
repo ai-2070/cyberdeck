@@ -81,7 +81,31 @@ impl MemoriesAdapter {
     /// observes every replayed event's `EventMeta` and advances
     /// `app_seq` past any pre-existing same-origin `seq_or_ts`,
     /// so the first `ingest_typed` after `open` cannot collide
-    /// with an already-stored event.
+    /// with an already-stored event THIS ADAPTER caused.
+    ///
+    /// # Single-origin invariant
+    ///
+    /// `app_seq` is initialized by reading `file.next_seq()` and
+    /// awaiting `wait_for_seq(next_seq - 1)`. If another writer
+    /// — typically a sibling adapter under the same `origin_hash`
+    /// running in a different process or a crashed daemon
+    /// resurrecting its old keypair — appends events between
+    /// `next_seq()` and the user's first `ingest_typed`, those
+    /// events are NOT reflected in our `app_seq` and the next
+    /// stamped `seq_or_ts` can collide with them.
+    ///
+    /// **The bus assumes exactly one writer per `origin_hash` per
+    /// channel.** Splitting writers across processes / runtimes
+    /// for the same origin breaks the no-collision guarantee.
+    /// Either:
+    ///   - Use distinct origins per writer (typical: derive from
+    ///     a unique `EntityKeypair`).
+    ///   - Coordinate writers out-of-band so only one is active
+    ///     at a time.
+    ///
+    /// The pre-fix doc said "the first `ingest_typed` after open
+    /// cannot collide with an already-stored event" full-stop;
+    /// the qualifier "THIS ADAPTER caused" is the correction.
     pub async fn open(redex: &Redex, origin_hash: u32) -> Result<Self, CortexAdapterError> {
         Self::open_with_config(redex, origin_hash, RedexFileConfig::default()).await
     }

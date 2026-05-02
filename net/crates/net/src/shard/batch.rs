@@ -17,6 +17,14 @@ use std::time::{Duration, Instant};
 use crate::config::BatchConfig;
 use crate::event::{Batch, InternalEvent};
 
+/// Cap on `AdaptiveBatcher::velocity_samples` to bound per-shard
+/// memory use under high throughput. `calculate_velocity` reads
+/// only `front()` and `back()`, so additional samples in between
+/// are pure overhead. 1 024 entries × ~24 bytes per tuple
+/// ≈ 24 KiB per shard — well below the 240 KiB pre-fix worst
+/// case at 100 k events/s × 100 ms `velocity_window`.
+const VELOCITY_SAMPLES_CAP: usize = 1024;
+
 /// Adaptive batch size calculator.
 ///
 /// Tracks recent ingestion velocity and adjusts batch size accordingly.
@@ -61,7 +69,7 @@ impl AdaptiveBatcher {
         // Add sample
         self.velocity_samples.push_back((now, self.total_events));
 
-        // Remove old samples outside the window
+        // Remove old samples outside the time window.
         let window_start = now - self.config.velocity_window;
         while let Some(&(ts, _)) = self.velocity_samples.front() {
             if ts < window_start {
@@ -69,6 +77,18 @@ impl AdaptiveBatcher {
             } else {
                 break;
             }
+        }
+
+        // Also cap the deque by sample COUNT. Pre-fix the
+        // bound was time-only, so at 100k events/s with a 100 ms
+        // velocity_window the deque could grow to ~10 000 entries
+        // before time-eviction caught up, costing ~240 KiB per
+        // shard for samples never used (calculate_velocity reads
+        // only `front()` and `back()`). Cap at
+        // VELOCITY_SAMPLES_CAP so the memory footprint is bounded
+        // regardless of throughput.
+        while self.velocity_samples.len() > VELOCITY_SAMPLES_CAP {
+            self.velocity_samples.pop_front();
         }
 
         // Recalculate batch size periodically (not on every call)
@@ -212,6 +232,22 @@ impl BatchWorker {
     /// Add events to the current batch.
     ///
     /// Returns a completed batch if thresholds are met, or None if more events are needed.
+    ///
+    /// # Empty-input side effect
+    ///
+    /// Passing an empty `events` vec is **not** a no-op. The
+    /// BatchWorker's recv-timeout arm calls `add_events(vec![])`
+    /// specifically to drive a `check_timeout` round, which may
+    /// flush the in-memory `current_batch` if `max_delay` has
+    /// elapsed since the last event arrived. Callers who want
+    /// "true no-op on empty input" must check `events.is_empty()`
+    /// themselves before calling.
+    ///
+    /// Pre-fix this side effect was not documented and
+    /// surprised callers expecting `add_events([])` to be inert.
+    /// The fix is documentation only — the BatchWorker's timeout
+    /// flush relies on this behavior, so removing the side effect
+    /// would break the timeout-flush mechanism in bus.rs.
     pub fn add_events(&mut self, events: Vec<InternalEvent>) -> Option<Batch> {
         if events.is_empty() {
             return self.check_timeout();
@@ -346,6 +382,55 @@ mod tests {
         assert_eq!(batch.shard_id, 0);
     }
 
+    /// `add_events(vec![])` is **not** a no-op. The activate-failure
+    /// rollback path in `bus.rs` and the BatchWorker's recv-timeout
+    /// arm both rely on the empty-input call to drive a
+    /// `check_timeout`, which can flush `current_batch` if
+    /// `max_delay` has elapsed. A future refactor that makes
+    /// `add_events([])` a true no-op would silently lose those
+    /// already-batched events on the rollback path. Pin the
+    /// load-bearing behavior here so any such "cleanup" trips a
+    /// failing test rather than producing a silent regression.
+    #[test]
+    fn add_events_empty_can_flush_via_timeout() {
+        let config = BatchConfig {
+            min_size: 10,
+            max_size: 1000,
+            max_delay: Duration::from_millis(1),
+            adaptive: false,
+            velocity_window: Duration::from_millis(100),
+        };
+        let mut worker = BatchWorker::new(0, config, fresh_published(), 0);
+
+        // Stage some events well below `min_size` so neither size
+        // threshold can hide the timeout-flush.
+        let pre = worker.add_events(make_events(3, 0));
+        assert!(pre.is_none(), "below min_size — no flush yet");
+
+        // Empty input *before* max_delay must be a no-op (returns
+        // None). This pins the second half of the contract: the
+        // side-effect is bounded to "check timeout", not "always
+        // flush".
+        let early = worker.add_events(vec![]);
+        assert!(
+            early.is_none(),
+            "empty input before max_delay must NOT flush — \
+             check_timeout returns None when start.elapsed() < max_delay"
+        );
+
+        // Wait past max_delay and call with empty input — must flush.
+        std::thread::sleep(Duration::from_millis(5));
+        let flushed = worker.add_events(vec![]);
+        assert!(
+            flushed.is_some(),
+            "empty input after max_delay MUST flush via check_timeout — \
+             this is the contract bus.rs and BatchWorker's recv-timeout \
+             arm rely on; making it a no-op silently loses events on \
+             the activate-failure rollback path"
+        );
+        assert_eq!(flushed.unwrap().events.len(), 3);
+    }
+
     #[test]
     fn test_batch_timeout() {
         let config = BatchConfig {
@@ -437,7 +522,7 @@ mod tests {
         assert_eq!(batch3.sequence_start, 150);
     }
 
-    /// Regression for BUG #153 — every `flush` must publish the
+    /// Regression: every `flush` must publish the
     /// post-flush `next_sequence` to the shared atomic so
     /// `bus::remove_shard_internal` can read it after awaiting the
     /// worker and use it as the stranded-flush `sequence_start`.
@@ -490,8 +575,8 @@ mod tests {
     /// atomic. `bus::remove_shard_internal` uses this value as a
     /// `sequence_start`; if it ever overflowed back to 0 the
     /// stranded batch's msg-ids would collide with the worker's
-    /// first batch — the exact JetStream-dedup hazard BUG #153
-    /// names.
+    /// first batch — the exact JetStream-dedup hazard the
+    /// stranded-flush path is designed to avoid.
     #[test]
     fn flush_publishes_saturating_max_on_overflow() {
         let config = BatchConfig::default();

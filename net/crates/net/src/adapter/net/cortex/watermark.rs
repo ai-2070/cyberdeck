@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn inner_fold_error_propagates_and_does_not_advance_watermark() {
-        // BUG #148 fix: the watermark only advances on a *successful*
+        // The watermark only advances on a *successful*
         // inner-fold apply. If the user fold rejects the event, the
         // wrapper must surface the error AND leave app_seq alone — the
         // event was effectively skipped (Continue policy) or halted

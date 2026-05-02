@@ -341,7 +341,6 @@ pub(crate) async fn spawn_replica_group(
     let group = SdkReplicaGroup::spawn(&runtime, &kind, cfg).map_err(group_err)?;
     Ok(ReplicaGroup {
         inner: Arc::new(group),
-        kind,
     })
 }
 
@@ -364,7 +363,6 @@ pub(crate) async fn spawn_fork_group(
         SdkForkGroup::fork(&runtime, &kind, parent_origin, fork_seq, cfg).map_err(group_err)?;
     Ok(ForkGroup {
         inner: Arc::new(group),
-        kind,
     })
 }
 
@@ -385,7 +383,6 @@ pub(crate) async fn spawn_standby_group(
     let group = SdkStandbyGroup::spawn(&runtime, &kind, cfg).map_err(group_err)?;
     Ok(StandbyGroup {
         inner: Arc::new(group),
-        kind,
     })
 }
 
@@ -393,10 +390,17 @@ pub(crate) async fn spawn_standby_group(
 // ReplicaGroup
 // =========================================================================
 
+// Pre-fix this struct (and ForkGroup, StandbyGroup
+// below) carried a `kind: String` field that was captured at
+// spawn but never read on `self.kind` anywhere. The
+// `Arc<SdkReplicaGroup>` (and friends) hold their own copy of
+// the kind, so the binding-side field was dead code AND a
+// maintenance trap: any future "use" of `self.kind` would read
+// a frozen snapshot that could drift from the SDK-side kind.
+// Removed for both correctness and footprint.
 #[napi]
 pub struct ReplicaGroup {
     inner: Arc<SdkReplicaGroup>,
-    kind: String,
 }
 
 #[napi]
@@ -485,7 +489,7 @@ impl ReplicaGroup {
 #[napi]
 pub struct ForkGroup {
     inner: Arc<SdkForkGroup>,
-    kind: String,
+    // Removed unused `kind` field; see ReplicaGroup.
 }
 
 #[napi]
@@ -573,7 +577,7 @@ impl ForkGroup {
 #[napi]
 pub struct StandbyGroup {
     inner: Arc<SdkStandbyGroup>,
-    kind: String,
+    // Removed unused `kind` field; see ReplicaGroup.
 }
 
 #[napi]
@@ -660,17 +664,30 @@ impl StandbyGroup {
     }
 
     /// `"active"` | `"standby"` | `null` (out-of-range index).
+    ///
+    /// Pre-fix, `index as u8` silently wrapped — a JS caller
+    /// passing 256 expected null (out-of-range) but received the role
+    /// for member 0. `u8::try_from` returns `Err` on overflow, which
+    /// we map to `None` for the documented contract.
     #[napi]
     pub fn member_role(&self, index: u32) -> Option<String> {
+        let idx = u8::try_from(index).ok()?;
         self.inner
-            .member_role(index as u8)
+            .member_role(idx)
             .map(member_role_str)
             .map(String::from)
     }
 
+    /// Returns the highest event sequence the standby member at
+    /// `index` has acknowledged, or `null` if `index` is out of range.
+    ///
+    /// Same wrapping hazard as `member_role`. A JS caller
+    /// polling sync progress for index 257 would silently get the
+    /// lag of member 1 and could make an incorrect failover decision.
     #[napi]
     pub fn synced_through(&self, index: u32) -> Option<BigInt> {
-        self.inner.synced_through(index as u8).map(BigInt::from)
+        let idx = u8::try_from(index).ok()?;
+        self.inner.synced_through(idx).map(BigInt::from)
     }
 
     #[napi(getter)]

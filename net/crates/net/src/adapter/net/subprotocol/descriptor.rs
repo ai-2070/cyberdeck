@@ -262,7 +262,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #132: read_manifest_entry / with_min_compatible must reject
+    // read_manifest_entry / with_min_compatible must reject
     // min_compatible > version (phantom-incompatibility DoS)
     // ========================================================================
 
@@ -284,7 +284,7 @@ mod tests {
         let parsed = read_manifest_entry(&mut cursor);
         assert!(
             parsed.is_none(),
-            "read_manifest_entry must reject min_compat > version (BUG #132)",
+            "read_manifest_entry must reject min_compat > version",
         );
     }
 

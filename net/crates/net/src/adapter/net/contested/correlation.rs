@@ -154,14 +154,21 @@ impl CorrelatedFailureDetector {
             self.recent_failures.pop_front();
         }
 
-        // Count unique failures in the window
-        let window_failures: Vec<u64> = self
-            .recent_failures
-            .iter()
-            .map(|e| e.node_id)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
+        // Count unique failures in the window.
+        //
+        // Pre-fix this collected through a `HashSet<u64>`
+        // and converted back to `Vec`, which exposed the HashSet's
+        // randomized iteration order to downstream consumers.
+        // `window_failures` flows verbatim into
+        // `PartitionRecord::other_side` (partition.rs:160), so two
+        // nodes with identical inputs produced different
+        // `other_side` orderings, breaking cross-node serialization
+        // / reconcile-ordering / replay validation. Sort + dedup
+        // gives a canonical Vec deterministic across processes.
+        let mut window_failures: Vec<u64> =
+            self.recent_failures.iter().map(|e| e.node_id).collect();
+        window_failures.sort_unstable();
+        window_failures.dedup();
 
         if total_tracked == 0 {
             return CorrelationVerdict::Independent {
@@ -496,6 +503,39 @@ mod tests {
         } = &verdict
         {
             assert_eq!(*suspected_cause, FailureCause::Unknown);
+        }
+    }
+
+    /// `failed_nodes` in the verdict (sourced from
+    /// `window_failures` after dedup) must be sorted, not in
+    /// arbitrary HashSet iteration order. Pre-fix the same input
+    /// could produce different orderings on each run / process,
+    /// breaking serialization parity across nodes that observe
+    /// the same partition.
+    ///
+    /// We can't easily test "different across processes" in a
+    /// single test run, but we CAN check the ordering is
+    /// monotonic, which is a strong proxy: a sorted output is
+    /// canonical, while a HashSet output is not.
+    #[test]
+    fn mass_failure_failed_nodes_are_sorted_canonically() {
+        let mut det = make_detector(0.30);
+        for i in 0..10 {
+            det.register_node(i, SubnetId::new(&[1]));
+        }
+
+        // Record failures in a deliberately-unsorted order.
+        let verdict = det.record_failures(&[7, 2, 9, 4, 0, 5, 8, 1], 10);
+        assert!(verdict.is_mass_failure());
+        if let CorrelationVerdict::MassFailure { failed_nodes, .. } = &verdict {
+            let mut sorted = failed_nodes.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                failed_nodes, &sorted,
+                "MassFailure.failed_nodes must be in canonical \
+                 (sorted) order; pre-fix it leaked HashSet iteration order \
+                 and varied per process"
+            );
         }
     }
 }

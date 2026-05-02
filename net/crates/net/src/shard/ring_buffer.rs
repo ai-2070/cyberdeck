@@ -765,7 +765,7 @@ mod tests {
         }
     }
 
-    /// BUG #78: cursors must be `u64` regardless of target pointer
+    /// Cursors must be `u64` regardless of target pointer
     /// width. Pre-fix `head` and `tail` were `AtomicUsize`; on
     /// 32-bit they wrapped after 2^32 pushes and the buffer
     /// permanently wedged once the wrapping distance exceeded

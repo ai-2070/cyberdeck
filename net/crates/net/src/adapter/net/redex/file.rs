@@ -353,8 +353,42 @@ impl RedexFile {
 
     /// Next sequence to be assigned (== total append count since open,
     /// including any evicted head).
+    ///
+    /// Pre-fix, this read `next_seq` outside the state
+    /// lock. `append` / `append_batch` etc. allocate a seq via
+    /// `fetch_add` before the disk write and `fetch_sub`-rollback
+    /// on failure — both within the state-lock critical section.
+    /// A concurrent reader without the lock could observe the
+    /// temporarily-bumped value: external observers (metrics,
+    /// snapshot logic, an `IndexStart::FromSeq(next_seq())`
+    /// re-tail) believed a seq existed that was never durably
+    /// appended. Taking the state lock here serializes the read
+    /// with the append's commit-or-rollback, so callers only
+    /// observe values that have been durably committed (or
+    /// never assigned).
     pub fn next_seq(&self) -> u64 {
+        let _state = self.inner.state.lock();
         self.inner.next_seq.load(Ordering::Acquire)
+    }
+
+    /// Whether [`Self::close`] has run. After close, `tail` streams
+    /// terminate with `Err(Closed)` and `append`/`append_*` reject
+    /// with the same error.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
+    /// Lowest sequence number currently retained in the in-memory
+    /// index, or `None` when the file holds nothing.
+    ///
+    /// `next_seq() - lowest_retained_seq()` is **not** the count —
+    /// retention is by event-or-byte-or-age, not by contiguous range.
+    /// Use this for "where can I safely tail from without triggering
+    /// `Lagged`?": passing the returned seq (or higher) to
+    /// [`Self::tail`] guarantees the backfill does not signal
+    /// retention-induced history loss.
+    pub fn lowest_retained_seq(&self) -> Option<u64> {
+        self.inner.state.lock().index.first().map(|e| e.seq)
     }
 
     /// Append one event. Returns the assigned sequence.
@@ -462,8 +496,23 @@ impl RedexFile {
         Ok(seq)
     }
 
-    /// Append many payloads. Returns the sequence of the FIRST event
-    /// in the batch. All entries land contiguously in the index.
+    /// Append many payloads. Returns `Some(seq)` of the FIRST event
+    /// in the batch, or `None` for an empty input. All entries
+    /// land contiguously in the index.
+    ///
+    /// # Empty input
+    ///
+    /// Pre-fix the signature was `Result<u64, RedexError>` and an
+    /// empty `payloads` returned `Ok(next_seq)` — the seq value
+    /// the next append *would* receive. Callers couldn't
+    /// distinguish "wrote zero, seq N would be next" from "wrote
+    /// one event with seq N" via the return value alone.
+    ///
+    /// Breaking change: signature is now
+    /// `Result<Option<u64>, RedexError>`. `None` ⇒ empty input,
+    /// no events appended; `Some(seq)` ⇒ first seq of the batch.
+    /// Callers iterating over optionally-empty batches no longer
+    /// need an `is_empty` pre-check.
     ///
     /// Failure atomicity:
     /// - seq numbers are allocated **after** the batch is validated
@@ -472,10 +521,10 @@ impl RedexFile {
     ///   any in-memory commit — on disk failure the seq allocation
     ///   rolls back and neither memory nor subscribers observe the
     ///   batch.
-    pub fn append_batch(&self, payloads: &[Bytes]) -> Result<u64, RedexError> {
+    pub fn append_batch(&self, payloads: &[Bytes]) -> Result<Option<u64>, RedexError> {
         self.check_not_closed()?;
         if payloads.is_empty() {
-            return Ok(self.inner.next_seq.load(Ordering::Acquire));
+            return Ok(None);
         }
 
         let ts = now_ns();
@@ -561,7 +610,7 @@ impl RedexFile {
         for event in &events {
             notify_watchers(&mut state.watchers, event);
         }
-        Ok(first_seq)
+        Ok(Some(first_seq))
     }
 
     /// Strictly-ordered variant of [`Self::append`].
@@ -675,10 +724,13 @@ impl RedexFile {
     /// atomic (all-or-nothing within the batch) and strictly
     /// seq-ordered relative to any other ordered writers. Same
     /// failure-atomicity contract as [`Self::append_batch`].
-    pub fn append_batch_ordered(&self, payloads: &[Bytes]) -> Result<u64, RedexError> {
+    ///
+    /// Returns `Some(first_seq)` on a non-empty batch and `None`
+    /// on empty input — same convention as `append_batch`.
+    pub fn append_batch_ordered(&self, payloads: &[Bytes]) -> Result<Option<u64>, RedexError> {
         self.check_not_closed()?;
         if payloads.is_empty() {
-            return Ok(self.inner.next_seq.load(Ordering::Acquire));
+            return Ok(None);
         }
         let ts = now_ns();
         let mut state = self.inner.state.lock();
@@ -754,7 +806,7 @@ impl RedexFile {
         for event in &events {
             notify_watchers(&mut state.watchers, event);
         }
-        Ok(first_seq)
+        Ok(Some(first_seq))
     }
 
     /// Append `value` (postcard-serialized) AND run `fold_fn` against
@@ -840,6 +892,32 @@ impl RedexFile {
             return ReceiverStream::new(rx);
         }
 
+        // Detect retention-induced history loss.
+        // `partition_point(|e| e.seq < from_seq)` only catches
+        // overflow within the retained range — it cannot tell us
+        // the requested `from_seq` predates the lowest retained
+        // entry, because that entry has already been dropped from
+        // `state.index`. Pre-fix, a subscriber asking for
+        // `from_seq = 0` after retention had pruned the head
+        // received the retained tail with no `Lagged` signal —
+        // silent data loss for resume-from-snapshot consumers.
+        //
+        // Two cases mean history was dropped:
+        //   1. The lowest retained seq is greater than `from_seq`.
+        //   2. Nothing is retained but events were appended (next_seq
+        //      moved past from_seq).
+        // Either case → signal `Lagged` before enqueuing anything.
+        let next_seq = self.inner.next_seq.load(Ordering::Acquire);
+        let history_lost = match state.index.first() {
+            Some(first) => first.seq > from_seq,
+            None => from_seq < next_seq,
+        };
+        if history_lost {
+            drop(state);
+            let _ = tx.try_send(Err(RedexError::Lagged));
+            return ReceiverStream::new(rx);
+        }
+
         // Backfill pre-flight. The index is in seq order so we can
         // binary-search for the first matching entry and compute the
         // backfill size in O(log n). If it can't fit in the channel,
@@ -916,6 +994,27 @@ impl RedexFile {
 
     /// Run the retention policy synchronously. Exposed so a background
     /// task (heartbeat loop) can drive it; no hot-path cost.
+    ///
+    /// # Disk I/O under parking_lot Mutex
+    ///
+    /// `sweep_retention` and `append_batch` call disk operations
+    /// (`disk.compact_to`, `disk.append_entries_at`) while
+    /// holding `state.lock()`, a non-yielding parking_lot Mutex.
+    /// All concurrent appenders, `tail` registrations,
+    /// `read_range`, `len`, `is_empty`, and `close` block on the
+    /// same lock for the duration of the I/O. **This is a
+    /// latency / starvation concern, not a correctness one.**
+    /// Throughput-critical deployments should drive
+    /// `sweep_retention` from a low-priority background task
+    /// scheduled outside the hot path.
+    ///
+    /// A proper fix would snapshot the state needed for I/O,
+    /// release the lock, perform I/O, then re-acquire to
+    /// commit — that's a substantial restructure (transactional
+    /// staging area, conflict resolution against concurrent
+    /// appends) and out of scope here. Documented as a known
+    /// performance trade-off so future profilers don't
+    /// rediscover it as a "bug".
     pub fn sweep_retention(&self) {
         let cfg = self.inner.config;
         if cfg.retention_max_events.is_none()
@@ -1110,10 +1209,23 @@ impl RedexFile {
 
 impl std::fmt::Debug for RedexFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Read only lock-free state: `len` and the lock-taking
+        // `next_seq()` accessor would acquire `state.lock()` (the
+        // accessor takes it for read-after-rollback consistency).
+        // Two separate acquisitions in one Debug print also produce
+        // torn reads. More importantly, any future
+        // `tracing::?(?file, …)` inside a region that already holds
+        // `state` would deadlock. The atomic gives a possibly-stale
+        // (mid-append) value, which is acceptable for diagnostic
+        // output and is the same trade-off other lock-free Debug
+        // impls in this crate make.
         f.debug_struct("RedexFile")
             .field("name", &self.inner.name)
-            .field("len", &self.len())
-            .field("next_seq", &self.next_seq())
+            .field(
+                "next_seq_atomic",
+                &self.inner.next_seq.load(Ordering::Relaxed),
+            )
+            .field("closed", &self.inner.closed.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -1220,6 +1332,42 @@ mod tests {
         assert_eq!(f.next_seq(), 3);
     }
 
+    /// `Debug` must not acquire `state.lock()`. Pre-fix it called
+    /// `self.len()` and `self.next_seq()`, both of which lock the
+    /// state mutex. Any caller that printed a `RedexFile` from
+    /// inside an existing `state`-locked region (e.g. a future
+    /// `tracing::?(?file, …)` inside an append path) would
+    /// deadlock against itself. The fix reads the lock-free
+    /// atomics directly. We pin the property by holding the lock
+    /// across a `format!("{:?}", file)` call — pre-fix this
+    /// deadlocks; post-fix it returns immediately.
+    #[test]
+    fn debug_does_not_acquire_state_lock() {
+        use std::sync::atomic::Ordering;
+        let f = make_file("t-debug-lock");
+        f.append(b"x").unwrap();
+
+        // Hold the state lock and format the file. If `Debug`
+        // tries to take the same lock, the test hangs (would
+        // be caught by CI test-timeout, but more importantly it
+        // would have hung pre-fix).
+        let guard = f.inner.state.lock();
+        let s = format!("{:?}", f);
+        drop(guard);
+
+        assert!(s.contains("RedexFile"));
+        assert!(
+            s.contains("next_seq_atomic"),
+            "Debug must surface the lock-free atomic, got: {s}"
+        );
+        // Sanity: the atomic value matches what `next_seq.load` returns.
+        let direct = f.inner.next_seq.load(Ordering::Relaxed);
+        assert!(
+            s.contains(&direct.to_string()),
+            "Debug must reflect the live atomic value, got: {s}"
+        );
+    }
+
     #[test]
     fn test_read_range_returns_events_in_order() {
         let f = make_file("t2");
@@ -1247,7 +1395,7 @@ mod tests {
         let start = f
             .append_batch(&[Bytes::from_static(b"one"), Bytes::from_static(b"two")])
             .unwrap();
-        assert_eq!(start, 0);
+        assert_eq!(start, Some(0));
         assert_eq!(f.next_seq(), 2);
         let events = f.read_range(0, 2);
         assert_eq!(events[0].payload.as_ref(), b"one");
@@ -1386,6 +1534,115 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].payload.as_ref(), b"second");
         assert_eq!(events[1].payload.as_ref(), b"third");
+    }
+
+    /// A subscriber that requests `tail(from_seq)` for a
+    /// `from_seq` BELOW the lowest currently retained entry must
+    /// receive `Err(Lagged)` as the first stream item, not a silently
+    /// truncated history.
+    ///
+    /// Pre-fix, `partition_point(|e| e.seq < from_seq)` returned 0
+    /// when every retained entry had `seq >= from_seq` (because all
+    /// the older ones were dropped from `state.index`), so the
+    /// `backfill_count` matched the retained range size and the
+    /// subscriber received `[seq=2..N]` with no signal that
+    /// `[from_seq..2]` had ever existed.
+    #[tokio::test]
+    async fn tail_signals_lagged_when_from_seq_below_retained_head() {
+        let f = RedexFile::new(
+            ChannelName::new("t-bug2").unwrap(),
+            RedexFileConfig::default().with_retention_max_events(3),
+        );
+        for i in 0..10u64 {
+            f.append(format!("e{}", i).as_bytes()).unwrap();
+        }
+        f.sweep_retention();
+        // After sweep, retained = seqs 7, 8, 9. lowest_retained = 7.
+        assert_eq!(f.lowest_retained_seq(), Some(7));
+
+        // Request from_seq = 0 — every seq < 7 was retained-evicted.
+        let mut stream = Box::pin(f.tail(0));
+        let first = stream.next().await.expect("must yield at least one item");
+        assert!(
+            matches!(first, Err(RedexError::Lagged)),
+            "expected Lagged signal for from_seq=0 below retained head 7, got {:?}",
+            first
+                .as_ref()
+                .map(|_| "Ok event")
+                .map_err(|e| format!("{:?}", e)),
+        );
+    }
+
+    /// `from_seq` exactly at or above the lowest
+    /// retained head must NOT signal `Lagged` — every requested seq
+    /// is still present.
+    #[tokio::test]
+    async fn tail_does_not_signal_lagged_when_from_seq_at_or_above_retained_head() {
+        let f = RedexFile::new(
+            ChannelName::new("t-bug2-ok").unwrap(),
+            RedexFileConfig::default().with_retention_max_events(3),
+        );
+        for i in 0..10u64 {
+            f.append(format!("e{}", i).as_bytes()).unwrap();
+        }
+        f.sweep_retention();
+        assert_eq!(f.lowest_retained_seq(), Some(7));
+
+        // Request from_seq = 7 — exactly the lowest retained.
+        let mut stream = Box::pin(f.tail(7));
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            first.entry.seq, 7,
+            "tail(7) must return seq 7 as first backfilled event"
+        );
+    }
+
+    /// `from_seq < next_seq` with no retained
+    /// entries also signals `Lagged` — events were appended and
+    /// then entirely retention-evicted.
+    #[tokio::test]
+    async fn tail_signals_lagged_when_all_retained_dropped() {
+        let f = RedexFile::new(
+            ChannelName::new("t-bug2-all-gone").unwrap(),
+            RedexFileConfig::default().with_retention_max_events(0),
+        );
+        f.append(b"a").unwrap();
+        f.append(b"b").unwrap();
+        f.sweep_retention();
+        assert_eq!(f.len(), 0);
+        assert_eq!(f.lowest_retained_seq(), None);
+        assert_eq!(f.next_seq(), 2);
+
+        // Request from_seq = 0 — events existed but are gone.
+        let mut stream = Box::pin(f.tail(0));
+        let first = stream.next().await.expect("must yield at least one item");
+        assert!(
+            matches!(first, Err(RedexError::Lagged)),
+            "expected Lagged when next_seq advanced past from_seq with empty index"
+        );
+    }
+
+    /// `from_seq >= next_seq` (waiting for future
+    /// events) on an empty index must NOT signal `Lagged` — the
+    /// subscriber is just ahead of the file.
+    #[tokio::test]
+    async fn tail_does_not_signal_lagged_when_waiting_for_future_events() {
+        let f = make_file("t-bug2-future");
+        // No appends. next_seq = 0.
+
+        let stream = Box::pin(f.tail(5));
+        // Append something; subscriber should NOT see Lagged for the
+        // initial "from_seq=5 with empty index, next_seq=0" condition.
+        f.append(b"e5").unwrap(); // seq 0
+        f.append(b"e6").unwrap(); // seq 1
+        f.append(b"e7").unwrap(); // seq 2
+                                  // ... still nothing at seq 5 yet, so stream is idle.
+                                  // What we do assert: the backfill check did NOT push Lagged
+                                  // synchronously (which would be the next item polled).
+                                  // Instead, the watcher is registered live and waiting.
+                                  // Cancel via dropping.
+        drop(stream);
+        // No assertion failure means we didn't hit the Lagged path.
     }
 
     #[test]

@@ -34,11 +34,29 @@ pub const STREAM_WINDOW_SIZE: usize = 16;
 /// stream since it was opened. The sender uses this to recompute
 /// `tx_credit_remaining = tx_window - (tx_bytes_sent - total_consumed)`,
 /// making the mechanism self-healing against lost grants.
+///
+/// # Consumer-side validation
+///
+/// The codec accepts any `total_consumed: u64`. Pre-fix the doc-
+/// comment's "self-healing" framing implied no further validation
+/// was needed, but the formula
+/// `tx_credit_remaining = tx_window - (tx_bytes_sent - total_consumed)`
+/// underflows if a malformed or hostile peer sends
+/// `total_consumed > tx_bytes_sent`. **The consumer MUST clamp
+/// `total_consumed` to its local `tx_bytes_sent` watermark before
+/// applying.** `StreamState::apply_authoritative_grant`
+/// (`adapter/net/session.rs:1153-1154`) does this today; any
+/// future consumer of this codec must do the same. The codec
+/// layer cannot do the clamp itself because it doesn't know the
+/// sender's local state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamWindow {
     /// Stream the grant applies to.
     pub stream_id: u64,
     /// Receiver's cumulative consumed-byte count on this stream.
+    ///
+    /// Consumers MUST clamp this to the local `tx_bytes_sent`
+    /// watermark before deriving credit.
     pub total_consumed: u64,
 }
 

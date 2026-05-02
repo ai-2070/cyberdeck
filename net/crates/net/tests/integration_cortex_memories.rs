@@ -513,7 +513,7 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
 
 #[tokio::test]
 async fn test_open_returns_with_state_already_caught_up() {
-    // BUG #148 fix: `MemoriesAdapter::open[_with_config]` awaits the
+    // `MemoriesAdapter::open[_with_config]` awaits the
     // inner fold task's catch-up before returning. State is fully
     // visible synchronously — no `wait_for_seq` required.
     let redex = Redex::new();
@@ -604,7 +604,7 @@ async fn test_open_from_snapshot_with_empty_replay_tail_keeps_snapshot_app_seq()
 
 #[tokio::test]
 async fn test_regression_open_advances_app_seq_past_existing_same_origin_events() {
-    // Regression for BUG #148 secondary-fix: pre-fix
+    // Regression: pre-fix
     // `MemoriesAdapter::open` set `app_seq = AtomicU64::new(0)`
     // unconditionally, so reopening against a Redex with existing
     // same-origin events caused the next ingest to stamp

@@ -178,7 +178,7 @@ pub extern "C" fn net_redis_dedup_clear(handle: *mut RedisStreamDedupHandle) {
 mod tests {
     //! C-FFI smoke tests. The Rust helper is exhaustively tested in
     //! `sdk/src/redis_dedup.rs`; here we just pin that the FFI
-    //! shims agree with the Rust semantic on the canonical BUG #57
+    //! shims agree with the Rust semantic on the canonical
     //! producer-retry scenario, plus error-shape tests for NULL
     //! and invalid-UTF-8 inputs.
     use super::*;

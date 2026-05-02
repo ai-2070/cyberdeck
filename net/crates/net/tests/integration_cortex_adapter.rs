@@ -132,7 +132,7 @@ async fn test_from_seq_checkpoint_resume() {
 
     // Simulate a caller that has persisted state through seq 4 and
     // rehydrates via the snapshot path. Resume at seq 5 — the
-    // public `open` API rejects `FromSeq(n>0)` (BUG #134); only
+    // public `open` API rejects `FromSeq(n>0)`; only
     // `open_from_snapshot` is allowed to skip the event prefix
     // because it carries the matching `(state, last_seq)` pair.
     let mut rehydrated = RecorderState::default();
@@ -186,7 +186,7 @@ async fn test_live_only_skips_pre_open_events() {
     // Reopen via the snapshot path with `last_seq = Some(9)` — that
     // routes the tail to start at seq 10, the live-only equivalent
     // for a 10-event file. The public `open` API rejects
-    // `LiveOnly` directly (BUG #134) because skipping a non-empty
+    // `LiveOnly` directly because skipping a non-empty
     // event prefix without a matching state snapshot would advance
     // the watermark past events the adapter never folded.
     let empty_snapshot = postcard::to_allocvec(&RecorderState::default()).unwrap();

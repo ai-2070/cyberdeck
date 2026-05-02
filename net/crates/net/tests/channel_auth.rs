@@ -188,13 +188,15 @@ async fn subscribe_rejected_with_expired_token() {
     a.registry
         .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_require_token(true));
 
-    // Zero-duration token — expires on issue.
+    // 1-second token, then sleep past `not_after`.
+    // (duration_secs == 0 is now rejected; mint with the minimum
+    // valid TTL and wait it out.)
     let token = PermissionToken::issue(
         &a.keypair,
         b.keypair.entity_id().clone(),
         TokenScope::SUBSCRIBE,
         name.hash(),
-        0,
+        1,
         0,
     );
     // Let now() tick past `not_after`.

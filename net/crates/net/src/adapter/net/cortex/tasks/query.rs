@@ -314,7 +314,7 @@ mod tests {
             .map(|t| t.id)
             .collect();
         ids.sort();
-        // BUG #142: bounds are inclusive. Task 3 (created_ns=300)
+        // Bounds are inclusive. Task 3 (created_ns=300)
         // qualifies — pre-fix the comparator was strict `>`, which
         // dropped boundary events that should belong to either side
         // of a `last_sync_ns`-style cutoff.
@@ -332,12 +332,12 @@ mod tests {
             .map(|t| t.id)
             .collect();
         ids.sort();
-        // BUG #142: inclusive — task 3 (created_ns=300) qualifies.
+        // Inclusive — task 3 (created_ns=300) qualifies.
         assert_eq!(ids, vec![1, 2, 3]);
     }
 
     /// CR-20: pin the symmetric duplicate-delivery hazard the
-    /// BUG #142 inclusive-bound fix introduced. The fix made
+    /// inclusive-bound fix introduced. The fix made
     /// `created_after(N)` inclusive (`>=`) so a `created_ns == N`
     /// event isn't dropped by both halves of a `[after, before]`
     /// pagination range. But the symmetric paginate-by-cutoff
@@ -373,7 +373,7 @@ mod tests {
 
         // CR-20: the boundary event at `created_ns == last_seen`
         // is RE-DELIVERED. This is the symmetric hazard the
-        // BUG #142 fix introduced.
+        // inclusive-bound fix introduced.
         let boundary_count = page_2.iter().filter(|t| t.created_ns == last_seen).count();
         assert!(
             boundary_count >= 1,
@@ -399,7 +399,7 @@ mod tests {
             .map(|t| t.id)
             .collect();
         ids.sort();
-        // BUG #142: inclusive bounds — task 2 (updated_ns=250) is
+        // Inclusive bounds — task 2 (updated_ns=250) is
         // included by `updated_after(250)`, and task 5 (520) is
         // still excluded because it's strictly above 500.
         assert_eq!(ids, vec![2, 3, 4]);

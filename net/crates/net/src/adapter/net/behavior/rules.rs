@@ -114,14 +114,78 @@ fn compare_values(
     right: &serde_json::Value,
 ) -> Option<std::cmp::Ordering> {
     match (left, right) {
-        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
-            let a = a.as_f64()?;
-            let b = b.as_f64()?;
-            a.partial_cmp(&b)
-        }
+        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => compare_numbers(a, b),
         (serde_json::Value::String(a), serde_json::Value::String(b)) => Some(a.cmp(b)),
         _ => None,
     }
+}
+
+/// Compare two `serde_json::Number` values without losing precision
+/// when both fit in an integer type.
+///
+/// Pre-fix, `compare_values` always reduced both sides to
+/// `f64` via `as_f64()`. For integer fields above `2^53` (e.g. byte
+/// counts, ns timestamps, monotonic sequence numbers) the cast was
+/// lossy: two adjacent values like `9_007_199_254_740_992` and
+/// `9_007_199_254_740_993` compared `Equal`, so a `Gt` rule guarding
+/// a quota silently failed to fire. NaN/Infinity (legal under
+/// `arbitrary_precision`, though we don't enable it) yielded `None`,
+/// silently masking the bug.
+///
+/// Post-fix:
+///   1. Both i64 → exact i64 compare (handles negatives).
+///   2. Both u64 → exact u64 compare (handles values > i64::MAX).
+///   3. Mixed signed-i64 / large-u64 → resolved by sign:
+///      a negative i64 is always less than any u64; a u64 above
+///      i64::MAX is always greater than any negative i64.
+///   4. At least one is a float → f64 fallback with the documented
+///      lossy semantics.
+fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Option<std::cmp::Ordering> {
+    // We don't enable serde_json's `arbitrary_precision` feature in
+    // this tree, but a transitive dependency could turn it on
+    // workspace-wide via Cargo's feature unification. With it, a
+    // big-integer literal stops fitting in any of `as_i64` /
+    // `as_u64` / `as_f64` (all three return `None`) and the rule
+    // would silently fail to fire — quota gates, threshold checks,
+    // and policy rules become no-ops with no diagnostic. The
+    // `debug_assert!` makes the misuse loud during dev/test; in
+    // release we still return `None` so the rule fails closed.
+    debug_assert!(
+        a.is_i64() || a.is_u64() || a.is_f64(),
+        "compare_numbers: lhs is neither i64/u64/f64 — likely \
+         `serde_json/arbitrary_precision` got enabled via feature \
+         unification. Rule will silently fail closed in release."
+    );
+    debug_assert!(
+        b.is_i64() || b.is_u64() || b.is_f64(),
+        "compare_numbers: rhs is neither i64/u64/f64 — likely \
+         `serde_json/arbitrary_precision` got enabled via feature \
+         unification. Rule will silently fail closed in release."
+    );
+
+    // 1. Both fit in i64.
+    if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
+        return Some(ai.cmp(&bi));
+    }
+    // 2. Both fit in u64. Order matters: i64 takes precedence above
+    //    so non-negative integers that fit in both types use the
+    //    signed compare; only this branch handles values > i64::MAX.
+    if let (Some(au), Some(bu)) = (a.as_u64(), b.as_u64()) {
+        return Some(au.cmp(&bu));
+    }
+    // 3. Mixed: one is a negative i64 (as_u64 returned None for it)
+    //    and the other is a u64 above i64::MAX (as_i64 returned None
+    //    for it). The negative side is always less than the
+    //    non-negative side.
+    if a.as_i64().is_some() && b.as_u64().is_some() {
+        return Some(std::cmp::Ordering::Less);
+    }
+    if a.as_u64().is_some() && b.as_i64().is_some() {
+        return Some(std::cmp::Ordering::Greater);
+    }
+    // 4. Float fallback. NaN → None, which collapses comparing-to-
+    //    NaN rules to the existing `partial_cmp` semantics.
+    a.as_f64()?.partial_cmp(&b.as_f64()?)
 }
 
 /// Logical operators for combining conditions
@@ -573,10 +637,22 @@ pub struct RateLimit {
 impl Rule {
     /// Create a new rule
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // Pre-fix this used `.as_millis() as u64`, which
+        // silently truncated the u128 millis on overflow. Realistic
+        // dates (anything within u64::MAX milliseconds since UNIX
+        // epoch — year ~584,554,051) are unaffected, but `as`
+        // casts on durations are a footgun worth eliminating.
+        // `try_from` saturates on overflow so a far-future clock
+        // surfaces as a max-timestamp instead of wrapping to a
+        // small value that would invert "newer-rule-wins"
+        // comparisons.
+        let now = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         Self {
             id: id.into(),
@@ -1183,18 +1259,38 @@ impl RuleEngine {
     // Record an execution
     fn record_execution(&mut self, rule_id: &str) {
         let now = Instant::now();
+
+        // Pre-fix this incremented `execution_count`
+        // unconditionally, even for rules without a rate_limit.
+        // A rule that toggled rate-limited → unlimited carried
+        // its old count forever; on toggle BACK to rate-limited
+        // with the same window, the count was already at-or-
+        // above max and every execution was immediately blocked
+        // — silent stuck-rule on hot reload.
+        //
+        // Fix: only touch rate-limit-specific state when the
+        // current rule actually has a rate_limit. The
+        // last_execution timestamp is independently used by
+        // cooldown-based gating, so it advances regardless.
+        let has_rate_limit = self
+            .rules_by_id
+            .get(rule_id)
+            .and_then(|r| r.rate_limit.as_ref())
+            .is_some();
+
         let state = self.execution_state.entry(rule_id.to_string()).or_default();
-
         state.last_execution = Some(now);
-        state.execution_count += 1;
 
-        // Reset window if needed
-        if let Some(rule) = self.rules_by_id.get(rule_id) {
-            if let Some(ref limit) = rule.rate_limit {
-                let window_duration = Duration::from_secs(limit.window_secs as u64);
-                if now.duration_since(state.window_start) >= window_duration {
-                    state.window_start = now;
-                    state.execution_count = 1;
+        if has_rate_limit {
+            state.execution_count += 1;
+            // Reset window if needed.
+            if let Some(rule) = self.rules_by_id.get(rule_id) {
+                if let Some(ref limit) = rule.rate_limit {
+                    let window_duration = Duration::from_secs(limit.window_secs as u64);
+                    if now.duration_since(state.window_start) >= window_duration {
+                        state.window_start = now;
+                        state.execution_count = 1;
+                    }
                 }
             }
         }
@@ -1231,10 +1327,15 @@ pub struct RuleSet {
 impl RuleSet {
     /// Create a new rule set
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // See Rule::new for rationale on saturating
+        // u128 → u64 instead of `as u64`.
+        let now = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         Self {
             id: id.into(),
@@ -1295,6 +1396,84 @@ mod tests {
         assert!(
             CompareOp::In.evaluate(&serde_json::json!("a"), &serde_json::json!(["a", "b", "c"]))
         );
+    }
+
+    /// Pre-fix, both sides were reduced to f64 via
+    /// `as_f64()`. Two adjacent u64 values above 2^53 round to
+    /// the same f64 — `9_007_199_254_740_992` and
+    /// `9_007_199_254_740_993` both become `9007199254740992.0`,
+    /// so `Gt` incorrectly returned false (they compared Equal).
+    /// Real-world impact: rules guarding ns timestamps or byte
+    /// counts silently failed to fire.
+    #[test]
+    fn gt_compares_large_u64_without_loss_of_precision() {
+        // 2^53 + 1: just past the f64 mantissa boundary.
+        let small = serde_json::json!(9_007_199_254_740_992u64);
+        let big = serde_json::json!(9_007_199_254_740_993u64);
+
+        // Sanity — pre-fix this would have failed (both round to
+        // the same f64).
+        assert!(
+            CompareOp::Gt.evaluate(&big, &small),
+            "Gt must distinguish u64 values one apart at the f64 boundary"
+        );
+        assert!(
+            !CompareOp::Gt.evaluate(&small, &big),
+            "Gt must NOT report the smaller value as greater"
+        );
+        assert!(
+            CompareOp::Lt.evaluate(&small, &big),
+            "Lt must distinguish at the f64 boundary"
+        );
+        assert!(
+            !CompareOp::Eq.evaluate(&small, &big),
+            "Eq must NOT collapse two distinct u64 values; \
+             pre-fix these compared equal because both round to the same f64"
+        );
+    }
+
+    /// Very large u64 values (> i64::MAX) must still
+    /// compare correctly even though as_i64() returns None for
+    /// them.
+    #[test]
+    fn gt_compares_u64_values_above_i64_max() {
+        let a = serde_json::json!(u64::MAX);
+        let b = serde_json::json!(u64::MAX - 1);
+        assert!(CompareOp::Gt.evaluate(&a, &b));
+        assert!(CompareOp::Lt.evaluate(&b, &a));
+    }
+
+    /// Comparing a negative i64 against a u64 above
+    /// i64::MAX must always say "negative is less". Pre-fix the
+    /// f64 fallback could happen to give a numerically correct
+    /// answer here (negatives < positives in f64), but only by
+    /// accident — the helper's contract is now explicit.
+    #[test]
+    fn compares_negative_i64_against_huge_u64_correctly() {
+        let neg = serde_json::json!(-1i64);
+        let huge = serde_json::json!(u64::MAX);
+        assert!(CompareOp::Lt.evaluate(&neg, &huge));
+        assert!(CompareOp::Gt.evaluate(&huge, &neg));
+    }
+
+    /// Floats still work via the f64 fallback.
+    #[test]
+    fn float_comparisons_still_work_via_fallback() {
+        let a = serde_json::json!(1.5);
+        let b = serde_json::json!(2.5);
+        assert!(CompareOp::Lt.evaluate(&a, &b));
+        assert!(CompareOp::Gt.evaluate(&b, &a));
+    }
+
+    /// Integer-vs-float comparison falls back
+    /// to f64 (with the documented loss of precision for huge
+    /// integers, which is unavoidable when one side is a float).
+    #[test]
+    fn integer_vs_float_uses_f64_fallback() {
+        let i = serde_json::json!(5i64);
+        let f = serde_json::json!(4.5);
+        assert!(CompareOp::Gt.evaluate(&i, &f));
+        assert!(CompareOp::Lt.evaluate(&f, &i));
     }
 
     #[test]

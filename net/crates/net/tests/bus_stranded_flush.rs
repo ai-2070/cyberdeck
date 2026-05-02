@@ -1,7 +1,7 @@
 //! Regression coverage for `bus::remove_shard_internal`'s stranded-
-//! ring-buffer flush — BUG #153 (sequence_start collision under
-//! JetStream dedup) and BUG #154 (premature finalize-vs-pending-events
-//! race).
+//! ring-buffer flush — covering the sequence_start collision under
+//! JetStream dedup and the premature finalize-vs-pending-events
+//! race.
 //!
 //! Both bugs land at the same code path: when a shard is being torn
 //! down (via `manual_scale_down` or the scaling-monitor's auto path),
@@ -9,7 +9,7 @@
 //! stranded, sequence_start)` to flush whatever events were left in
 //! the ring buffer at unmap time.
 //!
-//! - **#153.** Pre-fix `sequence_start` was hardcoded to `0`. Every
+//! - **Sequence collision.** Pre-fix `sequence_start` was hardcoded to `0`. Every
 //!   `BatchWorker` for the same shard ALSO starts at sequence 0, so
 //!   the stranded batch's per-event msg-ids
 //!   (`{nonce}:{shard_id}:0:{i}`) collided with the worker's very
@@ -19,7 +19,7 @@
 //!   after awaiting its `JoinHandle` and uses that as the
 //!   `sequence_start`.
 //!
-//! - **#154.** Pre-fix `remove_shard_internal` dropped the
+//! - **Finalize race.** Pre-fix `remove_shard_internal` dropped the
 //!   `BatchWorker`'s `JoinHandle` without await, so a finalize
 //!   triggered while the worker still had `current_batch` events or
 //!   in-flight mpsc-channel events would race the worker's own
@@ -51,7 +51,7 @@ struct BatchObservation {
     shard_id: u16,
     sequence_start: u64,
     len: usize,
-    /// Stamped by the bus from its loaded `producer_nonce` (BUG #56).
+    /// Stamped by the bus from its loaded `producer_nonce`.
     /// Recorded so tests can pin that the stranded-flush path uses
     /// the same nonce as the worker batches.
     process_nonce: u64,
@@ -149,7 +149,7 @@ fn config(num_shards: u16) -> EventBusConfig {
         .unwrap()
 }
 
-/// Pin BUG #153: the stranded-flush batch's `sequence_start` MUST
+/// Pin the stranded-flush batch's `sequence_start` MUST
 /// be strictly past every `(shard_id, sequence_start, i)` msg-id
 /// the worker emitted. Pre-fix it was hardcoded to 0, colliding
 /// with the worker's very first batch.
@@ -190,7 +190,7 @@ async fn stranded_flush_does_not_collide_with_worker_msg_ids() {
         sorted.len(),
         ids.len(),
         "duplicate (shard, sequence_start, i) msg-id tuples observed — \
-         stranded-flush collided with worker batch (BUG #153). \
+         stranded-flush collided with worker batch. \
          Total batches: {}, total msg-ids: {}, unique: {}",
         batches.lock().len(),
         ids.len(),
@@ -232,7 +232,7 @@ async fn at_most_one_batch_per_shard_uses_sequence_start_zero() {
             *count <= 1,
             "shard {} produced {} batches with sequence_start=0 — \
              stranded-flush re-used the worker's first-batch sequence, \
-             colliding under JetStream dedup (BUG #153). \
+             colliding under JetStream dedup. \
              Recorded batches: {:?}",
             shard_id,
             count,
@@ -241,7 +241,7 @@ async fn at_most_one_batch_per_shard_uses_sequence_start_zero() {
     }
 }
 
-/// Pin BUG #154: events still in the BatchWorker's mpsc channel or
+/// Pin: events still in the BatchWorker's mpsc channel or
 /// `current_batch` at the moment `remove_shard_internal` is invoked
 /// must reach the adapter — they must NOT be silently dropped or
 /// race the stranded-flush.
@@ -284,11 +284,11 @@ async fn events_in_flight_at_finalize_reach_adapter() {
         total_seen, N as usize,
         "expected exactly {N} events delivered to adapter; got {total_seen}. \
          Events lost between BatchWorker pending state and stranded-flush \
-         (BUG #154 race window)",
+         (race window)",
     );
 
-    // No duplicates either — the same msg-id collision logic from
-    // BUG #153 applies if the worker's pending batch and the
+    // No duplicates either — the same msg-id collision logic
+    // applies if the worker's pending batch and the
     // stranded batch raced through dedup.
     let ids = msg_ids.lock().clone();
     let mut sorted = ids.clone();
@@ -298,7 +298,7 @@ async fn events_in_flight_at_finalize_reach_adapter() {
         sorted.len(),
         ids.len(),
         "duplicate msg-id tuples observed during in-flight finalize — \
-         BatchWorker's pending batch raced with stranded-flush (BUG #153 + #154)",
+         BatchWorker's pending batch raced with stranded-flush",
     );
 }
 
@@ -342,7 +342,7 @@ impl Adapter for SlowRecordingAdapter {
     }
 }
 
-/// Pin BUG #56 + BUG #153 interaction: when the bus is configured
+/// Pin the producer-nonce + sequence-start interaction: when the bus is configured
 /// with a persistent `producer_nonce_path`, the stranded-flush
 /// batch (constructed in `remove_shard_internal`) MUST stamp the
 /// same `process_nonce` as the worker's own batches. JetStream's
@@ -356,8 +356,8 @@ impl Adapter for SlowRecordingAdapter {
 /// per-process fallback `batch_process_nonce()`) would silently
 /// regress this for buses configured with a persistent path.
 ///
-/// We use the same `SlowRecordingAdapter` pattern from the BUG
-/// #153 test below to actually exercise the stranded-flush path
+/// We use the same `SlowRecordingAdapter` pattern from the
+/// stranded-flush test below to actually exercise the stranded-flush path
 /// — without back-pressure on the worker pipeline `flush()`
 /// drains the ring buffer cleanly and `remove_shard_internal`'s
 /// `if !stranded.is_empty()` block doesn't run.
@@ -430,7 +430,7 @@ async fn stranded_flush_uses_bus_producer_nonce() {
     let _ = std::fs::remove_file(&nonce_path);
 }
 
-/// Pin BUG #153 + #154 directly by *forcing* the stranded-flush path
+/// Pin both fixes directly by *forcing* the stranded-flush path
 /// to run with a non-empty `stranded` Vec. The slow adapter backs
 /// up the BatchWorker's mpsc channel, which backs up the drain
 /// worker, which leaves events sitting in the ring buffer at the
@@ -493,8 +493,8 @@ async fn stranded_flush_with_real_stranded_events_uses_post_worker_sequence() {
     assert_eq!(
         sorted.len(),
         ids.len(),
-        "duplicate msg-id tuples observed in stranded-flush path \
-         (BUG #153). Total batches: {}, total msg-ids: {}, unique: {}",
+        "duplicate msg-id tuples observed in stranded-flush path. \
+         Total batches: {}, total msg-ids: {}, unique: {}",
         batches.lock().len(),
         ids.len(),
         sorted.len(),

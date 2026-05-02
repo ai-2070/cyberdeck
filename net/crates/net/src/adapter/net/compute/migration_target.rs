@@ -392,14 +392,35 @@ impl MigrationTargetHandler {
     }
 
     /// Drain pending events in sequence order, delivering to the daemon.
+    ///
+    /// On a mid-batch delivery failure, advances `replayed_through` past
+    /// the events that *did* land and re-inserts the undelivered tail back
+    /// into `pending_events` so a subsequent `drain_pending` (triggered
+    /// by the next `replay_events` / `buffer_event` / `activate`) resumes
+    /// at the failure point.
+    ///
+    /// Pre-fix, this returned `?` on the first delivery error
+    /// without updating `replayed_through` and without restoring the
+    /// remaining events. Every event in `to_replay` had already been
+    /// removed from `pending_events` upstream, so on retry the
+    /// undelivered tail was simply gone — silent, permanent desync
+    /// between source and target for any non-empty replay batch where
+    /// one delivery errored mid-loop.
     fn drain_pending(&self, state: &mut TargetMigrationState) -> Result<(), MigrationError> {
-        // Collect events to replay (contiguous from replayed_through + 1)
+        // Collect events to replay (contiguous from replayed_through + 1).
+        //
+        // Pre-fix `state.replayed_through + 1` and `next_seq
+        // += 1` would panic in debug or wrap to 0 in release at
+        // u64::MAX. Saturating arithmetic clamps at u64::MAX so an
+        // (astronomical) overflow surfaces as "no further events
+        // accepted" rather than silent re-keying.
         let mut to_replay = Vec::new();
-        let mut next_seq = state.replayed_through + 1;
+        let mut next_seq = state.replayed_through.saturating_add(1);
 
         while let Some(event) = state.pending_events.remove(&next_seq) {
             to_replay.push(event);
-            next_seq += 1;
+            // saturating_add: same rationale as above.
+            next_seq = next_seq.saturating_add(1);
         }
 
         // Also drain any events with sequence <= replayed_through (duplicates)
@@ -413,16 +434,36 @@ impl MigrationTargetHandler {
             state.pending_events.remove(&seq);
         }
 
-        // Deliver events to daemon via registry
+        // Deliver events to daemon via registry. Track how many actually
+        // landed; on failure we persist the prefix and restore the tail.
+        let mut delivered = 0usize;
+        let mut failure: Option<MigrationError> = None;
         for event in &to_replay {
-            self.daemon_registry
-                .deliver(state.daemon_origin, event)
-                .map_err(|e| MigrationError::StateFailed(e.to_string()))?;
+            match self.daemon_registry.deliver(state.daemon_origin, event) {
+                Ok(_) => delivered += 1,
+                Err(e) => {
+                    failure = Some(MigrationError::StateFailed(e.to_string()));
+                    break;
+                }
+            }
         }
 
-        if let Some(last) = to_replay.last() {
+        if delivered > 0 {
+            let last = &to_replay[delivered - 1];
             state.replayed_through = last.link.sequence;
             state.target_head = last.link;
+        }
+
+        if let Some(err) = failure {
+            // Restore the undelivered tail so the next drain_pending
+            // call replays from the failure point. Without this, any
+            // event with sequence > the failed one — already removed
+            // upstream — would be lost forever, since the source has
+            // moved on and won't re-send it.
+            for event in to_replay.into_iter().skip(delivered) {
+                state.pending_events.insert(event.link.sequence, event);
+            }
+            return Err(err);
         }
 
         Ok(())
@@ -1039,5 +1080,159 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A daemon whose `process()` fails on event N of M during
+    /// `replay_events` would, pre-fix, lose every event with seq > N
+    /// permanently — `drain_pending` removed all M events from
+    /// `pending_events` upstream of the delivery loop, and the `?`
+    /// early-return on the failure left the undelivered tail in the
+    /// local `to_replay` Vec which then dropped on function exit.
+    /// `replayed_through` was also left at its pre-batch value, so a
+    /// retry replayed the prefix again (re-incrementing the daemon's
+    /// counters) but never reached the failed event again.
+    ///
+    /// Post-fix: a mid-batch failure advances `replayed_through` past
+    /// the events that did land, restores the undelivered tail
+    /// (including the failed event itself) into `pending_events`, and
+    /// returns the error. A subsequent `replay_events` /
+    /// `buffer_event` / `activate` triggers another `drain_pending`
+    /// that picks up exactly where the previous one stopped.
+    #[test]
+    fn drain_pending_restores_undelivered_tail_on_mid_batch_failure() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Daemon that fails on the Nth `process` call (1-indexed).
+        struct FailOnNth {
+            count: Arc<AtomicU64>,
+            fail_at: u64,
+            state: u64,
+        }
+        impl MeshDaemon for FailOnNth {
+            fn name(&self) -> &str {
+                "fail-on-nth"
+            }
+            fn requirements(&self) -> CapabilityFilter {
+                CapabilityFilter::default()
+            }
+            fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+                let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == self.fail_at {
+                    return Err(DaemonError::ProcessFailed("simulated".into()));
+                }
+                self.state += 1;
+                Ok(vec![])
+            }
+            fn snapshot(&self) -> Option<Bytes> {
+                Some(Bytes::from(self.state.to_le_bytes().to_vec()))
+            }
+            fn restore(&mut self, state: Bytes) -> Result<(), DaemonError> {
+                if state.len() != 8 {
+                    return Err(DaemonError::RestoreFailed("bad size".into()));
+                }
+                self.state = u64::from_le_bytes(state[..8].try_into().unwrap());
+                Ok(())
+            }
+        }
+
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+        let snapshot = make_snapshot(&kp, 0, 0);
+        let count = Arc::new(AtomicU64::new(0));
+
+        // Fail on the 3rd process() call — events at seq 1, 2 should
+        // land; seq 3 fails; seq 4, 5 should be retained for retry.
+        let count_for_factory = count.clone();
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                move || {
+                    Box::new(FailOnNth {
+                        count: count_for_factory.clone(),
+                        fail_at: 3,
+                        state: 0,
+                    })
+                },
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        let events = vec![
+            make_event(0xBBBB, 1),
+            make_event(0xBBBB, 2),
+            make_event(0xBBBB, 3),
+            make_event(0xBBBB, 4),
+            make_event(0xBBBB, 5),
+        ];
+
+        // First replay: should fail mid-batch on event 3.
+        let err = handler.replay_events(origin, events).unwrap_err();
+        assert!(
+            err.to_string().contains("simulated"),
+            "expected the simulated process() failure, got: {err}"
+        );
+
+        // Pre-fix this would be 0 (no advance) and events 4, 5 would
+        // be gone. Post-fix: advanced past 1, 2 — the prefix that
+        // actually landed.
+        assert_eq!(
+            handler.replayed_through(origin),
+            Some(2),
+            "replayed_through must advance past the events that did \
+             land before the failure"
+        );
+
+        // Confirm 3 process() calls happened (1 OK, 2 OK, 3 fail).
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+
+        // Second drain — issue an empty `replay_events` to retrigger
+        // drain_pending. Pre-fix this would be a no-op because
+        // pending_events was empty; post-fix events 3, 4, 5 are
+        // still there and replay resumes from seq 3.
+        //
+        // Reset the failure counter so the daemon now succeeds on
+        // every call. (This simulates the operator clearing whatever
+        // transient condition caused the original failure.)
+        count.store(100, Ordering::SeqCst); // > fail_at, never matches
+
+        let replayed = handler.replay_events(origin, vec![]).unwrap();
+        assert_eq!(
+            replayed, 5,
+            "second drain must replay seq 3, 4, 5 — pre-fix these were \
+             permanently lost when the first batch errored"
+        );
+        assert_eq!(handler.replayed_through(origin), Some(5));
+
+        // Second drain must NOT redeliver the prefix that already
+        // landed on the first drain. The daemon's `process()` call
+        // count tracks every entry; with the prefix-skip invariant
+        // the total should be:
+        //   first drain  : 1, 2 (OK), 3 (fail)        →  3 calls
+        //   second drain : 3, 4, 5 (OK)               →  3 calls
+        //   total                                     →  6 calls
+        // If the prefix were redelivered, we'd see 8 (1, 2 again
+        // before 3, 4, 5). The pre-`count.store(100, …)` value of
+        // 3 is the count after first drain; the post-second-drain
+        // value should advance by exactly 3, not 5.
+        //
+        // The store-to-100 is needed so the daemon stops failing
+        // — the assertion compares `count - 100` (what advanced
+        // during the second drain) against the expected 3.
+        let total_after_second = count.load(Ordering::SeqCst);
+        let second_drain_calls = total_after_second.saturating_sub(100);
+        assert_eq!(
+            second_drain_calls, 3,
+            "second drain processed {second_drain_calls} events; expected 3 \
+             (seq 3, 4, 5). Anything more means the already-delivered \
+             prefix (seq 1, 2) was redelivered — duplicate-delivery hazard"
+        );
     }
 }

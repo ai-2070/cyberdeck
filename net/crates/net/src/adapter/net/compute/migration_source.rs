@@ -69,16 +69,51 @@ impl MigrationSourceHandler {
         target_node: u64,
         orchestrator_node: u64,
     ) -> Result<StateSnapshot, MigrationError> {
-        // Atomic check-and-reserve via entry() to prevent TOCTOU races
-        let entry = match self.migrations.entry(daemon_origin) {
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                return Err(MigrationError::AlreadyMigrating(daemon_origin));
-            }
-            dashmap::mapref::entry::Entry::Vacant(entry) => entry,
-        };
+        // Pre-fix, the Vacant entry write-guard from
+        // `migrations.entry(daemon_origin)` was held across
+        // `daemon_registry.contains` and `daemon_registry.snapshot`,
+        // both of which take an inner `Mutex<DaemonHost>`.
+        // Combined with another caller that takes the daemon-host
+        // mutex first then touches the same dashmap shard,
+        // deadlock risk emerges. The snapshot itself runs
+        // user-supplied `MeshDaemon::snapshot()` code, blocking
+        // co-hashed migrations on the held shard guard for the
+        // duration.
+        //
+        // Post-fix: do the read-only contains check + the
+        // expensive snapshot OUTSIDE any dashmap entry guard,
+        // then `entry()` again at the very end to atomically
+        // insert. The trade-off is a wasted snapshot if two
+        // callers race start_snapshot for the same origin (the
+        // second one's `entry()` finds Occupied and discards its
+        // snapshot). That's far cheaper than a deadlock — and
+        // the duplicate snapshot work is bounded to the racing
+        // pair, not all co-hashed origins.
+        //
+        // Side-effect note: `daemon_registry.snapshot(...)` calls
+        // user-supplied `MeshDaemon::snapshot()` code. Two racing
+        // `start_snapshot` calls therefore produce two snapshot
+        // side-effects (counter bumps, deferred I/O, etc.) where
+        // the prior single-flight design produced one. This is
+        // fine for any *idempotent* `MeshDaemon::snapshot()` —
+        // which is the documented contract — but a non-idempotent
+        // implementation must be aware that the second call's
+        // result is discarded *after* it ran. If your daemon's
+        // snapshot has visible side-effects beyond serializing
+        // state, gate them behind your own single-flight (e.g. a
+        // `tokio::sync::Mutex`) inside `MeshDaemon::snapshot`
+        // rather than relying on this layer to deduplicate.
 
         if !self.daemon_registry.contains(daemon_origin) {
             return Err(MigrationError::DaemonNotFound(daemon_origin));
+        }
+
+        // Cheap pre-check on the migrations map without holding
+        // a guard across the snapshot. Avoids the wasted snapshot
+        // in the common case where another caller already got
+        // there first.
+        if self.migrations.contains_key(&daemon_origin) {
+            return Err(MigrationError::AlreadyMigrating(daemon_origin));
         }
 
         let snapshot = self
@@ -89,6 +124,15 @@ impl MigrationSourceHandler {
                 MigrationError::StateFailed("daemon is stateless or snapshot failed".into())
             })?;
 
+        // Atomic insert. If another caller raced past the
+        // pre-check above and inserted first, our snapshot is
+        // wasted but we surface the same AlreadyMigrating error.
+        let entry = match self.migrations.entry(daemon_origin) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(MigrationError::AlreadyMigrating(daemon_origin));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => entry,
+        };
         entry.insert(Mutex::new(SourceMigrationState {
             daemon_origin,
             target_node,

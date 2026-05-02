@@ -2542,7 +2542,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #110: replayed/expired announcements must not be admitted
+    // replayed/expired announcements must not be admitted
     // ========================================================================
 
     /// An already-expired announcement (origin timestamp older than
@@ -2569,7 +2569,7 @@ mod tests {
         assert_eq!(
             index.stats().node_count,
             0,
-            "expired announcement must not be indexed (BUG #110)",
+            "expired announcement must not be indexed",
         );
         assert!(index.get(1).is_none());
     }
@@ -2599,7 +2599,7 @@ mod tests {
         index.index(ann);
 
         // Access the IndexedNode via private `nodes` field — `get()`
-        // returns only the CapabilitySet, but BUG #110's clamp lives
+        // returns only the CapabilitySet, but the clamp lives
         // on `IndexedNode::ttl`.
         let stored_ttl = index
             .nodes
@@ -2627,7 +2627,7 @@ mod tests {
     /// `index()` exempts them so the documented "announce-and-
     /// forget" diagnostic flow keeps working — guarded by
     /// `gc_evicts_entries_with_ttl_zero` already, but pinned here
-    /// alongside the BUG #110 cluster so a future tightening of
+    /// alongside the replay-rejection cluster so a future tightening of
     /// the rejection rule can't silently break zero-TTL.
     #[test]
     fn index_admits_zero_ttl_announcement_even_though_is_expired_returns_true() {

@@ -596,7 +596,7 @@ mod tests {
     fn test_regression_causal_link_wire_size_is_28() {
         // Regression: original repr(C) with field order u32, u64,
         // u64, u32 padded to 32 bytes; an earlier fix reordered to
-        // u32, u32, u64, u64 (24 bytes). BUG #130's fix widens
+        // u32, u32, u64, u64 (24 bytes). The bloom-widening fix widens
         // `horizon_encoded` from u32 to u64 to give the bloom
         // filter enough bits to be useful past ~6 origins, taking
         // the wire size to 28 bytes (4 + 8 + 8 + 8). Pin the new

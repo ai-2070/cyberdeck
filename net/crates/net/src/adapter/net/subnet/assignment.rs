@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use super::error::SubnetError;
 use super::id::SubnetId;
 use crate::adapter::net::behavior::capability::CapabilitySet;
 
@@ -68,15 +69,26 @@ impl SubnetPolicy {
     /// Add a rule to the policy.
     ///
     /// # Panics
-    /// Panics if the rule's level is >= 4.
-    pub fn add_rule(mut self, rule: SubnetRule) -> Self {
-        assert!(
-            rule.level < 4,
-            "subnet rule level must be 0-3, got {}",
-            rule.level
-        );
+    /// Panics if the rule's level is >= 4. For untrusted input
+    /// (config files, FFI, JSON) prefer [`Self::try_add_rule`],
+    /// which returns a [`SubnetError`] instead of panicking.
+    pub fn add_rule(self, rule: SubnetRule) -> Self {
+        self.try_add_rule(rule)
+            .expect("SubnetPolicy::add_rule: invalid rule (use try_add_rule for fallible)")
+    }
+
+    /// Fallible variant of [`Self::add_rule`].
+    ///
+    /// Pre-existing `add_rule` panics on `rule.level >= 4`.
+    /// Subnet policies typically come from config / FFI / JSON and
+    /// a malformed entry should surface as a recoverable error
+    /// rather than crashing the daemon loader.
+    pub fn try_add_rule(mut self, rule: SubnetRule) -> Result<Self, SubnetError> {
+        if rule.level >= 4 {
+            return Err(SubnetError::LevelOutOfRange { got: rule.level });
+        }
         self.rules.push(rule);
-        self
+        Ok(self)
     }
 
     /// Assign a subnet ID to a node based on its capability tags.
@@ -120,14 +132,28 @@ impl SubnetRule {
     /// Map a tag value to a level value.
     ///
     /// # Panics
-    /// Panics if `level_value` is 0 (reserved for "unmatched / no restriction").
-    pub fn map(mut self, tag_value: impl Into<String>, level_value: u8) -> Self {
-        assert!(
-            level_value != 0,
-            "level_value 0 is reserved for unmatched levels"
-        );
+    /// Panics if `level_value` is 0 (reserved for "unmatched /
+    /// no restriction"). For untrusted input prefer
+    /// [`Self::try_map`].
+    pub fn map(self, tag_value: impl Into<String>, level_value: u8) -> Self {
+        self.try_map(tag_value, level_value)
+            .expect("SubnetRule::map: level_value 0 is reserved (use try_map for fallible)")
+    }
+
+    /// Fallible variant of [`Self::map`].
+    ///
+    /// Pre-existing `map` panics on `level_value == 0`.
+    /// Returns [`SubnetError::LevelValueReserved`] instead.
+    pub fn try_map(
+        mut self,
+        tag_value: impl Into<String>,
+        level_value: u8,
+    ) -> Result<Self, SubnetError> {
+        if level_value == 0 {
+            return Err(SubnetError::LevelValueReserved);
+        }
         self.values.insert(tag_value.into(), level_value);
-        self
+        Ok(self)
     }
 }
 
@@ -360,5 +386,52 @@ mod tests {
             "swapping tag order swaps which one wins — first-wins is \
              insensitive to values-map ordering, only to tag iteration order",
         );
+    }
+
+    /// Out-of-range `level` must surface as `Err(...)`,
+    /// not panic. Subnet policies typically come from config /
+    /// FFI / JSON; a malformed entry must not crash the daemon
+    /// loader.
+    #[test]
+    fn try_add_rule_rejects_level_out_of_range() {
+        let policy = SubnetPolicy::new();
+        let err = policy
+            .try_add_rule(SubnetRule::new("region:", 4).map("us", 1))
+            .unwrap_err();
+        assert!(
+            matches!(err, SubnetError::LevelOutOfRange { got: 4 }),
+            "expected LevelOutOfRange{{got: 4}}, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn try_add_rule_accepts_max_level() {
+        let policy = SubnetPolicy::new();
+        // Level 3 is the highest valid level (0..=3).
+        policy
+            .try_add_rule(SubnetRule::new("level3:", 3).map("x", 1))
+            .expect("level=3 must be accepted (boundary)");
+    }
+
+    /// Zero `level_value` must surface as `Err(...)`,
+    /// not panic.
+    #[test]
+    fn try_map_rejects_reserved_zero() {
+        let rule = SubnetRule::new("region:", 0);
+        let err = rule.try_map("us", 0).unwrap_err();
+        assert!(
+            matches!(err, SubnetError::LevelValueReserved),
+            "expected LevelValueReserved, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn try_map_accepts_one() {
+        // 1 is the lowest non-reserved level value.
+        SubnetRule::new("region:", 0)
+            .try_map("us", 1)
+            .expect("level_value=1 must be accepted (boundary)");
     }
 }

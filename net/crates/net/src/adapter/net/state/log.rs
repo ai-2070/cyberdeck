@@ -504,7 +504,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BUG #129: prune_through(seq) on empty / out-of-range logs must not
+    // prune_through(seq) on empty / out-of-range logs must not
     // desync snapshot_seq from base_link.sequence
     // ========================================================================
 
@@ -564,7 +564,7 @@ mod tests {
     }
 
     /// A successful prune still advances `snapshot_seq` — pins the
-    /// happy path so the BUG #129 gate doesn't accidentally lock
+    /// happy path so the prune-no-op gate doesn't accidentally lock
     /// out legitimate pruning.
     #[test]
     fn prune_through_advances_snapshot_seq_when_events_pruned() {

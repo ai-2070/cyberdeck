@@ -1,5 +1,5 @@
-//! Producer-consumer contract test for the Redis `dedup_id` field
-//! (BUG #57). Verifies the consumer-side helper
+//! Producer-consumer contract test for the Redis `dedup_id` field.
+//! Verifies the consumer-side helper
 //! [`net_sdk::RedisStreamDedup`] correctly filters duplicates
 //! whose `dedup_id` strings exactly match the format the Redis
 //! adapter writes:
@@ -24,7 +24,7 @@ fn dedup_id(producer_nonce: u64, shard_id: u16, sequence_start: u64, i: usize) -
     format!("{producer_nonce:x}:{shard_id}:{sequence_start}:{i}")
 }
 
-/// Pin the canonical BUG #57 scenario: a producer's MULTI/EXEC
+/// Pin the canonical scenario: a producer's MULTI/EXEC
 /// timed out client-side but the EXEC ran server-side, the retry
 /// then issued another EXEC, and the Redis stream now carries
 /// two copies of the same logical batch. Each copy has distinct
@@ -64,7 +64,7 @@ fn helper_filters_producer_retry_duplicates() {
 /// pre-crash; the consumer helper filters the post-restart copy.
 ///
 /// (We model "same persistent nonce" by reusing the same u64; the
-/// BUG #56 producer-side fix is what makes that hold in
+/// producer-side fix is what makes that hold in
 /// production.)
 #[test]
 fn helper_filters_cross_restart_duplicates_via_stable_nonce() {

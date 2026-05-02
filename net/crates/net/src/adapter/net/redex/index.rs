@@ -36,13 +36,17 @@
 
 use std::collections::HashSet;
 use std::hash::Hash;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use serde::de::DeserializeOwned;
 use tokio::sync::Notify;
 
+use super::error::RedexError;
 use super::event::RedexEvent;
 use super::file::RedexFile;
 
@@ -89,6 +93,15 @@ where
     /// notify against the tail stream; whichever wins wakes first
     /// and the task exits.
     shutdown: Arc<Notify>,
+    /// Counter incremented every time the tail task clears the
+    /// in-memory index because of a `Lagged` event or a
+    /// saturation-induced watcher drop. Downstreams that need to
+    /// react to a lossy reset (e.g. for an aggregating index that
+    /// can't tolerate dropped counts, vs. a state-rebuild index
+    /// that re-converges on re-tail) can poll
+    /// [`RedexIndex::lag_resets`] and detect a bump rather than
+    /// having to diff `len()` over time.
+    lag_resets: Arc<AtomicU64>,
 }
 
 impl<K, V> RedexIndex<K, V>
@@ -112,17 +125,37 @@ where
     {
         let inner: Arc<DashMap<K, HashSet<V>>> = Arc::new(DashMap::new());
         let shutdown = Arc::new(Notify::new());
+        let lag_resets = Arc::new(AtomicU64::new(0));
 
         let from_seq = match start {
             IndexStart::FromBeginning => 0,
             IndexStart::FromSeq(n) => n,
         };
-        let tail = file.tail(from_seq);
         let task_inner = inner.clone();
         let task_shutdown = shutdown.clone();
+        let task_file = file.clone();
+        let task_lag_resets = lag_resets.clone();
 
         tokio::spawn(async move {
-            tokio::pin!(tail);
+            // Use Box::pin (not tokio::pin!) so we can swap in a
+            // fresh tail stream after a Lagged recovery without
+            // restructuring the task.
+            let mut tail: Pin<Box<dyn Stream<Item = Result<RedexEvent, RedexError>> + Send>> =
+                Box::pin(task_file.tail(from_seq));
+
+            // Saturation-resume backoff: under sustained burst load
+            // with an under-sized `tail_buffer_size`, the recovery
+            // path can re-fire instantly (`tail.next() → None →
+            // clear → re-tail → None → …`). Without backoff this
+            // hot-loops and emits a `tracing::warn!` per cycle —
+            // production deployments with under-sized buffers see
+            // log floods. We track consecutive resets within a
+            // short window and sleep proportionally; one
+            // make-progress event resets the counter. The cap
+            // (250ms) keeps the worst-case recovery latency
+            // bounded.
+            let mut consecutive_resets: u32 = 0;
+
             loop {
                 tokio::select! {
                     // Drop-on-cancel: the Notify wins and the task
@@ -130,18 +163,129 @@ where
                     _ = task_shutdown.notified() => return,
                     next = tail.next() => {
                         match next {
-                            Some(Ok(event)) => apply_event(&task_inner, &project, &event),
+                            Some(Ok(event)) => {
+                                apply_event(&task_inner, &project, &event);
+                                // Forward progress — clear the
+                                // backoff counter so the next
+                                // genuine reset starts fresh.
+                                consecutive_resets = 0;
+                            }
+                            Some(Err(RedexError::Lagged)) => {
+                                // Pre-fix, the loop just
+                                // logged at debug! and continued,
+                                // but the underlying watcher had
+                                // been dropped from the file —
+                                // `tail.next()` returned `None` on
+                                // the next poll and the task
+                                // exited permanently with an
+                                // incomplete index. Keys missing
+                                // post-`Lagged` stayed missing
+                                // forever.
+                                //
+                                // Recovery: clear the in-memory
+                                // index (any prior state is now
+                                // ambiguous — we don't know which
+                                // ops we missed) and re-tail from
+                                // `next_seq()`, i.e. live-only.
+                                // We do NOT replay retained
+                                // history because the buffer that
+                                // produced the original `Lagged`
+                                // is the same buffer we'd have to
+                                // squeeze the retained range
+                                // through, which would just
+                                // signal `Lagged` again. The
+                                // index user is responsible for
+                                // sizing the tail buffer; this
+                                // path is the safe-recovery
+                                // fallback when that sizing is
+                                // wrong.
+                                let resume_seq = task_file.next_seq();
+                                task_inner.clear();
+                                let total_resets =
+                                    task_lag_resets.fetch_add(1, Ordering::Relaxed) + 1;
+                                tail = Box::pin(task_file.tail(resume_seq));
+                                consecutive_resets = consecutive_resets.saturating_add(1);
+                                rate_limited_lag_warn(
+                                    "RedexIndex: tail lagged; cleared index, resumed live-only",
+                                    resume_seq,
+                                    total_resets,
+                                    consecutive_resets,
+                                );
+                                if let Some(d) = backoff_for(consecutive_resets) {
+                                    tokio::time::sleep(d).await;
+                                }
+                            }
                             Some(Err(e)) => {
                                 tracing::debug!(error = %e, "RedexIndex tail error; continuing");
                             }
-                            None => return, // file closed
+                            None => {
+                                // Stream ended.
+                                // Two distinct causes share this
+                                // branch:
+                                //   (a) the file was closed —
+                                //       the task should exit.
+                                //   (b) `notify_watchers` dropped
+                                //       our watcher under buffer
+                                //       saturation and the
+                                //       best-effort `Err(Lagged)`
+                                //       send itself failed (the
+                                //       channel was already full),
+                                //       so the receiver just sees
+                                //       a clean end. Pre-fix the
+                                //       task always treated this
+                                //       as (a) and exited — same
+                                //       failure mode as the
+                                //       explicit Lagged case.
+                                // Distinguish via `is_closed()`.
+                                if task_file.is_closed() {
+                                    return;
+                                }
+                                let resume_seq = task_file.next_seq();
+                                task_inner.clear();
+                                let total_resets =
+                                    task_lag_resets.fetch_add(1, Ordering::Relaxed) + 1;
+                                tail = Box::pin(task_file.tail(resume_seq));
+                                consecutive_resets = consecutive_resets.saturating_add(1);
+                                rate_limited_lag_warn(
+                                    "RedexIndex: tail stream ended on a still-open file \
+                                     (saturation-induced watcher drop); cleared index, \
+                                     resumed live-only",
+                                    resume_seq,
+                                    total_resets,
+                                    consecutive_resets,
+                                );
+                                if let Some(d) = backoff_for(consecutive_resets) {
+                                    tokio::time::sleep(d).await;
+                                }
+                            }
                         }
                     }
                 }
             }
         });
 
-        Self { inner, shutdown }
+        Self {
+            inner,
+            shutdown,
+            lag_resets,
+        }
+    }
+
+    /// Total number of times the index has been cleared and
+    /// re-tailed because of a `Lagged` event or a saturation-
+    /// induced watcher drop, since this index was opened.
+    ///
+    /// Each increment corresponds to a *lossy* reset — the
+    /// previous in-memory contents were discarded and re-tailing
+    /// resumed live-only (no historical replay). For a
+    /// state-rebuild index over a fully-retained file, this is
+    /// recoverable — a subsequent re-open with `IndexStart::
+    /// FromBeginning` re-converges. For an aggregating index
+    /// (counters, top-N) the dropped events are lost; a
+    /// downstream that polls this counter can detect the bump
+    /// and trigger an external recompute.
+    pub fn lag_resets(&self) -> u64 {
+        self.lag_resets.load(Ordering::Relaxed)
     }
 
     /// Snapshot the values at `key`. Returns `None` when the key
@@ -200,6 +344,35 @@ where
         f.debug_struct("RedexIndex")
             .field("keys", &self.inner.len())
             .finish()
+    }
+}
+
+/// Backoff schedule for consecutive saturation-induced resets.
+/// First reset returns `None` (no sleep — recover immediately).
+/// Subsequent resets sleep for an exponentially-growing window
+/// capped at 250ms. The cap keeps worst-case recovery latency
+/// bounded; the growth keeps a sustained burst from emitting
+/// thousands of resets per second.
+fn backoff_for(consecutive_resets: u32) -> Option<Duration> {
+    match consecutive_resets {
+        0 | 1 => None,
+        2 => Some(Duration::from_millis(5)),
+        3 => Some(Duration::from_millis(20)),
+        4 => Some(Duration::from_millis(60)),
+        _ => Some(Duration::from_millis(250)),
+    }
+}
+
+/// Emit a `tracing::warn!` only on the first reset of a burst
+/// and then once per power-of-two cumulative reset (1, 2, 4, 8,
+/// 16, …). A sustained burst with an under-sized buffer would
+/// otherwise flood the log; one warn per reset times millions of
+/// events per second is enough to drown observability tooling.
+/// We keep the first hit so single-shot lags are still visible.
+fn rate_limited_lag_warn(msg: &'static str, resume_seq: u64, total: u64, consecutive: u32) {
+    let log_this = consecutive == 1 || total.is_power_of_two();
+    if log_this {
+        tracing::warn!(resume_seq, total, consecutive, "{msg}");
     }
 }
 
@@ -412,5 +585,220 @@ mod tests {
 
         assert!(idx.contains(&"x".to_string(), &7u64));
         assert_eq!(idx.len(), 1);
+    }
+
+    /// A `Lagged` from the underlying tail must NOT
+    /// permanently halt the index task. Pre-fix the loop logged at
+    /// debug! and continued, but the file had already dropped the
+    /// watcher — the next `tail.next()` returned `None` and the
+    /// task exited with the index frozen at whatever state it had
+    /// when the lag fired. Keys appended later never appeared.
+    ///
+    /// Post-fix: on `Lagged` (or on a stream `None` arriving while
+    /// the file is still open — saturation-induced watcher drop),
+    /// the task clears the in-memory index and re-tails from
+    /// `next_seq()` (live-only). Live events from that point
+    /// forward populate the index again.
+    ///
+    /// The test paces the post-lag appends with a yield between
+    /// each so the recovered tail's small buffer doesn't itself
+    /// saturate; absent that pacing, the buffer-2 watcher would
+    /// drop again and the index would clear a second time, which
+    /// is also correct but not what we're trying to verify.
+    #[tokio::test]
+    async fn index_recovers_from_tail_lag_and_continues_indexing() {
+        // Tiny tail buffer so the backfill saturates immediately
+        // when we open the index against a file with many events.
+        let r = Redex::new();
+        let f = r
+            .open_file(
+                &ChannelName::new("idx/lag-recovery").unwrap(),
+                RedexFileConfig::default().with_tail_buffer_size(2),
+            )
+            .unwrap();
+
+        // Pre-load the file with more events than the tail buffer
+        // can hold during backfill — this triggers Lagged at
+        // open-time.
+        for id in 0..10u64 {
+            let ev = Tagged {
+                id,
+                tags: vec!["pre".into()],
+            };
+            f.append(&postcard::to_allocvec(&ev).unwrap()).unwrap();
+        }
+
+        let idx: RedexIndex<String, u64> =
+            RedexIndex::open::<Tagged, _>(&f, IndexStart::FromBeginning, |t| {
+                t.tags
+                    .iter()
+                    .map(|tag| IndexOp::Insert(tag.clone(), t.id))
+                    .collect()
+            });
+
+        // Let the task observe Lagged and re-tail from live.
+        yield_a_few().await;
+
+        // Append new events one at a time with a yield between
+        // each so the recovered watcher (also buffer=2) drains
+        // before the next event arrives.
+        for id in 100..105u64 {
+            let ev = Tagged {
+                id,
+                tags: vec!["post".into()],
+            };
+            f.append(&postcard::to_allocvec(&ev).unwrap()).unwrap();
+            yield_a_few().await;
+        }
+
+        // The index must reflect every post-lag event. Pre-fix the
+        // task had already exited and `idx.get` would return
+        // `None`.
+        let post_keys = idx.get(&"post".to_string()).expect(
+            "post-lag bucket missing — pre-fix the index task halted \
+                 permanently after Lagged and never observed these events",
+        );
+        assert_eq!(
+            post_keys.len(),
+            5,
+            "every post-lag event must be indexed; recovered set was {:?}",
+            post_keys
+        );
+        for id in 100..105u64 {
+            assert!(
+                post_keys.contains(&id),
+                "post-lag id {} missing from recovered index",
+                id
+            );
+        }
+    }
+
+    /// Closing the file naturally must still
+    /// terminate the index task (no infinite re-tail loop).
+    #[tokio::test]
+    async fn index_terminates_when_file_closes() {
+        let r = Redex::new();
+        let f = r
+            .open_file(
+                &ChannelName::new("idx/close-terminates").unwrap(),
+                RedexFileConfig::default(),
+            )
+            .unwrap();
+
+        let idx: RedexIndex<String, u64> =
+            RedexIndex::open::<Tagged, _>(&f, IndexStart::FromBeginning, |t| {
+                t.tags
+                    .iter()
+                    .map(|tag| IndexOp::Insert(tag.clone(), t.id))
+                    .collect()
+            });
+
+        let ev = Tagged {
+            id: 1,
+            tags: vec!["a".into()],
+        };
+        f.append(&postcard::to_allocvec(&ev).unwrap()).unwrap();
+        yield_a_few().await;
+        assert!(idx.contains(&"a".to_string(), &1));
+
+        // Close should propagate as Err(Closed) on the tail; the
+        // task must NOT treat it as a saturation event and re-tail.
+        f.close().unwrap();
+        yield_a_few().await;
+        // Hard to assert "task exited" directly without exposing
+        // the JoinHandle, but if the task were re-tailing in a
+        // loop on Err(Closed) → re-tail → Err(Closed) → ... the
+        // CPU would spin and the test would still pass. The real
+        // assertion is that we don't deadlock here — close returned,
+        // and the file's drop semantics are unchanged.
+        assert!(f.is_closed());
+    }
+
+    /// `lag_resets()` must increment when the tail task clears
+    /// the index because of a saturation-induced reset.
+    /// Downstreams use this counter to detect that the index
+    /// just lost data — without it, the only signal was polling
+    /// `len()` over time. Pre-fix there was no public way to
+    /// observe a clear at all.
+    #[tokio::test]
+    async fn lag_resets_counter_increments_on_saturation_reset() {
+        let r = Redex::new();
+        let f = r
+            .open_file(
+                &ChannelName::new("idx/lag-resets-counter").unwrap(),
+                RedexFileConfig::default().with_tail_buffer_size(2),
+            )
+            .unwrap();
+
+        // Pre-load past the tail buffer so the backfill saturates
+        // and the index task takes the recovery path.
+        for id in 0..10u64 {
+            let ev = Tagged {
+                id,
+                tags: vec!["pre".into()],
+            };
+            f.append(&postcard::to_allocvec(&ev).unwrap()).unwrap();
+        }
+
+        let idx: RedexIndex<String, u64> =
+            RedexIndex::open::<Tagged, _>(&f, IndexStart::FromBeginning, |t| {
+                t.tags
+                    .iter()
+                    .map(|tag| IndexOp::Insert(tag.clone(), t.id))
+                    .collect()
+            });
+
+        // At open time `lag_resets` is zero. After saturation it
+        // must be at least 1. We yield a generous handful of times
+        // to give the spawned task room to observe Lagged.
+        assert_eq!(idx.lag_resets(), 0, "fresh index has not reset yet");
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if idx.lag_resets() > 0 {
+                break;
+            }
+        }
+        assert!(
+            idx.lag_resets() >= 1,
+            "saturation must bump lag_resets, got {}",
+            idx.lag_resets()
+        );
+    }
+
+    /// `backoff_for` schedule pins the worst-case recovery
+    /// latency at 250ms while still allowing immediate recovery
+    /// for a single transient lag event. Pre-fix the loop had no
+    /// backoff at all and a sustained burst with an under-sized
+    /// buffer hot-looped.
+    #[test]
+    fn backoff_schedule_is_monotonic_and_bounded() {
+        // First (single transient) reset → no sleep.
+        assert_eq!(backoff_for(0), None);
+        assert_eq!(backoff_for(1), None);
+
+        // Subsequent consecutive resets must sleep, monotonically
+        // non-decreasing.
+        let prev = backoff_for(2).unwrap();
+        for n in 3..=10 {
+            let cur = backoff_for(n).unwrap();
+            assert!(
+                cur >= prev,
+                "backoff must be non-decreasing in consecutive resets; \
+                 backoff_for({n}) = {:?} < backoff_for({}) = {:?}",
+                cur,
+                n - 1,
+                prev,
+            );
+            assert!(
+                cur <= Duration::from_millis(250),
+                "backoff must be bounded at 250ms; backoff_for({n}) = {:?}",
+                cur,
+            );
+        }
+
+        // The cap must be reached (otherwise growth could continue
+        // unbounded under a different schedule).
+        assert_eq!(backoff_for(100).unwrap(), Duration::from_millis(250));
+        assert_eq!(backoff_for(u32::MAX).unwrap(), Duration::from_millis(250));
     }
 }

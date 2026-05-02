@@ -38,19 +38,30 @@ impl SubnetId {
     /// Levels are packed MSB-first: `&[3, 7]` becomes `0x03_07_00_00`.
     ///
     /// # Panics
-    /// Panics if more than 4 levels are provided.
+    /// Panics if more than 4 levels are provided. For untrusted
+    /// input (config / FFI / JSON) prefer [`Self::try_new`].
     pub fn new(levels: &[u8]) -> Self {
-        assert!(
-            levels.len() <= MAX_DEPTH as usize,
-            "SubnetId supports at most {} levels, got {}",
-            MAX_DEPTH,
-            levels.len()
-        );
+        Self::try_new(levels).expect("SubnetId::new: too many levels (use try_new for fallible)")
+    }
+
+    /// Fallible variant of [`Self::new`].
+    ///
+    /// Pre-existing `new` panics on `levels.len() >
+    /// MAX_DEPTH`. Returns [`super::SubnetError::TooManyLevels`]
+    /// instead so a malformed config doesn't crash the daemon
+    /// loader.
+    pub fn try_new(levels: &[u8]) -> Result<Self, super::SubnetError> {
+        if levels.len() > MAX_DEPTH as usize {
+            return Err(super::SubnetError::TooManyLevels {
+                got: levels.len(),
+                max: MAX_DEPTH,
+            });
+        }
         let mut val = 0u32;
         for (i, &level) in levels.iter().enumerate() {
             val |= (level as u32) << (24 - i * 8);
         }
-        Self(val)
+        Ok(Self(val))
     }
 
     /// Create from raw u32 value.
@@ -284,5 +295,32 @@ mod tests {
         assert_eq!(SubnetId::mask_for_depth(2), 0xFFFF0000);
         assert_eq!(SubnetId::mask_for_depth(3), 0xFFFFFF00);
         assert_eq!(SubnetId::mask_for_depth(4), 0xFFFFFFFF);
+    }
+
+    /// Too many levels must surface as `Err(...)`, not
+    /// panic. SubnetId values typically come from config / FFI /
+    /// JSON; a malformed entry must not crash the daemon loader.
+    #[test]
+    fn try_new_rejects_too_many_levels() {
+        use super::super::error::SubnetError;
+        let err = SubnetId::try_new(&[1, 2, 3, 4, 5]).unwrap_err();
+        assert!(
+            matches!(err, SubnetError::TooManyLevels { got: 5, max: 4 }),
+            "expected TooManyLevels{{got: 5, max: 4}}, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn try_new_accepts_max_depth() {
+        // Boundary: exactly 4 levels must succeed.
+        let id = SubnetId::try_new(&[1, 2, 3, 4]).expect("4 levels must be accepted (boundary)");
+        assert_eq!(id, SubnetId::new(&[1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn try_new_accepts_empty() {
+        let id = SubnetId::try_new(&[]).expect("0 levels (GLOBAL) must be accepted");
+        assert_eq!(id, SubnetId::GLOBAL);
     }
 }

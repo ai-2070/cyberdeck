@@ -42,6 +42,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct TimestampGenerator {
     /// quanta clock (TSC-based after calibration).
     clock: quanta::Clock,
+    /// Raw TSC value sampled at construction. All `next()` calls
+    /// compute their nanosecond offset relative to this baseline,
+    /// so the returned values are "ns since this generator was
+    /// created" rather than the unspecified "ns since the
+    /// quanta::Clock's internal calibration".
+    ///
+    /// Pre-fix the next() call did
+    /// `clock.delta_as_nanos(0, raw)`. quanta's calibration is
+    /// per-Clock and the "0" baseline doesn't correspond to any
+    /// meaningful real-world time — the returned ns counts were
+    /// in the order of system uptime, not "since this generator".
+    /// Two generators created at different times produced
+    /// timestamps with different effective offsets even on the
+    /// same physical TSC, breaking any consumer reasoning about
+    /// "approximately when did this event happen relative to
+    /// generator-creation".
+    baseline_raw: u64,
     /// Last generated timestamp (for monotonicity).
     last: AtomicU64,
 }
@@ -52,8 +69,11 @@ impl TimestampGenerator {
     /// This performs a one-time calibration against the system clock.
     /// Subsequent timestamp reads use TSC directly.
     pub fn new() -> Self {
+        let clock = quanta::Clock::new();
+        let baseline_raw = clock.raw();
         Self {
-            clock: quanta::Clock::new(),
+            clock,
+            baseline_raw,
             last: AtomicU64::new(0),
         }
     }
@@ -61,8 +81,7 @@ impl TimestampGenerator {
     /// Generate the next timestamp.
     ///
     /// Returns a strictly monotonically increasing value in
-    /// **nanoseconds** since this generator's calibration baseline
-    /// (the moment the underlying `quanta::Clock` was created). This
+    /// **nanoseconds since this generator was constructed**. This
     /// operation is lock-free and does not invoke any syscalls.
     ///
     /// Previously returned the raw TSC tick count. The docstring
@@ -80,9 +99,9 @@ impl TimestampGenerator {
     #[inline(always)]
     pub fn next(&self) -> u64 {
         // Read TSC (no syscall) and convert to nanoseconds against
-        // the clock's calibration baseline.
+        // the construction-time baseline.
         let raw = self.clock.raw();
-        let now = self.clock.delta_as_nanos(0, raw);
+        let now = self.clock.delta_as_nanos(self.baseline_raw, raw);
 
         // Ensure strict monotonicity via CAS loop
         loop {
@@ -90,11 +109,27 @@ impl TimestampGenerator {
 
             // Guard against u64::MAX exhaustion: saturating_add(1) at MAX
             // would return MAX again, breaking strict monotonicity.
+            //
+            // Pre-fix, at `last == u64::MAX - 1` we'd return
+            // `u64::MAX` (via `.max()` clamp) and the NEXT call
+            // would panic on `checked_add(1)`. That gap leaves the
+            // generator briefly stalled at MAX before failure —
+            // not a monotonicity violation, but the caller sees a
+            // "value progression" that's actually clamped. Panic
+            // preemptively when the result would be u64::MAX so
+            // the failure mode is one consistent panic, not
+            // "return MAX once then panic on retry."
             let next = match last.checked_add(1) {
                 Some(inc) => inc,
                 None => panic!("TimestampGenerator: timestamp space exhausted (u64::MAX)"),
             };
             let ts = now.max(next);
+            if ts == u64::MAX {
+                panic!(
+                    "TimestampGenerator: timestamp space exhausted (would return u64::MAX); \
+                     last={last}, now={now}",
+                );
+            }
 
             match self
                 .last
@@ -362,6 +397,29 @@ mod tests {
             "delta over a 50ms sleep was {delta} — outside the {ns_lo}..={ns_hi} \
              ns window. Most likely the timestamp is in raw TSC ticks again \
              (would be ~150_000_000 on a 3 GHz core)."
+        );
+    }
+
+    /// A fresh generator's first `next()` value must be
+    /// small (close to "ns since this generator was created"),
+    /// not "ns since system uptime started" or some other
+    /// arbitrary baseline. Pre-fix the baseline was `0` against
+    /// the quanta::Clock's internal calibration, so on a system
+    /// that had been up for hours the first `next()` returned
+    /// many trillion nanoseconds.
+    ///
+    /// We assert the first `next()` is below ~10ms in nanoseconds,
+    /// which is plenty of slack for construction overhead but
+    /// nowhere near "ns since boot."
+    #[test]
+    fn next_first_call_is_close_to_zero() {
+        let ts_gen = TimestampGenerator::new();
+        let first = ts_gen.next();
+        let ten_ms_ns = 10_000_000u64;
+        assert!(
+            first < ten_ms_ns,
+            "first next() returned {first} ns; expected < {ten_ms_ns} ns. \
+             Pre-fix this would be ~uptime in ns."
         );
     }
 }

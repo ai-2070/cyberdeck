@@ -1535,7 +1535,7 @@ mod tests {
         assert_eq!(orch.status(origin), Some(MigrationPhase::Transfer));
     }
 
-    /// Regression for BUG #104: pre-fix the local-source path called
+    /// Regression: pre-fix the local-source path called
     /// `daemon_registry.snapshot()` directly and never invoked
     /// `MigrationSourceHandler::start_snapshot`. The source-side
     /// handler had no record of the migration; `is_migrating(origin)`
@@ -1564,11 +1564,11 @@ mod tests {
         // Post-condition: BOTH the orchestrator and the source
         // handler have records of the migration. Pre-fix only the
         // orchestrator had a record; the source handler's
-        // `is_migrating(origin)` returned false (the BUG #104
+        // `is_migrating(origin)` returned false (the
         // failure mode).
         assert!(
             source_handler.is_migrating(origin),
-            "BUG #104 regression: source_handler must have a record \
+            "regression: source_handler must have a record \
              of the local-source migration after `start_migration` \
              returns",
         );
@@ -1627,8 +1627,8 @@ mod tests {
         );
     }
 
-    /// Regression: with the source handler registered (BUG #104
-    /// fix), `source_handler.buffer_event` is now invokable for a
+    /// Regression: with the source handler registered,
+    /// `source_handler.buffer_event` is now invokable for a
     /// local-source migration. Pre-fix it returned `Ok(false)`
     /// ("no migration active") because `start_snapshot` had never
     /// run. Pin the fix-enabled-functionality directly: a caller
@@ -1663,7 +1663,7 @@ mod tests {
         let buffered = source_handler.buffer_event(origin, event).unwrap();
         assert!(
             buffered,
-            "BUG #104 fix must enable source-handler buffering for \
+            "fix must enable source-handler buffering for \
              local-source migrations — pre-fix `buffer_event` returned \
              `Ok(false)` because the migration was never registered",
         );

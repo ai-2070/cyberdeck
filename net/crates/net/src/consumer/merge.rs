@@ -98,9 +98,30 @@ impl CompositeCursor {
     }
 
     /// Encode the cursor as a base64 string.
-    pub fn encode(&self) -> String {
-        let json = serde_json::to_string(&self.positions).unwrap_or_default();
-        BASE64.encode(json.as_bytes())
+    ///
+    /// Pre-fix used `unwrap_or_default()`, which silently
+    /// produced an empty string on serialization failure. The
+    /// empty cursor then base64-encoded to an empty string and
+    /// the consumer's next poll restarted from the beginning of
+    /// the stream — silent rewind. For the current `positions`
+    /// schema (`HashMap<u16, Arc<str>>`), serialization is
+    /// infallible, so the failure path is unreachable.
+    ///
+    /// We surface that as a `ConsumerError::InvalidCursor` rather
+    /// than a panic. `poll()` is an `async fn`, and a panic that
+    /// propagates from there can abort the surrounding tokio
+    /// runtime worker. Returning `Err` lets `poll()` stay
+    /// non-panicking even if a future schema change breaks the
+    /// invariant; the caller will see a structured error and can
+    /// retry / log instead of taking down a worker.
+    pub fn encode(&self) -> Result<String, ConsumerError> {
+        let json = serde_json::to_string(&self.positions).map_err(|e| {
+            ConsumerError::InvalidCursor(format!(
+                "CompositeCursor::encode failed to serialize positions \
+                 (HashMap<u16, Arc<str>> should be infallible): {e}"
+            ))
+        })?;
+        Ok(BASE64.encode(json.as_bytes()))
     }
 
     /// Decode a cursor from a base64 string.
@@ -217,6 +238,27 @@ pub struct ConsumeResponse {
     pub next_id: Option<String>,
     /// True if there are more events available.
     pub has_more: bool,
+    /// `true` if the per-shard fetch was clamped by the internal
+    /// `PER_SHARD_FETCH_CAP` (10 000). Callers requesting very
+    /// large `limit` values across few shards may receive fewer
+    /// events than `limit` per `poll()` even when the underlying
+    /// streams have more — pagination via `next_id` still works.
+    ///
+    /// Pre-fix this clamp was silent. The default is
+    /// `false`; tools building observability around large polls
+    /// can detect under-delivery via this flag.
+    pub truncated_at_per_shard_cap: bool,
+    /// Shards that reported `has_more=true` but contributed no
+    /// events and no cursor advance to this poll. The merger
+    /// suppresses the aggregate `has_more` flag for caller-
+    /// protection (preventing infinite loops), but operators
+    /// monitoring adapter health should know which shards are
+    /// stuck.
+    ///
+    /// Pre-fix the suppression was logged at warn but
+    /// invisible to callers. Empty on the happy path; populated
+    /// only when a stall was detected and suppressed.
+    pub stalled_shards: Vec<u16>,
 }
 
 impl ConsumeResponse {
@@ -226,9 +268,26 @@ impl ConsumeResponse {
             events: Vec::new(),
             next_id: None,
             has_more: false,
+            truncated_at_per_shard_cap: false,
+            stalled_shards: Vec::new(),
         }
     }
 }
+
+/// Internal cap on per-shard `direct_get` / `XRANGE` fetch sizes,
+/// applied in `PollMerger::poll`. Bounds the adapter's per-call
+/// memory pressure for a single poll. Callers needing larger
+/// effective limits should paginate.
+///
+/// Marked `#[doc(hidden)]` because the value is an internal
+/// tuning knob, not part of the consumer's public API. Surfacing
+/// it on the docs would invite downstreams to match against it
+/// and turn a silent tuning change into a breaking-change
+/// negotiation. Callers that need to know whether a poll was
+/// truncated should read `ConsumeResponse::truncated_at_per_shard_cap`
+/// rather than comparing against this constant directly.
+#[doc(hidden)]
+pub const PER_SHARD_FETCH_CAP: usize = 10_000;
 
 /// Match a `StoredEvent` against a filter, surfacing parse failures.
 ///
@@ -257,17 +316,31 @@ fn event_matches_filter(event: &StoredEvent, filter: &Filter) -> bool {
 pub struct PollMerger {
     /// Adapter for polling shards.
     adapter: Arc<dyn Adapter>,
-    /// Total number of shards.
-    num_shards: u16,
+    /// Active shard IDs to poll when the request omits an explicit
+    /// `shards` list.
+    ///
+    /// Previously stored only `num_shards: u16` and generated
+    /// `(0..num_shards)` on every default-shards poll. After a dynamic
+    /// scale-down (`ShardMapper::scale_down` evicts the lowest-weight
+    /// shard, not necessarily the highest id), the active id set can
+    /// become sparse — e.g. `{1, 2}` after id 0 was drained — but
+    /// `num_shards == 2` still produces `[0, 1]`, polling a stale or
+    /// nonexistent shard 0 and skipping the live shard 2 entirely.
+    /// Captured at construction; the bus replaces the merger via
+    /// `ArcSwap` whenever topology changes (`add_shard`,
+    /// `remove_shard_internal`).
+    shard_ids: Vec<u16>,
 }
 
 impl PollMerger {
     /// Create a new poll merger.
-    pub fn new(adapter: Arc<dyn Adapter>, num_shards: u16) -> Self {
-        Self {
-            adapter,
-            num_shards,
-        }
+    ///
+    /// `shard_ids` should be the snapshot of currently-active shard IDs
+    /// (e.g. `ShardManager::shard_ids()`). Passing `0..num_shards` is
+    /// only correct when ids are guaranteed dense from 0 — i.e. the
+    /// static-shards path with no scaling.
+    pub fn new(adapter: Arc<dyn Adapter>, shard_ids: Vec<u16>) -> Self {
+        Self { adapter, shard_ids }
     }
 
     /// Poll events according to the request.
@@ -286,21 +359,30 @@ impl PollMerger {
         let shards: Vec<u16> = request
             .shards
             .clone()
-            .unwrap_or_else(|| (0..self.num_shards).collect());
+            .unwrap_or_else(|| self.shard_ids.clone());
 
         if shards.is_empty() {
             return Ok(ConsumeResponse::empty());
         }
 
         // Calculate per-shard limit (over-fetch to account for filtering)
-        // Use ceiling division to avoid truncating to 0 when limit < shard count
+        // Use ceiling division to avoid truncating to 0 when limit < shard count.
+        //
+        // Pre-fix this `min(10_000)` clamp was silent —
+        // a caller with `limit=200_000` over 10 shards expected
+        // 20 000/shard plus over-fetch but got 10 000/shard with
+        // no diagnostic. Track whether the clamp triggered and
+        // surface it on the response so callers building
+        // observability around large polls can detect under-
+        // delivery.
         let over_fetch_factor = if request.filter.is_some() { 3 } else { 2 };
-        let per_shard_limit = request
+        let unclamped_per_shard = request
             .limit
             .div_ceil(shards.len())
             .max(1)
-            .saturating_mul(over_fetch_factor)
-            .min(10_000);
+            .saturating_mul(over_fetch_factor);
+        let per_shard_limit = unclamped_per_shard.min(PER_SHARD_FETCH_CAP);
+        let truncated_at_per_shard_cap = unclamped_per_shard > PER_SHARD_FETCH_CAP;
 
         // Poll all shards in parallel. Each future borrows its start
         // position directly from `cursor` (which outlives `join_all` below),
@@ -328,6 +410,14 @@ impl PollMerger {
             .sum();
         let mut all_events = Vec::with_capacity(total_events);
         let mut any_has_more = false;
+        // Track which shards reported `has_more=true` so
+        // we can surface them on the response when the merger
+        // suppresses has_more for caller-protection. Pre-fix, an
+        // adapter stuck reporting `has_more=true` with no events
+        // and no cursor advance was logged at warn but invisible
+        // to callers — they saw a clean "no more events" and
+        // exited.
+        let mut shards_reporting_has_more: Vec<u16> = Vec::new();
         // `new_cursor` (fetched-position tracking) is only consulted on the
         // filter path — building it for unfiltered polls wastes a full
         // HashMap clone plus a `set()` per shard every poll.
@@ -350,7 +440,10 @@ impl PollMerger {
                     if let (Some(nc), Some(next_id)) = (new_cursor.as_mut(), next_id) {
                         nc.set(shard_id, next_id);
                     }
-                    any_has_more |= has_more;
+                    if has_more {
+                        any_has_more = true;
+                        shards_reporting_has_more.push(shard_id);
+                    }
                     all_events.extend(events);
                 }
                 Err(e) => {
@@ -566,18 +659,27 @@ impl PollMerger {
         // response and must back off rather than spin.
         let we_made_progress = !all_events.is_empty() || cursor_advanced;
         let has_more = (any_has_more || had_extra || all_filtered) && we_made_progress;
-        if any_has_more && !we_made_progress {
+        // When we suppress has_more for caller-protection
+        // (an adapter stuck at has_more=true with no progress),
+        // surface the offending shard ids on the response so
+        // operators can alert. Pre-fix the suppression was warn-
+        // logged only.
+        let stalled_shards: Vec<u16> = if any_has_more && !we_made_progress {
             tracing::warn!(
+                stalled_shards = ?shards_reporting_has_more,
                 "PollMerger: an adapter reported has_more=true with no events \
                  and no cursor advance — suppressing to avoid caller infinite-loop"
             );
-        }
+            shards_reporting_has_more
+        } else {
+            Vec::new()
+        };
         // Return the cursor even when all events were filtered out, so the
         // caller advances past the filtered region instead of re-fetching
         // the same events forever. The cursor is None only when nothing was
         // fetched at all (truly empty shards).
         let next_id = if we_made_progress {
-            Some(final_cursor.encode())
+            Some(final_cursor.encode()?)
         } else {
             None
         };
@@ -586,6 +688,8 @@ impl PollMerger {
             events: all_events,
             next_id,
             has_more,
+            truncated_at_per_shard_cap,
+            stalled_shards,
         })
     }
 }
@@ -602,7 +706,7 @@ mod tests {
         cursor.set(1, "1702123456790-0".to_string());
         cursor.set(5, "1702123456795-0".to_string());
 
-        let encoded = cursor.encode();
+        let encoded = cursor.encode().unwrap();
         let decoded = CompositeCursor::decode(&encoded).unwrap();
 
         assert_eq!(decoded.get(0), Some("1702123456789-0"));
@@ -618,7 +722,7 @@ mod tests {
         let events = vec![
             StoredEvent::from_value("100-0".to_string(), json!({}), 100, 0),
             StoredEvent::from_value("200-0".to_string(), json!({}), 200, 1),
-            // BUG #66: this used to be "later event in shard 0" by
+            // This used to be "later event in shard 0" by
             // virtue of being LAST in the input slice, but its id
             // (150-0) is stream-order BEFORE 200-0 — wait, this is
             // for shard 0 not shard 1. shard 0 only had 100-0
@@ -633,7 +737,7 @@ mod tests {
         assert_eq!(cursor.get(1), Some("200-0"));
     }
 
-    /// BUG #66: cursor must NOT regress when events arrive in a
+    /// Cursor must NOT regress when events arrive in a
     /// non-ascending order for the same shard. Pre-fix the cursor
     /// for shard 0 would land on `100-0` (the last item in the
     /// slice), regressing past `200-0`.
@@ -651,11 +755,11 @@ mod tests {
         assert_eq!(
             cursor.get(0),
             Some("200-0"),
-            "cursor must hold the highest id, not the last-in-slice id (BUG #66)",
+            "cursor must hold the highest id, not the last-in-slice id",
         );
     }
 
-    /// BUG #66: a partial overlap (advance for one shard, regression
+    /// A partial overlap (advance for one shard, regression
     /// attempt for another shard) must keep both cursors at their
     /// respective max.
     #[test]
@@ -868,7 +972,7 @@ mod tests {
     #[test]
     fn test_composite_cursor_empty_encode() {
         let cursor = CompositeCursor::new();
-        let encoded = cursor.encode();
+        let encoded = cursor.encode().unwrap();
         let decoded = CompositeCursor::decode(&encoded).unwrap();
         assert!(decoded.positions.is_empty());
     }
@@ -1006,7 +1110,7 @@ mod tests {
             cursor.set(i, format!("pos-{}", i));
         }
 
-        let encoded = cursor.encode();
+        let encoded = cursor.encode().unwrap();
         let decoded = CompositeCursor::decode(&encoded).unwrap();
 
         for i in 0..100u16 {
@@ -1115,14 +1219,76 @@ mod tests {
     #[tokio::test]
     async fn test_poll_merger_new() {
         let adapter = Arc::new(MockAdapter::new());
-        let merger = PollMerger::new(adapter, 4);
-        assert_eq!(merger.num_shards, 4);
+        let merger = PollMerger::new(adapter, vec![0, 1, 2, 3]);
+        assert_eq!(merger.shard_ids, vec![0, 1, 2, 3]);
+    }
+
+    /// When the active shard id set is sparse (e.g. shard 0
+    /// was scaled down, leaving `{1, 2}`), a poll with no explicit
+    /// `request.shards` must hit shards 1 and 2 — not generate
+    /// `[0, 1]` from a stale count and miss the live shard 2.
+    ///
+    /// Pre-fix, `PollMerger` stored only `num_shards: u16` and the
+    /// default branch generated `(0..num_shards).collect()`, so
+    /// shard 2's events were silently invisible to default-shards
+    /// consumers after a scale-down.
+    #[tokio::test]
+    async fn poll_merger_default_shards_uses_active_id_set_after_scale_down() {
+        let adapter = Arc::new(MockAdapter::new());
+
+        // Shard 0 (drained / no longer active): would mis-poll
+        // pre-fix and could return stale data on adapters that
+        // recreate streams on demand. We don't add events here.
+        // Shard 1 + Shard 2: active set after a scale-down that
+        // evicted shard 0.
+        adapter.add_events(
+            1,
+            vec![StoredEvent::from_value(
+                "1-a".to_string(),
+                json!({"shard": 1}),
+                100,
+                1,
+            )],
+        );
+        adapter.add_events(
+            2,
+            vec![StoredEvent::from_value(
+                "2-a".to_string(),
+                json!({"shard": 2}),
+                200,
+                2,
+            )],
+        );
+
+        // Sparse id set — shard 0 is NOT in the active list.
+        let merger = PollMerger::new(adapter, vec![1, 2]);
+
+        // Default-shards request (no `shards` override).
+        let request = ConsumeRequest::new(100);
+        let response = merger.poll(request).await.unwrap();
+
+        let returned: std::collections::HashSet<u16> =
+            response.events.iter().map(|e| e.shard_id).collect();
+        assert!(
+            returned.contains(&1),
+            "default-shards poll must include shard 1 (active)",
+        );
+        assert!(
+            returned.contains(&2),
+            "default-shards poll must include shard 2 — pre-fix this was silently \
+             skipped because the merger generated `0..num_shards` = `[0, 1]`",
+        );
+        assert!(
+            !returned.contains(&0),
+            "default-shards poll must NOT touch shard 0 — it was evicted",
+        );
+        assert_eq!(response.events.len(), 2);
     }
 
     #[tokio::test]
     async fn test_poll_merger_empty_limit() {
         let adapter = Arc::new(MockAdapter::new());
-        let merger = PollMerger::new(adapter, 4);
+        let merger = PollMerger::new(adapter, vec![0, 1, 2, 3]);
 
         let request = ConsumeRequest::new(0);
         let response = merger.poll(request).await.unwrap();
@@ -1135,7 +1301,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_merger_empty_shards() {
         let adapter = Arc::new(MockAdapter::new());
-        let merger = PollMerger::new(adapter, 4);
+        let merger = PollMerger::new(adapter, vec![0, 1, 2, 3]);
 
         let request = ConsumeRequest::new(100).shards(vec![]);
         let response = merger.poll(request).await.unwrap();
@@ -1169,7 +1335,7 @@ mod tests {
             )],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
 
         let request = ConsumeRequest::new(100);
         let response = merger.poll(request).await.unwrap();
@@ -1200,7 +1366,7 @@ mod tests {
             )],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
 
         let request = ConsumeRequest::new(100).ordering(Ordering::InsertionTs);
         let response = merger.poll(request).await.unwrap();
@@ -1225,7 +1391,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 1);
+        let merger = PollMerger::new(adapter, vec![0]);
 
         let request = ConsumeRequest::new(100).filter(Filter::eq("type", json!("token")));
         let response = merger.poll(request).await.unwrap();
@@ -1249,7 +1415,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 1);
+        let merger = PollMerger::new(adapter, vec![0]);
 
         let request = ConsumeRequest::new(2);
         let response = merger.poll(request).await.unwrap();
@@ -1290,7 +1456,7 @@ mod tests {
             )],
         );
 
-        let merger = PollMerger::new(adapter, 3);
+        let merger = PollMerger::new(adapter, vec![0, 1, 2]);
 
         // Only poll shard 0 and 2
         let request = ConsumeRequest::new(100).shards(vec![0, 2]);
@@ -1316,7 +1482,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 1);
+        let merger = PollMerger::new(adapter, vec![0]);
 
         // First poll
         let request = ConsumeRequest::new(2);
@@ -1363,7 +1529,7 @@ mod tests {
             .collect();
         adapter.add_events(1, shard1_events);
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
 
         // Poll in pages of 10 and collect all events
         let mut all_events = Vec::new();
@@ -1427,7 +1593,7 @@ mod tests {
             adapter.add_events(shard_id, events);
         }
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
 
         // Poll in small pages
         let mut all_event_ids = Vec::new();
@@ -1490,7 +1656,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
 
         // Poll with ordering, page size 2
         let mut all_events = Vec::new();
@@ -1546,7 +1712,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
 
         // First poll with limit 2 - should get 2 events and cursor should reflect only those 2
         let response1 = merger.poll(ConsumeRequest::new(2)).await.unwrap();
@@ -1582,6 +1748,53 @@ mod tests {
         assert_eq!(response2.events.len(), 4, "Should get remaining 4 events");
     }
 
+    /// When the per-shard fetch hits the
+    /// PER_SHARD_FETCH_CAP clamp, the response must surface
+    /// `truncated_at_per_shard_cap = true` so callers can detect
+    /// the silent under-delivery.
+    #[tokio::test]
+    async fn poll_merger_surfaces_per_shard_cap_truncation() {
+        let adapter = Arc::new(MockAdapter::new());
+        // Single shard — over-fetch factor 2 — request limit
+        // 50 000 → unclamped per_shard would be 100 000 → clamped
+        // to PER_SHARD_FETCH_CAP (10 000).
+        adapter.add_events(
+            0,
+            (0..1)
+                .map(|i| StoredEvent::from_value(format!("0-{}", i), json!({}), 100, 0))
+                .collect(),
+        );
+
+        let merger = PollMerger::new(adapter, vec![0]);
+        let response = merger.poll(ConsumeRequest::new(50_000)).await.unwrap();
+        assert!(
+            response.truncated_at_per_shard_cap,
+            "large limit must flag the per-shard cap clamp",
+        );
+    }
+
+    /// Corollary: a small request that fits well below
+    /// the cap must NOT flag truncation.
+    #[tokio::test]
+    async fn poll_merger_does_not_flag_truncation_on_small_limit() {
+        let adapter = Arc::new(MockAdapter::new());
+        adapter.add_events(
+            0,
+            vec![StoredEvent::from_value(
+                "0-1".to_string(),
+                json!({}),
+                100,
+                0,
+            )],
+        );
+        let merger = PollMerger::new(adapter, vec![0]);
+        let response = merger.poll(ConsumeRequest::new(100)).await.unwrap();
+        assert!(
+            !response.truncated_at_per_shard_cap,
+            "small limits must not flag the cap",
+        );
+    }
+
     #[tokio::test]
     async fn test_poll_merger_small_limit_many_shards() {
         // Regression: limit < shard count caused integer division truncation to 0,
@@ -1601,7 +1814,7 @@ mod tests {
             );
         }
 
-        let merger = PollMerger::new(adapter, num_shards);
+        let merger = PollMerger::new(adapter, (0..num_shards).collect());
 
         // Request fewer events than shards — should still work
         let request = ConsumeRequest::new(3);
@@ -1638,7 +1851,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let filter = Filter::eq("type", json!("token"));
 
         // First poll: should return only the "token" events from shard 0
@@ -1716,7 +1929,7 @@ mod tests {
             .collect();
         adapter.add_events(1, shard1_events);
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let filter = Filter::eq("type", json!("token"));
 
         let mut all_events = Vec::new();
@@ -1787,7 +2000,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 1);
+        let merger = PollMerger::new(adapter, vec![0]);
         let filter = Filter::eq("type", json!("signal"));
 
         let response = merger
@@ -1835,7 +2048,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let filter = Filter::eq("type", json!("token"));
 
         // 4 matches exist; asking for 2 must yield the two earliest
@@ -1899,7 +2112,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 1);
+        let merger = PollMerger::new(adapter, vec![0]);
 
         // Filtered: corrupt event must be dropped, valid event kept.
         let filtered = merger
@@ -1965,7 +2178,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let filter = Filter::eq("type", json!("token"));
 
         // Page through with a small limit — over many polls every
@@ -2032,7 +2245,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let filter = Filter::eq("type", json!("token"));
 
         let mut all_returned: Vec<String> = Vec::new();
@@ -2108,7 +2321,7 @@ mod tests {
         }
 
         let adapter: Arc<dyn Adapter> = Arc::new(LiarAdapter);
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let response = merger.poll(ConsumeRequest::new(100)).await.unwrap();
 
         assert!(
@@ -2155,7 +2368,7 @@ mod tests {
         );
 
         // Poll many times; the order must be stable.
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let mut prior_order: Option<Vec<String>> = None;
         for iter in 0..20 {
             let r = merger

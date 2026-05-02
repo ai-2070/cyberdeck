@@ -65,14 +65,24 @@ pub(crate) fn compute_eviction_count(
         // size policy drops none.
     }
 
-    // Age-based: drop entries whose timestamp is older than the cutoff.
-    // Timestamps are ~monotonic (wall clock) within a single process,
-    // so the first entry with `ts > cutoff` marks the retained head.
+    // Age-based: drop entries whose timestamp is STRICTLY older
+    // than the cutoff. Timestamps are ~monotonic (wall clock)
+    // within a single process, so the first entry with
+    // `ts >= cutoff` marks the retained head.
+    //
+    // Pre-fix, the predicate was `ts > cutoff` (drop on
+    // `ts <= cutoff`), so an entry with `ts == cutoff` — i.e.
+    // an entry exactly `max_age_ns` old — was dropped.
+    // Intuitive "max age" semantics retain the boundary entry;
+    // breaking change to align the implementation with that
+    // intuition. Callers that depended on the off-by-one (e.g.
+    // tests asserting "5 of 10 dropped under
+    // `max_age = total - 1`") see one fewer drop now.
     if let Some(max_age_ns) = cfg.retention_max_age_ns {
         let cutoff = now_ns.saturating_sub(max_age_ns);
         let mut age_drop = 0;
         for &ts in timestamps.iter() {
-            if ts > cutoff {
+            if ts >= cutoff {
                 break;
             }
             age_drop += 1;
@@ -205,11 +215,18 @@ mod tests {
     fn test_age_retention_drops_older_than_cutoff() {
         // 10 entries, 1 ns apart at t=1000..1009.
         // max_age = 5 ns, now = 1009 → cutoff = 1004. Drop entries
-        // with ts <= 1004: ts 1000..=1004 = 5 entries.
+        // with ts < 1004: ts 1000..=1003 = 4 entries.
+        //
+        // Breaking change: pre-fix, the predicate was
+        // `ts > cutoff` (drop on `ts <= cutoff`), so an entry
+        // exactly `max_age_ns` old (ts == cutoff) was dropped —
+        // 5 entries dropped here. Post-fix uses `ts >= cutoff`
+        // (drop on `ts < cutoff`), retaining the boundary entry
+        // for intuitive "max age" semantics; 4 entries dropped.
         let entries = heap_entries(10, 16);
         let ts = ts_seq(10, 1);
         let cfg = RedexFileConfig::default().with_retention_max_age(Duration::from_nanos(5));
-        assert_eq!(compute_eviction_count(&entries, &ts, 1009, &cfg), 5);
+        assert_eq!(compute_eviction_count(&entries, &ts, 1009, &cfg), 4);
     }
 
     #[test]
@@ -265,7 +282,31 @@ mod tests {
         let cfg = RedexFileConfig::default()
             .with_retention_max_events(5)
             .with_retention_max_age(Duration::from_nanos(1));
-        // now=1000, cutoff=999. All ts = 1 <= 999 → drop 10.
+        // now=1000, cutoff=999. All ts = 1 < 999 → drop 10.
         assert_eq!(compute_eviction_count(&entries, &ts, 1000, &cfg), 10);
+    }
+
+    /// Regression: an entry with timestamp exactly equal
+    /// to the cutoff (`ts == now - max_age_ns`) — i.e. an entry
+    /// that is exactly `max_age_ns` old — must be RETAINED, not
+    /// dropped. Pre-fix the predicate was `ts > cutoff` (drop on
+    /// `ts <= cutoff`), so the boundary entry was dropped. Post-
+    /// fix uses `ts >= cutoff` (drop on `ts < cutoff`), aligning
+    /// with intuitive "max age N retains entries up to N old"
+    /// semantics.
+    #[test]
+    fn bug23_entry_at_exact_cutoff_is_retained() {
+        let entries = heap_entries(3, 16);
+        // ts: [10, 15, 20]. now=20, max_age=5 → cutoff=15.
+        let ts = vec![10u64, 15, 20];
+        let cfg = RedexFileConfig::default().with_retention_max_age(Duration::from_nanos(5));
+        // Only ts=10 (< 15) should be dropped; ts=15 (== cutoff)
+        // is retained (NEW behavior); ts=20 is fresh.
+        assert_eq!(
+            compute_eviction_count(&entries, &ts, 20, &cfg),
+            1,
+            "entry at exactly cutoff (ts=15, max_age=5, now=20) \
+             must be retained — pre-fix this dropped 2 entries"
+        );
     }
 }

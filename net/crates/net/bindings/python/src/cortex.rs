@@ -316,9 +316,15 @@ impl PyRedexFile {
             .map_err(|e| RedexError::new_err(format!("append: {}", e)))
     }
 
-    /// Append a batch atomically. Returns the seq of the FIRST event;
-    /// subsequent events are `first + 0, first + 1, ...`.
-    fn append_batch(&self, payloads: Vec<Vec<u8>>) -> PyResult<u64> {
+    /// Append a batch atomically. Returns the seq of the FIRST event,
+    /// or `None` if `payloads` was empty (no events appended).
+    /// Subsequent events are `first + 0, first + 1, ...`.
+    ///
+    /// The underlying `RedexFile::append_batch`
+    /// returns `Result<Option<u64>>` so callers can distinguish
+    /// "wrote zero" from "wrote one with seq N". The Python
+    /// signature mirrors that — `int | None`.
+    fn append_batch(&self, payloads: Vec<Vec<u8>>) -> PyResult<Option<u64>> {
         let bytes: Vec<Bytes> = payloads.into_iter().map(Bytes::from).collect();
         self.inner
             .append_batch(&bytes)
