@@ -1568,6 +1568,41 @@ async fn run_scaling_monitor_via_weak(weak: std::sync::Weak<EventBus>) {
 /// just delays the inevitable while burning CPU and amplifying log
 /// noise. Use `AdapterError::is_retryable` as the single source of
 /// truth for this decision.
+/// Compute the per-attempt backoff for `dispatch_batch` retries.
+///
+/// BUG #74: pre-fix the retry loop slept a flat `Duration::from_millis(100)`
+/// after every failure. Under a partial backend outage (Redis /
+/// JetStream slow but not dead), every shard's BatchWorker retried
+/// on the exact same 100 ms cadence, producing a synchronized
+/// retry storm that amplified load while the backend was
+/// recovering.
+///
+/// Post-fix: exponential backoff (100, 200, 400, 800, 1600, 3200 ms)
+/// with per-(shard, attempt) jitter to decorrelate retries across
+/// shards. Capped at attempt=5 (3.2 s base) so retries don't grow
+/// unboundedly. Jitter is `[-25%, +25%]` of the base, derived from
+/// hashing `(shard_id, attempt)` — deterministic per shard but
+/// uncorrelated across shards, which is exactly what the storm
+/// mitigation needs.
+fn retry_backoff(shard_id: u16, attempt: u32) -> Duration {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // 100 ms × 2^attempt, capped at attempt=5 → 100/200/400/800/1600/3200.
+    let base_ms: u64 = 100u64.saturating_mul(1u64 << attempt.min(5));
+
+    let mut hasher = DefaultHasher::new();
+    shard_id.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    let h = hasher.finish();
+    // Jitter in [0, base_ms/2), centered to give [-25%, +25%].
+    let jitter_range = (base_ms / 2).max(1);
+    let jitter = (h % jitter_range) as i64 - (jitter_range as i64 / 2);
+    let final_ms = (base_ms as i64 + jitter).max(1) as u64;
+
+    Duration::from_millis(final_ms)
+}
+
 async fn dispatch_batch(
     adapter: &dyn Adapter,
     batch: Batch,
@@ -1596,7 +1631,7 @@ async fn dispatch_batch(
                 tracing::warn!(shard_id, attempt, "Adapter on_batch timed out, retrying");
             }
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(retry_backoff(shard_id, attempt)).await;
     }
 
     match tokio::time::timeout(timeout, adapter.on_batch(batch)).await {
@@ -2246,6 +2281,50 @@ mod tests {
         async fn is_healthy(&self) -> bool {
             true
         }
+    }
+
+    /// BUG #74: `retry_backoff` exponentially grows the base delay
+    /// per attempt and adds per-(shard, attempt) jitter to
+    /// decorrelate retries across shards. Pin both invariants:
+    /// monotonic growth on the base, and jitter that produces
+    /// different outputs for different shard ids.
+    #[test]
+    fn retry_backoff_grows_with_attempt_and_jitters_per_shard() {
+        // Shard 0 attempt 0..6: base ms 100, 200, 400, 800, 1600,
+        // 3200, 3200 (cap). Plus ±25% jitter.
+        let s0_a0 = retry_backoff(0, 0).as_millis();
+        let s0_a1 = retry_backoff(0, 1).as_millis();
+        let s0_a4 = retry_backoff(0, 4).as_millis();
+        let s0_a5 = retry_backoff(0, 5).as_millis();
+        let s0_a6 = retry_backoff(0, 6).as_millis();
+
+        // Bounds: each attempt's base is in `[base*0.75, base*1.25)`.
+        assert!((75..=125).contains(&s0_a0));
+        assert!((150..=250).contains(&s0_a1));
+        assert!((1200..=2000).contains(&s0_a4));
+        assert!((2400..=4000).contains(&s0_a5));
+        // Cap at attempt=5: attempt 6 must NOT exceed attempt 5's
+        // upper bound.
+        assert!(
+            s0_a6 <= 4000,
+            "attempt > 5 must cap at the attempt-5 base; got {}ms",
+            s0_a6
+        );
+
+        // BUG #74 jitter property: different shards at the same
+        // attempt land on different backoffs. Sample 16 distinct
+        // shard ids and assert at least 8 unique backoff values
+        // — the hasher's distribution should easily clear that.
+        use std::collections::HashSet;
+        let s_attempt2: HashSet<u128> = (0u16..16)
+            .map(|s| retry_backoff(s, 2).as_millis())
+            .collect();
+        assert!(
+            s_attempt2.len() >= 8,
+            "BUG #74: jitter must decorrelate retries across shards; \
+             only {} unique backoffs across 16 shards",
+            s_attempt2.len()
+        );
     }
 
     /// CR-23: pin that `EventBus::shutdown` actually invokes the

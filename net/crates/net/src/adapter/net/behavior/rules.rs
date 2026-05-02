@@ -618,10 +618,22 @@ pub struct RateLimit {
 impl Rule {
     /// Create a new rule
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // BUG #21: pre-fix this used `.as_millis() as u64`, which
+        // silently truncated the u128 millis on overflow. Realistic
+        // dates (anything within u64::MAX milliseconds since UNIX
+        // epoch — year ~584,554,051) are unaffected, but `as`
+        // casts on durations are a footgun worth eliminating.
+        // `try_from` saturates on overflow so a far-future clock
+        // surfaces as a max-timestamp instead of wrapping to a
+        // small value that would invert "newer-rule-wins"
+        // comparisons.
+        let now = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         Self {
             id: id.into(),
@@ -1276,10 +1288,15 @@ pub struct RuleSet {
 impl RuleSet {
     /// Create a new rule set
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // BUG #21: see Rule::new for rationale on saturating
+        // u128 → u64 instead of `as u64`.
+        let now = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         Self {
             id: id.into(),
