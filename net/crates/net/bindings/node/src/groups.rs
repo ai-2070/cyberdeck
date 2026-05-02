@@ -341,7 +341,6 @@ pub(crate) async fn spawn_replica_group(
     let group = SdkReplicaGroup::spawn(&runtime, &kind, cfg).map_err(group_err)?;
     Ok(ReplicaGroup {
         inner: Arc::new(group),
-        kind,
     })
 }
 
@@ -364,7 +363,6 @@ pub(crate) async fn spawn_fork_group(
         SdkForkGroup::fork(&runtime, &kind, parent_origin, fork_seq, cfg).map_err(group_err)?;
     Ok(ForkGroup {
         inner: Arc::new(group),
-        kind,
     })
 }
 
@@ -385,7 +383,6 @@ pub(crate) async fn spawn_standby_group(
     let group = SdkStandbyGroup::spawn(&runtime, &kind, cfg).map_err(group_err)?;
     Ok(StandbyGroup {
         inner: Arc::new(group),
-        kind,
     })
 }
 
@@ -393,10 +390,17 @@ pub(crate) async fn spawn_standby_group(
 // ReplicaGroup
 // =========================================================================
 
+// BUG #33: pre-fix this struct (and ForkGroup, StandbyGroup
+// below) carried a `kind: String` field that was captured at
+// spawn but never read on `self.kind` anywhere. The
+// `Arc<SdkReplicaGroup>` (and friends) hold their own copy of
+// the kind, so the binding-side field was dead code AND a
+// maintenance trap: any future "use" of `self.kind` would read
+// a frozen snapshot that could drift from the SDK-side kind.
+// Removed for both correctness and footprint.
 #[napi]
 pub struct ReplicaGroup {
     inner: Arc<SdkReplicaGroup>,
-    kind: String,
 }
 
 #[napi]
@@ -485,7 +489,7 @@ impl ReplicaGroup {
 #[napi]
 pub struct ForkGroup {
     inner: Arc<SdkForkGroup>,
-    kind: String,
+    // BUG #33: removed unused `kind` field; see ReplicaGroup.
 }
 
 #[napi]
@@ -573,7 +577,7 @@ impl ForkGroup {
 #[napi]
 pub struct StandbyGroup {
     inner: Arc<SdkStandbyGroup>,
-    kind: String,
+    // BUG #33: removed unused `kind` field; see ReplicaGroup.
 }
 
 #[napi]
