@@ -499,6 +499,18 @@ impl RedexFile {
     /// Append many payloads. Returns the sequence of the FIRST event
     /// in the batch. All entries land contiguously in the index.
     ///
+    /// # Empty input
+    ///
+    /// BUG #27: an empty `payloads` slice returns `Ok(next_seq)` —
+    /// the seq value the next append *would* receive. Callers
+    /// **cannot** distinguish "wrote zero events with seq N" from
+    /// "wrote one event with seq N" via the return value alone.
+    /// The current behavior is preserved for backwards
+    /// compatibility (a stricter contract would be a breaking
+    /// API change), but callers iterating over a stream of
+    /// optionally-empty batches must check `payloads.is_empty()`
+    /// themselves and skip the call's return interpretation.
+    ///
     /// Failure atomicity:
     /// - seq numbers are allocated **after** the batch is validated
     ///   to fit (both segment capacity and u32 offset width);
