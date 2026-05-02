@@ -210,8 +210,17 @@ impl ShardMetricsCollector {
     /// last called. Used by `finalize_draining` to detect lingering
     /// producers that the window-reset `events_in_window` counter
     /// can race past.
+    ///
+    /// BUG #38: pre-fix used `Ordering::Relaxed`, but the writer
+    /// side (`set_draining(true)`) resets the counter under
+    /// `SeqCst`. On weakly-ordered hardware (ARM), a Relaxed
+    /// reader could observe a stale counter and `finalize_draining`
+    /// would falsely conclude the drain had flushed while
+    /// producers were still pushing. Acquire pairs with the
+    /// SeqCst release of the reset (SeqCst includes Release
+    /// semantics), making the reset happen-before this load.
     pub fn pushes_since_drain_start(&self) -> u64 {
-        self.pushes_since_drain_start.load(AtomicOrdering::Relaxed)
+        self.pushes_since_drain_start.load(AtomicOrdering::Acquire)
     }
 
     /// Check if draining.
