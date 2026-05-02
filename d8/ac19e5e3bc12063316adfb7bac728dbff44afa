@@ -1,0 +1,23 @@
+net/crates/net/src/bus.rs
+  7cd1aa3948e2e296 1955-1968,1971,1979-1986,1988
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d8ac19e5e3bc12063316adfb7bac728dbff44afa",
+  "prompts": {
+    "7cd1aa3948e2e296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad152adb-b4ac-4388-af9c-44b44434d029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3239,
+      "total_deletions": 1,
+      "accepted_lines": 1050,
+      "overriden_lines": 0
+    }
+  }
+}
