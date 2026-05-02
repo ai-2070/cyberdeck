@@ -1582,7 +1582,7 @@ mod tests {
         let f = make_file("t-bug2-future");
         // No appends. next_seq = 0.
 
-        let mut stream = Box::pin(f.tail(5));
+        let stream = Box::pin(f.tail(5));
         // Append something; subscriber should NOT see Lagged for the
         // initial "from_seq=5 with empty index, next_seq=0" condition.
         f.append(b"e5").unwrap(); // seq 0
