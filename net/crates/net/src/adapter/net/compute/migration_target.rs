@@ -407,13 +407,20 @@ impl MigrationTargetHandler {
     /// between source and target for any non-empty replay batch where
     /// one delivery errored mid-loop.
     fn drain_pending(&self, state: &mut TargetMigrationState) -> Result<(), MigrationError> {
-        // Collect events to replay (contiguous from replayed_through + 1)
+        // Collect events to replay (contiguous from replayed_through + 1).
+        //
+        // BUG #31: pre-fix `state.replayed_through + 1` and `next_seq
+        // += 1` would panic in debug or wrap to 0 in release at
+        // u64::MAX. Saturating arithmetic clamps at u64::MAX so an
+        // (astronomical) overflow surfaces as "no further events
+        // accepted" rather than silent re-keying.
         let mut to_replay = Vec::new();
-        let mut next_seq = state.replayed_through + 1;
+        let mut next_seq = state.replayed_through.saturating_add(1);
 
         while let Some(event) = state.pending_events.remove(&next_seq) {
             to_replay.push(event);
-            next_seq += 1;
+            // saturating_add: same rationale as above.
+            next_seq = next_seq.saturating_add(1);
         }
 
         // Also drain any events with sequence <= replayed_through (duplicates)
