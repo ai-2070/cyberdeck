@@ -442,36 +442,128 @@ impl EventBus {
         //
         // On `activate_shard` failure we mirror
         // `remove_shard_internal`'s teardown: drop the sender,
-        // abort both join handles, unmap the provisioning entry,
-        // then return. Returning immediately would leave the new
-        // sender in `batch_senders`, both `JoinHandle`s in
-        // `batch_workers`, and the `Provisioning` mapper entry
-        // behind. The drain worker would loop indefinitely on an
-        // empty ring buffer (`with_shard` still finds the entry;
-        // `select_shard` skips it), and each retry of
-        // `add_shard_internal` would allocate a fresh id while the
-        // dead one squats.
+        // unmap the provisioning entry (which atomically pops any
+        // residual ring-buffer events), gracefully await both
+        // workers (so the drain worker's `scratch` Vec sends its
+        // contents on the channel and the batch worker's
+        // `current_batch` is flushed via the channel-close path),
+        // then dispatch any stranded ring-buffer events through
+        // the adapter. Pre-fix this used `.abort()` on both
+        // handles (BUG #44 + #45) which dropped the drain
+        // worker's scratch and the batch worker's current_batch
+        // without dispatch.
         if let Err(e) = self.shard_manager.activate_shard(new_id) {
             tracing::warn!(
                 shard_id = new_id,
                 error = %e,
                 "activate_shard failed; rolling back provisioning state"
             );
-            // 1. Drop the sender so the batch worker's `recv()`
-            //    eventually returns None.
+
+            // 1. Drop the bus-side sender. The drain worker still
+            //    holds its own clone, so the channel stays open
+            //    until `with_shard` returns None (step 2) and the
+            //    drain worker breaks out of its loop, dropping
+            //    its sender and finally closing the channel.
             self.batch_senders.write().remove(&new_id);
-            // 2. Abort and forget the worker handles. The drain
-            //    worker is held alive by the channel sender we
-            //    just dropped, but it's also pinned to a `with_shard`
-            //    poll loop on an empty buffer — abort it so it
-            //    exits regardless of channel state.
-            if let Some(workers) = self.batch_workers.lock().remove(&new_id) {
-                workers.drain.abort();
-                workers.batch.abort();
+
+            // 2. Atomically pop any ring-buffer residue and
+            //    unmap the Provisioning entry. After this,
+            //    `with_shard(new_id)` returns None and the drain
+            //    worker exits at its next poll (after sending
+            //    any events it had already popped into `scratch`
+            //    on this iteration).
+            //
+            //    For a brand-new Provisioning shard the buffer
+            //    should be empty (`select_shard` skips
+            //    non-Active states), so `stranded` is normally
+            //    `Vec::new()`. The flush below is a defensive
+            //    no-op on the happy path but covers any future
+            //    code path that routes to a Provisioning shard
+            //    or any race window that tucked an event in
+            //    before `activate_shard` returned its error.
+            let stranded = self
+                .shard_manager
+                .remove_shard(new_id)
+                .unwrap_or_default();
+
+            // 3. Take ownership of the worker handles and await
+            //    them gracefully. Order: drain first (it pumps
+            //    its scratch + final-sweep contents into the
+            //    channel and exits), then batch (which receives
+            //    those events plus any prior channel residue,
+            //    flushes its own `current_batch`, and exits).
+            //
+            //    Awaiting in this order is what makes the drain
+            //    worker's scratch reach the adapter — the
+            //    drain's `Some(N>0)` arm `mem::replace`s scratch
+            //    into a batch and `sender.send(batch).await`s
+            //    it; that send must complete (or fail) before
+            //    the drain worker breaks. The batch worker's
+            //    `Ok(None)` arm then runs after both senders
+            //    are dropped and flushes any pending batch.
+            let workers = self.batch_workers.lock().remove(&new_id);
+            let final_next_sequence = if let Some(workers) = workers {
+                if let Err(err) = workers.drain.await {
+                    tracing::warn!(
+                        shard_id = new_id,
+                        error = %err,
+                        "drain worker JoinHandle errored on activate-failure rollback"
+                    );
+                }
+                if let Err(err) = workers.batch.await {
+                    tracing::warn!(
+                        shard_id = new_id,
+                        error = %err,
+                        "BatchWorker JoinHandle errored on activate-failure rollback"
+                    );
+                }
+                workers.next_sequence.load(AtomicOrdering::Acquire)
+            } else {
+                0
+            };
+
+            // 4. Dispatch any stranded events as a single-shot
+            //    batch so they reach durable storage with the
+            //    correct sequence-id segment. Identical to the
+            //    `remove_shard_internal` teardown.
+            if !stranded.is_empty() {
+                let count = stranded.len();
+                let batch = crate::event::Batch::with_nonce(
+                    new_id,
+                    stranded,
+                    final_next_sequence,
+                    self.producer_nonce,
+                );
+                let dispatched = dispatch_batch(
+                    &*self.adapter,
+                    batch,
+                    new_id,
+                    self.config.adapter_timeout,
+                    self.config.adapter_batch_retries,
+                )
+                .await;
+                if dispatched {
+                    self.stats
+                        .batches_dispatched
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    self.stats
+                        .events_dispatched
+                        .fetch_add(count as u64, AtomicOrdering::Relaxed);
+                    tracing::info!(
+                        shard_id = new_id,
+                        count,
+                        "activate-failure rollback: flushed stranded events to adapter",
+                    );
+                } else {
+                    tracing::error!(
+                        shard_id = new_id,
+                        count,
+                        "activate-failure rollback: adapter rejected stranded events; \
+                         events lost"
+                    );
+                }
             }
-            // 3. Unmap the Provisioning entry so the mapper can
-            //    reuse the slot on retry.
-            let _ = self.shard_manager.remove_shard(new_id);
+
             return Err(AdapterError::Fatal(e.to_string()));
         }
 
