@@ -639,7 +639,24 @@ impl SnapshotStore {
     /// from a known-clean snapshot at a lower `through_seq`). No
     /// effect on the snapshot itself — call `remove` separately
     /// if you also want to evict the live entry.
-    pub fn forget(&self, entity_id: &EntityId) {
+    ///
+    /// `pub(crate)` rather than `pub`: `forget` is the escape
+    /// hatch that defeats the high-water-mark anti-rewind
+    /// guarantee that `store` upholds. An external caller able to
+    /// invoke it arbitrarily can stage stale snapshots over fresh
+    /// ones, undermining the rebind-safety invariant the
+    /// high_water table exists to enforce. Internal call sites
+    /// (migration / rebind paths) may use it; external SDK
+    /// surfaces should not.
+    ///
+    /// Currently only exercised by unit tests; reserved for the
+    /// migration-rebind path that the high_water mark itself was
+    /// added to support. The `#[allow(dead_code)]` is intentional
+    /// — removing the function entirely would force whoever
+    /// wires up the rebind callsite to re-derive the threat
+    /// model.
+    #[allow(dead_code)]
+    pub(crate) fn forget(&self, entity_id: &EntityId) {
         self.high_water.remove(entity_id.as_bytes());
     }
 
