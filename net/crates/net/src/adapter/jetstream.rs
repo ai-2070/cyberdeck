@@ -107,7 +107,22 @@ impl JetStreamAdapter {
         let raw = value.get("r").cloned().unwrap_or(serde_json::Value::Null);
         let raw_bytes = Bytes::from(serde_json::to_vec(&raw).unwrap_or_default());
         let insertion_ts = value.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
-        let shard_id = value.get("s").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+
+        // BUG #39: pre-fix this was `... as u16`, which silently
+        // wrapped on a stored shard_id > 65 535 (e.g. 100 000 →
+        // 34 464). The result was a misrouted event at consume
+        // time, classified to a different shard than it was
+        // originally written under. Reject the event with a fatal
+        // error so the corruption surfaces at parse time rather
+        // than as a "wrong shard" mystery downstream.
+        let shard_id_raw = value.get("s").and_then(|v| v.as_u64()).unwrap_or(0);
+        let shard_id = u16::try_from(shard_id_raw).map_err(|_| {
+            AdapterError::Fatal(format!(
+                "JetStream stored event seq={seq} has shard_id {shard_id_raw} \
+                 outside u16 range (0..=65535); refusing to mis-route as \
+                 truncated value"
+            ))
+        })?;
 
         Ok(StoredEvent::new(
             seq.to_string(),
@@ -625,6 +640,32 @@ mod tests {
         assert_eq!(event.shard_id, 7);
         let raw: serde_json::Value = serde_json::from_slice(&event.raw).unwrap();
         assert_eq!(raw["token"], "world");
+    }
+
+    /// BUG #39: a stored shard_id outside the u16 range must be
+    /// rejected, not silently wrapped via `as u16`. Pre-fix,
+    /// `s: 100_000` deserialized to `shard_id = 34_464` (100 000
+    /// % 65 536), routing the event under the wrong shard at
+    /// consume time. Post-fix it surfaces as `AdapterError::Fatal`
+    /// so the corruption is observable at parse time.
+    #[test]
+    fn deserialize_event_rejects_shard_id_outside_u16_range() {
+        let data = br#"{"r":{"token":"x"},"t":1,"s":100000}"#;
+        let err = JetStreamAdapter::deserialize_event(42, data).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("100000") && msg.contains("u16"),
+            "expected error mentioning the bad value and u16 range, got: {}",
+            msg
+        );
+    }
+
+    /// BUG #39 boundary: u16::MAX must still parse cleanly.
+    #[test]
+    fn deserialize_event_accepts_max_u16_shard_id() {
+        let data = br#"{"r":{},"t":0,"s":65535}"#;
+        let event = JetStreamAdapter::deserialize_event(0, data).unwrap();
+        assert_eq!(event.shard_id, u16::MAX);
     }
 
     #[test]
