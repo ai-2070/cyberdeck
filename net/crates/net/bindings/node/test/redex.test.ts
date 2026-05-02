@@ -29,6 +29,8 @@ describe('Redex.openFile', () => {
       Buffer.from('b'),
       Buffer.from('c'),
     ]);
+    // BUG #27: appendBatch now returns BigInt | null. Empty
+    // input → null; non-empty → BigInt of the first seq.
     expect(first).toBe(0n);
     expect(file.len()).toBe(3n);
 
@@ -38,6 +40,15 @@ describe('Redex.openFile', () => {
       'b',
       'c',
     ]);
+  });
+
+  it('append_batch returns null on empty input (BUG #27)', () => {
+    const redex = new Redex();
+    const file = redex.openFile('test/batch-empty');
+
+    const first = file.appendBatch([]);
+    expect(first).toBeNull();
+    expect(file.len()).toBe(0n);
   });
 
   it('repeat openFile with the same name returns the live handle', () => {

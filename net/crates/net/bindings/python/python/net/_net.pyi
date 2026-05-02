@@ -297,8 +297,9 @@ class RedexFile:
     def append(self, payload: bytes) -> int:
         """Append one payload; returns the assigned sequence number."""
         ...
-    def append_batch(self, payloads: list[bytes]) -> int:
-        """Append a batch atomically; returns the seq of the FIRST event.
+    def append_batch(self, payloads: list[bytes]) -> int | None:
+        """Append a batch atomically; returns the seq of the FIRST event,
+        or `None` if `payloads` was empty (no events appended).
         Subsequent events are `first + 0, first + 1, ...`.
         """
         ...

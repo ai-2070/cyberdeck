@@ -274,10 +274,16 @@ impl RedexFile {
     }
 
     /// Append a batch of payloads atomically. Returns the sequence
-    /// number of the FIRST appended event; callers deduce subsequent
+    /// number of the FIRST appended event, or `null` if `payloads`
+    /// was empty (no events appended). Callers deduce subsequent
     /// seqs as `first + 0, first + 1, ...`.
+    ///
+    /// BUG #27 cascade: the underlying `RedexFile::append_batch`
+    /// returns `Result<Option<u64>>` so callers can distinguish
+    /// "wrote zero" from "wrote one with seq N". The TypeScript
+    /// signature mirrors that — `BigInt | null`.
     #[napi]
-    pub fn append_batch(&self, payloads: Vec<Buffer>) -> Result<BigInt> {
+    pub fn append_batch(&self, payloads: Vec<Buffer>) -> Result<Option<BigInt>> {
         let bytes: Vec<Bytes> = payloads
             .into_iter()
             .map(|b| Bytes::copy_from_slice(b.as_ref()))
@@ -286,7 +292,7 @@ impl RedexFile {
             .inner
             .append_batch(&bytes)
             .map_err(|e| redex_err("append_batch", e))?;
-        Ok(BigInt::from(seq))
+        Ok(seq.map(BigInt::from))
     }
 
     /// Read the half-open range `[start, end)` from the in-memory
