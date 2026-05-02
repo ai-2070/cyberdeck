@@ -570,6 +570,22 @@ impl Adapter for JetStreamAdapter {
                         // fix intended; logging-and-skipping would
                         // re-bury it under the existing "wrong
                         // shard" symptom downstream.
+                        //
+                        // Caveat: any events the loop has
+                        // *already* accumulated in `events` are
+                        // dropped here — the caller sees the
+                        // `Fatal` error and never the partial
+                        // batch. The cursor was not yet returned,
+                        // so a retry of `poll_shard` would
+                        // re-walk those sequences from the start.
+                        // Acceptable because `Fatal` is non-
+                        // retryable (`is_retryable` returns
+                        // false): the caller is expected to
+                        // surface the corruption to operators
+                        // rather than retry, so the dropped
+                        // prefix is a diagnostic price for
+                        // making the corruption observable, not
+                        // a silent data loss.
                         Err(e) => return Err(e),
                     }
                     current_seq += 1;
