@@ -1329,6 +1329,42 @@ mod tests {
         assert_eq!(f.next_seq(), 3);
     }
 
+    /// `Debug` must not acquire `state.lock()`. Pre-fix it called
+    /// `self.len()` and `self.next_seq()`, both of which lock the
+    /// state mutex. Any caller that printed a `RedexFile` from
+    /// inside an existing `state`-locked region (e.g. a future
+    /// `tracing::?(?file, …)` inside an append path) would
+    /// deadlock against itself. The fix reads the lock-free
+    /// atomics directly. We pin the property by holding the lock
+    /// across a `format!("{:?}", file)` call — pre-fix this
+    /// deadlocks; post-fix it returns immediately.
+    #[test]
+    fn debug_does_not_acquire_state_lock() {
+        use std::sync::atomic::Ordering;
+        let f = make_file("t-debug-lock");
+        f.append(b"x").unwrap();
+
+        // Hold the state lock and format the file. If `Debug`
+        // tries to take the same lock, the test hangs (would
+        // be caught by CI test-timeout, but more importantly it
+        // would have hung pre-fix).
+        let guard = f.inner.state.lock();
+        let s = format!("{:?}", f);
+        drop(guard);
+
+        assert!(s.contains("RedexFile"));
+        assert!(
+            s.contains("next_seq_atomic"),
+            "Debug must surface the lock-free atomic, got: {s}"
+        );
+        // Sanity: the atomic value matches what `next_seq.load` returns.
+        let direct = f.inner.next_seq.load(Ordering::Relaxed);
+        assert!(
+            s.contains(&direct.to_string()),
+            "Debug must reflect the live atomic value, got: {s}"
+        );
+    }
+
     #[test]
     fn test_read_range_returns_events_in_order() {
         let f = make_file("t2");
