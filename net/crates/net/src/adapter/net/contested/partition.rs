@@ -150,8 +150,27 @@ impl PartitionDetector {
             _ => return None, // broad outage, not a partition
         };
 
+        // BUG #20: pre-fix `self.next_id += 1` panicked in debug
+        // and wrapped to 0 in release at u64::MAX, reusing partition
+        // ID 0 — `confirm` / `find_mut` would then operate on the
+        // wrong record. Astronomical in practice (a node would have
+        // to create ~1.8e19 partition records, which is absurd
+        // even for very long uptimes), but cheap to guard against
+        // a wrap that would silently corrupt partition tracking.
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self.next_id.checked_add(1).unwrap_or_else(|| {
+            // Saturate by leaving next_id at u64::MAX. The next
+            // detection call will see `id = u64::MAX` again,
+            // re-issue it, and stay at u64::MAX. Two records with
+            // the same id is a recoverable failure mode (the
+            // operator notices duplicate partition tracking) where
+            // wraparound to 0 is silent.
+            tracing::error!(
+                "partition next_id reached u64::MAX; saturating to avoid \
+                 wrap-to-0 collisions with active records"
+            );
+            u64::MAX
+        });
 
         let record = PartitionRecord {
             id,
