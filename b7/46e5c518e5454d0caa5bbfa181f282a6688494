@@ -1,0 +1,23 @@
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_02.md
+  7ca5654078561730 422-572
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b746e5c518e5454d0caa5bbfa181f282a6688494",
+  "prompts": {
+    "7ca5654078561730": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c868c43f-1dda-4161-ae8a-2eafdf43e18e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 151,
+      "total_deletions": 0,
+      "accepted_lines": 151,
+      "overriden_lines": 0
+    }
+  }
+}
