@@ -848,6 +848,23 @@ impl ShardManager {
             "Dynamic scaling not enabled".into(),
         ))?;
 
+        // Capture the mapper-side state *before* we unmap. This
+        // gates the `num_shards` decrement at the end so it stays
+        // symmetric with `activate_shard`'s `fetch_add`. The
+        // activate-failure rollback path (`bus.rs`) calls us on a
+        // shard that's still `Provisioning` — `add_shard` never
+        // bumped `num_shards` for it, so an unconditional
+        // `fetch_sub` here would leave the counter one below the
+        // table's actual size, breaking modulo-based shard
+        // selection. `Active` / `Draining` / `Stopped` shards all
+        // had `activate_shard` succeed against them at some point
+        // (it's the only way out of `Provisioning`), so they did
+        // bump `num_shards` and must decrement here.
+        let was_activated = matches!(
+            mapper.shard_state(shard_id),
+            Some(ShardState::Active) | Some(ShardState::Draining) | Some(ShardState::Stopped)
+        );
+
         // Drain whatever is left in the ring buffer before unmapping.
         // `with_shard` returns `None` once the shard is gone, so we
         // do this *before* `rebuild_table`. We cap drain to a sane
@@ -887,7 +904,7 @@ impl ShardManager {
             }
         });
 
-        if removed {
+        if removed && was_activated {
             self.num_shards
                 .fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
@@ -1501,6 +1518,62 @@ mod tests {
             3,
             "repeated activate_shard must NOT keep bumping num_shards; \
              pre-fix this would be 5 after three calls",
+        );
+    }
+
+    /// Removing a still-`Provisioning` shard (the activate-failure
+    /// rollback path) must NOT decrement `num_shards`. `add_shard`
+    /// only registers a `Provisioning` entry and intentionally
+    /// leaves `num_shards` alone — the bump happens in
+    /// `activate_shard`. A symmetric `fetch_sub` in `remove_shard`
+    /// would therefore leave the counter one below the routing
+    /// table's actual size after a rollback, breaking modulo-based
+    /// shard selection. This pins the gating: the rollback removal
+    /// is a num_shards no-op, while removing an activated shard
+    /// still decrements normally.
+    #[test]
+    fn remove_provisioning_shard_does_not_decrement_num_shards() {
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 16,
+            cooldown: std::time::Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let manager = ShardManager::with_mapper(2, 1024, BackpressureMode::DropOldest, policy)
+            .expect("dynamic scaling enabled");
+        let initial = manager.num_shards();
+        assert_eq!(initial, 2);
+
+        // add_shard registers a Provisioning entry (no num_shards bump).
+        let new_id = manager.add_shard().expect("add_shard");
+        assert_eq!(
+            manager.num_shards(),
+            initial,
+            "add_shard must NOT bump num_shards (Provisioning, not yet selectable)"
+        );
+
+        // Simulate the activate-failure rollback path: remove the
+        // never-activated shard. Pre-fix this fired
+        // `fetch_sub(1)` unconditionally and dropped num_shards
+        // below the table size.
+        let stranded = manager.remove_shard(new_id).expect("rollback remove");
+        assert!(stranded.is_empty(), "fresh provisioning shard has no events");
+        assert_eq!(
+            manager.num_shards(),
+            initial,
+            "removing a provisioning (never-activated) shard must NOT decrement num_shards"
+        );
+
+        // Companion: removing an activated shard still decrements,
+        // so the gate is symmetric with activate_shard's fetch_add.
+        let activated_id = manager.add_shard().expect("add for activated path");
+        manager.activate_shard(activated_id).expect("activate");
+        assert_eq!(manager.num_shards(), initial + 1, "activate bumps num_shards");
+        manager.remove_shard(activated_id).expect("remove activated");
+        assert_eq!(
+            manager.num_shards(),
+            initial,
+            "removing an activated shard MUST decrement num_shards"
         );
     }
 }
