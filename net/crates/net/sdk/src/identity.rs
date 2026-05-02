@@ -136,6 +136,11 @@ impl Identity {
     ///
     /// `delegation_depth = 0` disallows re-delegation (subject cannot
     /// mint further tokens from this one).
+    ///
+    /// # Panics
+    /// Panics on a zero `ttl` (TTL of 0 seconds would produce a
+    /// born-expired token; BUG #22). For untrusted input prefer
+    /// [`Self::try_issue_token`].
     pub fn issue_token(
         &self,
         subject: EntityId,
@@ -144,7 +149,26 @@ impl Identity {
         ttl: Duration,
         delegation_depth: u8,
     ) -> PermissionToken {
-        PermissionToken::issue(
+        self.try_issue_token(subject, scope, channel, ttl, delegation_depth)
+            .expect("Identity::issue_token: invalid input (use try_issue_token for fallible)")
+    }
+
+    /// Fallible variant of [`Self::issue_token`].
+    ///
+    /// BUG #22: returns [`TokenError::ZeroTtl`] when `ttl ==
+    /// Duration::ZERO`. Pre-fix this minted a born-expired token
+    /// — every receiver rejected it as `Expired` and the issuer
+    /// learned about the misuse only by reading log lines on the
+    /// receiver side.
+    pub fn try_issue_token(
+        &self,
+        subject: EntityId,
+        scope: TokenScope,
+        channel: &ChannelName,
+        ttl: Duration,
+        delegation_depth: u8,
+    ) -> Result<PermissionToken, TokenError> {
+        PermissionToken::try_issue(
             &self.keypair,
             subject,
             scope,

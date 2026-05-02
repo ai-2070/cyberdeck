@@ -54,6 +54,7 @@ fn token_error_kind(e: &TokenError) -> &'static str {
         TokenError::NotAuthorized => "not_authorized",
         TokenError::InvalidFormat => "invalid_format",
         TokenError::ReadOnly => "read_only",
+        TokenError::ZeroTtl => "zero_ttl",
     }
 }
 
@@ -230,14 +231,20 @@ impl Identity {
         let subject_id = buffer_to_entity_id(&subject)?;
         let scope_bits = parse_scope(scope)?;
         let channel_hash = channel_to_hash(&channel)?;
-        let token = PermissionToken::issue(
+        // BUG #22: route through `try_issue` so a `ttl_seconds=0`
+        // surfaces as `TokenError::ZeroTtl` (mapped to NAPI
+        // Error here) rather than minting a born-expired token
+        // that every receiver rejects with no diagnostic to the
+        // issuer.
+        let token = PermissionToken::try_issue(
             &self.keypair,
             subject_id,
             scope_bits,
             channel_hash,
             u64::from(ttl_seconds),
             delegation_depth,
-        );
+        )
+        .map_err(map_token_err)?;
         Ok(Buffer::from(token.to_bytes()))
     }
 

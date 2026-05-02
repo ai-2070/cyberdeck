@@ -140,6 +140,13 @@ fn token_err_to_code(e: &CoreTokenError) -> c_int {
         // token-content issue. The error message in `Display`
         // makes the cause clear to the caller.
         CoreTokenError::ReadOnly => NET_ERR_IDENTITY,
+        // BUG #22: a zero-TTL request is a malformed token-issue
+        // input. Routes to `NET_ERR_TOKEN_INVALID_FORMAT` (the
+        // closest existing semantic — invalid input shape) so
+        // the C/Go header surface stays unchanged. The Display
+        // message ("token TTL must be > 0 seconds") tells the
+        // caller exactly what was wrong.
+        CoreTokenError::ZeroTtl => NET_ERR_TOKEN_INVALID_FORMAT,
     }
 }
 

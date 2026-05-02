@@ -51,6 +51,7 @@ pub(crate) fn token_error_kind(e: &CoreTokenError) -> &'static str {
         CoreTokenError::NotAuthorized => "not_authorized",
         CoreTokenError::InvalidFormat => "invalid_format",
         CoreTokenError::ReadOnly => "read_only",
+        CoreTokenError::ZeroTtl => "zero_ttl",
     }
 }
 
@@ -230,14 +231,18 @@ impl Identity {
         let subject_id = bytes_to_entity_id(subject)?;
         let scope_bits = parse_scope(&scope)?;
         let channel_hash = channel_to_hash(channel)?;
-        let token = PermissionToken::issue(
+        // BUG #22: route through `try_issue` so `ttl_seconds=0`
+        // surfaces as `TokenError::ZeroTtl` rather than minting a
+        // born-expired token.
+        let token = PermissionToken::try_issue(
             &self.keypair,
             subject_id,
             scope_bits,
             channel_hash,
             u64::from(ttl_seconds),
             delegation_depth,
-        );
+        )
+        .map_err(token_err)?;
         Ok(token.to_bytes())
     }
 

@@ -184,6 +184,17 @@ impl PermissionToken {
         duration_secs: u64,
         delegation_depth: u8,
     ) -> Result<Self, TokenError> {
+        // BUG #22: a TTL of 0 produces a token with
+        // `not_after == not_before`. The signature verifies but
+        // `is_valid()` rejects it as `Expired` immediately
+        // (`is_valid` uses strict `now >= not_after`, so a token
+        // with `not_after == now` is born expired). The caller
+        // mints something unusable with no diagnostic. Reject at
+        // issue time so the bug surfaces as a typed error rather
+        // than a silent "every check fails on the receiver".
+        if duration_secs == 0 {
+            return Err(TokenError::ZeroTtl);
+        }
         let now = current_timestamp();
         // Abort on `getrandom` failure rather than
         // panic-unwinding through the FFI boundary. Token nonces
@@ -696,6 +707,15 @@ pub enum TokenError {
     /// or other read-only construction). The caller's signing
     /// operation is not possible.
     ReadOnly,
+    /// `duration_secs == 0` was passed to [`PermissionToken::try_issue`].
+    ///
+    /// BUG #22: pre-fix, a TTL of 0 produced a token with
+    /// `not_after == not_before`, which every receiver immediately
+    /// rejects as `Expired`. The signature verifies but every
+    /// authorization check fails — silently. Reject at issue
+    /// time so the caller learns about the misuse instead of
+    /// minting an unusable token.
+    ZeroTtl,
 }
 
 impl std::fmt::Display for TokenError {
@@ -709,6 +729,7 @@ impl std::fmt::Display for TokenError {
             Self::NotAuthorized => write!(f, "not authorized"),
             Self::InvalidFormat => write!(f, "invalid token format"),
             Self::ReadOnly => write!(f, "signer keypair is public-only"),
+            Self::ZeroTtl => write!(f, "token TTL must be > 0 seconds"),
         }
     }
 }
@@ -747,6 +768,52 @@ mod tests {
         assert!(token.is_valid().is_ok());
     }
 
+    /// BUG #22: a TTL of 0 must surface as `TokenError::ZeroTtl`,
+    /// not silently mint a born-expired token. Pre-fix, the
+    /// caller got a token whose signature verified but every
+    /// authorization check failed at the receiver — no diagnostic
+    /// to the issuer.
+    #[test]
+    fn try_issue_rejects_zero_ttl() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        let err = PermissionToken::try_issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            0, // ttl = 0 seconds — the bug
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            TokenError::ZeroTtl,
+            "expected ZeroTtl, got {:?}",
+            err
+        );
+    }
+
+    /// BUG #22 corollary: TTL of 1 second is the lowest valid
+    /// value; must mint a token that is `is_valid()` immediately.
+    #[test]
+    fn try_issue_accepts_one_second_ttl() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        let token = PermissionToken::try_issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            1, // 1 second — minimum valid
+            0,
+        )
+        .expect("ttl=1 must mint cleanly (boundary)");
+        assert!(token.is_valid().is_ok());
+    }
+
     #[test]
     fn test_tampered_token() {
         let issuer = EntityKeypair::generate();
@@ -771,26 +838,29 @@ mod tests {
         let issuer = EntityKeypair::generate();
         let subject = EntityKeypair::generate();
 
-        let token = PermissionToken::issue(
+        // Mint with the minimum valid TTL (1 second), then
+        // backdate `not_after` to the past and re-sign — this is
+        // how we test expiry semantics now that BUG #22 rejects
+        // `duration_secs == 0` outright.
+        let mut token = PermissionToken::issue(
             &issuer,
             subject.entity_id().clone(),
             TokenScope::PUBLISH,
             0,
-            0, // expires immediately
+            1,
             0,
         );
+        token.not_after = 0;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
 
         assert!(token.verify().is_ok(), "signature is valid");
-        // `issue(duration=0)` sets `not_after = now`, and the
-        // inclusive-expiry convention (`now >= not_after`) says
-        // "expired exactly at the boundary" — so a zero-duration
-        // token is always expired on the very next read, without
-        // any timing ambiguity. This used to be "borderline"
-        // because the old `>` check let the boundary second count
-        // as valid.
+        // `not_after = 0` and the inclusive-expiry convention
+        // (`now >= not_after`) says "expired" — `is_expired` and
+        // `is_valid` must agree at the boundary.
         assert!(
             token.is_expired(),
-            "duration=0 token must report expired under inclusive-expiry",
+            "backdated token must report expired under inclusive-expiry",
         );
         assert!(
             matches!(token.is_valid(), Err(TokenError::Expired)),
@@ -1160,13 +1230,15 @@ mod tests {
         let subject = EntityKeypair::generate();
         let cache = TokenCache::new();
 
-        // Insert an expired channel-specific token
+        // Insert an expired channel-specific token. Mint with
+        // TTL=1 (BUG #22 rejects 0), then backdate not_after to
+        // force expiry.
         let mut expired_token = PermissionToken::issue(
             &issuer,
             subject.entity_id().clone(),
             TokenScope::PUBLISH,
             0xABCD,
-            0, // expires immediately
+            1,
             0,
         );
         // Force expiry by setting not_after to the past
