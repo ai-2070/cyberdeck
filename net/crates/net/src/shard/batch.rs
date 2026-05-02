@@ -382,6 +382,55 @@ mod tests {
         assert_eq!(batch.shard_id, 0);
     }
 
+    /// `add_events(vec![])` is **not** a no-op. The activate-failure
+    /// rollback path in `bus.rs` and the BatchWorker's recv-timeout
+    /// arm both rely on the empty-input call to drive a
+    /// `check_timeout`, which can flush `current_batch` if
+    /// `max_delay` has elapsed. A future refactor that makes
+    /// `add_events([])` a true no-op would silently lose those
+    /// already-batched events on the rollback path. Pin the
+    /// load-bearing behavior here so any such "cleanup" trips a
+    /// failing test rather than producing a silent regression.
+    #[test]
+    fn add_events_empty_can_flush_via_timeout() {
+        let config = BatchConfig {
+            min_size: 10,
+            max_size: 1000,
+            max_delay: Duration::from_millis(1),
+            adaptive: false,
+            velocity_window: Duration::from_millis(100),
+        };
+        let mut worker = BatchWorker::new(0, config, fresh_published(), 0);
+
+        // Stage some events well below `min_size` so neither size
+        // threshold can hide the timeout-flush.
+        let pre = worker.add_events(make_events(3, 0));
+        assert!(pre.is_none(), "below min_size — no flush yet");
+
+        // Empty input *before* max_delay must be a no-op (returns
+        // None). This pins the second half of the contract: the
+        // side-effect is bounded to "check timeout", not "always
+        // flush".
+        let early = worker.add_events(vec![]);
+        assert!(
+            early.is_none(),
+            "empty input before max_delay must NOT flush — \
+             check_timeout returns None when start.elapsed() < max_delay"
+        );
+
+        // Wait past max_delay and call with empty input — must flush.
+        std::thread::sleep(Duration::from_millis(5));
+        let flushed = worker.add_events(vec![]);
+        assert!(
+            flushed.is_some(),
+            "empty input after max_delay MUST flush via check_timeout — \
+             this is the contract bus.rs and BatchWorker's recv-timeout \
+             arm rely on; making it a no-op silently loses events on \
+             the activate-failure rollback path"
+        );
+        assert_eq!(flushed.unwrap().events.len(), 3);
+    }
+
     #[test]
     fn test_batch_timeout() {
         let config = BatchConfig {
