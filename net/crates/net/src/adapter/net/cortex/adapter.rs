@@ -514,7 +514,21 @@ where
             // `Stop`.
             let recoverable_decode = err.is_recoverable_decode();
             match policy {
-                FoldErrorPolicy::Stop if !recoverable_decode => true,
+                FoldErrorPolicy::Stop if !recoverable_decode => {
+                    // BUG #30: pre-fix this halt branch returned
+                    // without firing notify_waiters or
+                    // changes_tx.send. Subscribers using
+                    // `changes_with_lag()` to track the live tail
+                    // got no terminal signal — they learned the
+                    // task halted only by separately polling
+                    // is_running(). Fire one final notification
+                    // on the failing seq so subscribers wake up
+                    // and observe the halt via their own
+                    // is_running() check.
+                    inner.notify.notify_waiters();
+                    let _ = inner.changes_tx.send(seq);
+                    true
+                }
                 FoldErrorPolicy::Stop | FoldErrorPolicy::LogAndContinue => {
                     // Watermark was already advanced inside the lock
                     // above; just notify waiters.
