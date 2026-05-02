@@ -169,6 +169,19 @@ pub struct EventBusStats {
     /// `events_dispatched + events_dropped == events_ingested`. FFI
     /// consumers can also use this to monitor end-to-end delivery.
     pub events_dispatched: AtomicU64,
+    /// Set to `true` if `shutdown()` / `shutdown_via_ref()` had to
+    /// proceed past the in-flight-ingest grace deadline (5 s) with
+    /// producers still mid-push. The stranded count is counted into
+    /// `events_dropped` (already; pre-fix), but `shutdown` returns
+    /// `Ok(())` regardless — callers that need to distinguish
+    /// "clean shutdown" from "lossy shutdown" check this flag in
+    /// `bus.stats()` afterward (only meaningful for the
+    /// `shutdown_via_ref` path that doesn't consume the bus).
+    ///
+    /// BUG #48: pre-fix the warning + `events_dropped` increment
+    /// were the only signal; `Result<(), AdapterError>` returned
+    /// `Ok` indistinguishable from a clean shutdown.
+    pub shutdown_was_lossy: std::sync::atomic::AtomicBool,
 }
 
 impl EventBus {
@@ -1171,6 +1184,7 @@ impl EventBus {
                 let stranded = self.in_flight_ingests.load(AtomicOrdering::SeqCst);
                 tracing::warn!(
                     in_flight = stranded,
+                    lossy = true,
                     "shutdown timed out waiting for in-flight ingests after 5s; \
                      proceeding — up to {} events may strand in the ring buffer \
                      past final drain (documented data-loss path)",
@@ -1183,6 +1197,13 @@ impl EventBus {
                 self.stats
                     .events_dropped
                     .fetch_add(stranded as u64, AtomicOrdering::Relaxed);
+                // BUG #48: also set the dedicated lossy-shutdown
+                // flag so `shutdown_via_ref` callers can detect a
+                // lossy outcome without parsing log lines or
+                // diffing `events_dropped` snapshots.
+                self.stats
+                    .shutdown_was_lossy
+                    .store(true, AtomicOrdering::Release);
                 break;
             }
             tokio::task::yield_now().await;
