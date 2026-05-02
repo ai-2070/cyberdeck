@@ -1,0 +1,23 @@
+net/crates/net/bindings/node/src/groups.rs
+  7cd1aa3948e2e296 663-667,670,672,677-682,685-686
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "abb1e3367fc4aecfa8563102081983c0f4b6a066",
+  "prompts": {
+    "7cd1aa3948e2e296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad152adb-b4ac-4388-af9c-44b44434d029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 15,
+      "total_deletions": 2,
+      "accepted_lines": 1041,
+      "overriden_lines": 0
+    }
+  }
+}
