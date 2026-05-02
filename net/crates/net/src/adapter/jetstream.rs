@@ -519,7 +519,20 @@ impl Adapter for JetStreamAdapter {
         // (the `first_sequence` jump above already collapses huge
         // retention-rollover gaps in a single step) but small
         // enough that a cold stream doesn't burn 1000+ RTTs.
+        //
+        // The cap is gated on `first_seq == 0`: when the stream's
+        // first retained sequence is non-zero, `info()` succeeded
+        // and reported real data, so there's no risk of an
+        // unbounded walk on a cold/empty stream — `current_seq >
+        // max_seq` is the natural stop. Applying the cap there
+        // would truncate polling on a *sparse* populated stream
+        // (events at e.g. seq 1, 500, 1000) by breaking before
+        // reaching later valid sequences. `first_seq == 0` covers
+        // both genuinely empty streams and `info()` failures (the
+        // fallback uses `first_seq = 0`); both want the early-
+        // bail protection.
         let consecutive_not_found_cap = (fetch_limit / 2).max(64);
+        let cold_stream_bail_enabled = first_seq == 0;
         let mut consecutive_not_found = 0usize;
         while events.len() < fetch_limit {
             if current_seq > max_seq {
@@ -596,9 +609,14 @@ impl Adapter for JetStreamAdapter {
                         DirectGetErrorKind::NotFound => {
                             // Try next sequence (there might be gaps due to deletions),
                             // but bail after `consecutive_not_found_cap` to avoid
-                            // burning RTTs on a cold stream.
+                            // burning RTTs on a cold stream. Only applies when
+                            // `cold_stream_bail_enabled` (i.e. `first_seq == 0`):
+                            // a sparse populated stream needs to walk past arbitrarily
+                            // long deletion gaps to reach later events.
                             consecutive_not_found += 1;
-                            if consecutive_not_found >= consecutive_not_found_cap {
+                            if cold_stream_bail_enabled
+                                && consecutive_not_found >= consecutive_not_found_cap
+                            {
                                 tracing::debug!(
                                     stream = %self.stream_name(shard_id),
                                     consecutive_not_found,
