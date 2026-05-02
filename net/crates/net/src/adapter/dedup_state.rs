@@ -216,16 +216,41 @@ impl PersistentProducerNonce {
             p.set_file_name(name);
             p
         };
-        fs::write(&tmp_path, buf)?;
-
-        // Best-effort fsync of the file before rename. On Windows
-        // `File::sync_all` is supported but the rename-durability
-        // guarantee is weaker than POSIX; production callers that
-        // need strict durability should use a filesystem with
-        // appropriate ordering. We do the fsync regardless because
-        // it's the ceiling-set part of the contract.
-        if let Ok(f) = fs::File::open(&tmp_path) {
-            let _ = f.sync_all();
+        // BUG #40 + #68: pre-fix, the write/sync split was
+        //   fs::write(&tmp_path, buf)?;        // (a) write + close
+        //   if let Ok(f) = fs::File::open(&tmp_path) {
+        //       let _ = f.sync_all();          // (b) sync_all on
+        //                                      //     a read-only handle
+        //   }
+        // Two distinct hazards:
+        //   #40 — `let _ = f.sync_all()` swallowed disk-full / I/O
+        //         errors; the producer-nonce file was reported as
+        //         "saved" while still being only in the kernel
+        //         page cache. A power loss between rename and the
+        //         OS's own background flush left the nonce file
+        //         partial / undurable, breaking cross-restart
+        //         dedup on next start.
+        //   #68 — On Windows, `fs::File::open(&path)` opens
+        //         read-only. `File::sync_all` calls
+        //         `FlushFileBuffers`, which returns
+        //         `ERROR_ACCESS_DENIED` on a read-only handle —
+        //         the entire fsync was a silent no-op on every
+        //         Windows install.
+        //
+        // Post-fix uses a single writable handle for write+sync
+        // and propagates both errors. `OpenOptions` with
+        // `create_new(true)` matches the per-call-unique tmp_path
+        // contract; if a stale tempfile happens to exist (prior
+        // crash), the create_new fails and the caller retries
+        // with a fresh tmp name.
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
         }
         // `fs::rename` is `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` on
         // Windows / `rename(2)` on Unix — atomic replace on POSIX,
