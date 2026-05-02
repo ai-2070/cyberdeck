@@ -515,18 +515,30 @@ where
             let recoverable_decode = err.is_recoverable_decode();
             match policy {
                 FoldErrorPolicy::Stop if !recoverable_decode => {
-                    // Pre-fix, this halt branch returned
-                    // without firing notify_waiters or
-                    // changes_tx.send. Subscribers using
-                    // `changes_with_lag()` to track the live tail
-                    // got no terminal signal — they learned the
-                    // task halted only by separately polling
-                    // is_running(). Fire one final notification
-                    // on the failing seq so subscribers wake up
-                    // and observe the halt via their own
-                    // is_running() check.
+                    // Wake subscribers via `notify_waiters` so
+                    // anything parked on `inner.notify` unblocks
+                    // and can observe the halt via
+                    // `is_running()`. Do NOT broadcast `seq` on
+                    // `changes_tx`: this branch did not advance
+                    // `folded_through_seq` (the `advance` gate
+                    // above is false for `Stop + non-recoverable`),
+                    // and `changes_tx` is documented as carrying
+                    // *successful fold-apply* notifications. A
+                    // `ChangeEvent::Seq(seq)` for an unapplied
+                    // sequence would mislead consumers into
+                    // thinking the watermark advanced past the
+                    // failure — the very mis-routing the broadcast
+                    // contract was designed to avoid.
+                    //
+                    // The trade-off: subscribers using
+                    // `changes_with_lag()` won't see a terminal
+                    // event in the stream on halt; they need to
+                    // poll `is_running()` separately (or rely on
+                    // the broadcast channel ending when all adapter
+                    // handles are dropped). That's the documented
+                    // failure mode for non-recoverable halts —
+                    // surfacing a phantom seq was not.
                     inner.notify.notify_waiters();
-                    let _ = inner.changes_tx.send(seq);
                     true
                 }
                 FoldErrorPolicy::Stop | FoldErrorPolicy::LogAndContinue => {
@@ -655,6 +667,70 @@ mod tests {
         assert_eq!(adapter.fold_errors(), 1);
         // Seqs 0..=2 folded; seq 3 errored; seqs 4..=9 never folded.
         assert_eq!(*adapter.state().read(), 3);
+    }
+
+    /// `changes_tx` is the broadcast channel `changes_with_lag`
+    /// surfaces as `ChangeEvent::Seq(u64)` — documented as
+    /// "successful fold-apply notification". On the
+    /// Stop+non-recoverable halt path, the watermark
+    /// (`folded_through_seq`) is NOT advanced, so emitting the
+    /// failing seq on `changes_tx` would mis-represent an
+    /// unapplied event as if it were folded. Subscribers reading
+    /// the broadcast and trusting the contract would advance
+    /// their own state machines past the failure.
+    ///
+    /// Pin: after a Stop-policy halt, the broadcast must contain
+    /// the prefix that *did* apply (seqs 0..=2), and must NOT
+    /// contain the failing seq (3) or any later seq.
+    #[tokio::test]
+    async fn stop_policy_does_not_broadcast_failing_seq() {
+        use futures::StreamExt;
+
+        let redex = Redex::new();
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/stop-no-phantom-seq"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(), // Stop is default
+            FailAtSeq(3),
+            0u64,
+        )
+        .unwrap();
+
+        // Subscribe BEFORE ingesting so we capture every seq.
+        let mut changes = adapter.changes_with_lag();
+
+        for i in 0..10u64 {
+            let meta = EventMeta::new(0, 0, 0, i, 0);
+            let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+            adapter.ingest(env).unwrap();
+        }
+
+        // Wait for halt.
+        adapter.wait_for_seq(10).await;
+        assert!(!adapter.is_running(), "Stop policy must halt the task");
+        assert_eq!(adapter.fold_errors(), 1);
+
+        // Drain the broadcast with a short bound so a regression
+        // that re-emits the phantom seq doesn't hang the test.
+        let mut received: Vec<u64> = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), changes.next()).await {
+                Ok(Some(ChangeEvent::Seq(s))) => received.push(s),
+                Ok(Some(ChangeEvent::Lagged(_))) => continue,
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        // Successful prefix (0, 1, 2) must be visible. The failing
+        // seq (3) and any later seq must NOT.
+        assert_eq!(
+            received,
+            vec![0, 1, 2],
+            "broadcast must carry only successfully-folded seqs; \
+             pre-fix this would include 3 (the failing seq) as a \
+             phantom Seq(3) event, mis-routing subscribers' state"
+        );
     }
 
     // ========================================================================
