@@ -470,7 +470,25 @@ impl ReplayWindow {
         if shift == 0 {
             return;
         }
+        // BUG #37: pre-fix this branch silently zeroed the bitmap
+        // when a legitimate jump exceeded `WINDOW_SIZE` (1024
+        // packets). `MAX_FORWARD` is 65_536, so a single packet
+        // accepted with `received - rx_counter > 1024` clears the
+        // last 64-ish thousand counters' replay tracking — those
+        // sequence numbers can be replayed undetected. Operators
+        // should know when this happens so they can investigate
+        // (a misbehaving peer, a debug-only fast-forward, or
+        // adversarial packet injection mid-stream). Log at warn
+        // before zeroing.
         if shift >= (Self::BITMAP_WORDS as u64) * 64 {
+            tracing::warn!(
+                shift,
+                window_size = Self::WINDOW_SIZE,
+                max_forward = Self::MAX_FORWARD,
+                "anti-replay bitmap reset on large forward jump; \
+                 prior {} counters lost replay tracking",
+                Self::WINDOW_SIZE,
+            );
             self.bitmap = [0; Self::BITMAP_WORDS];
             return;
         }
