@@ -976,6 +976,27 @@ impl RedexFile {
 
     /// Run the retention policy synchronously. Exposed so a background
     /// task (heartbeat loop) can drive it; no hot-path cost.
+    ///
+    /// # BUG #12 — disk I/O under parking_lot Mutex
+    ///
+    /// `sweep_retention` and `append_batch` call disk operations
+    /// (`disk.compact_to`, `disk.append_entries_at`) while
+    /// holding `state.lock()`, a non-yielding parking_lot Mutex.
+    /// All concurrent appenders, `tail` registrations,
+    /// `read_range`, `len`, `is_empty`, and `close` block on the
+    /// same lock for the duration of the I/O. **This is a
+    /// latency / starvation concern, not a correctness one.**
+    /// Throughput-critical deployments should drive
+    /// `sweep_retention` from a low-priority background task
+    /// scheduled outside the hot path.
+    ///
+    /// A proper fix would snapshot the state needed for I/O,
+    /// release the lock, perform I/O, then re-acquire to
+    /// commit — that's a substantial restructure (transactional
+    /// staging area, conflict resolution against concurrent
+    /// appends) and out of scope here. Documented as a known
+    /// performance trade-off so future profilers don't
+    /// rediscover it as a "bug".
     pub fn sweep_retention(&self) {
         let cfg = self.inner.config;
         if cfg.retention_max_events.is_none()
