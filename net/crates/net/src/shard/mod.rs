@@ -789,13 +789,24 @@ impl ShardManager {
     /// will land in its ring buffer.
     ///
     /// Idempotent: calling on an already-`Active` shard is `Ok(())`.
+    ///
+    /// BUG #35: pre-fix this unconditionally `fetch_add(1)`d
+    /// `num_shards` even when the mapper's `activate()` early-
+    /// returned for an already-`Active` shard. After repeated
+    /// activate calls, `num_shards` exceeded both the mapper's
+    /// `active_count` and the actual shard count, breaking
+    /// modulo-based shard selection (`select_shard`) and
+    /// producing stale routing decisions.  Post-fix gates the
+    /// `fetch_add` on the mapper's transition signal.
     pub fn activate_shard(&self, shard_id: u16) -> Result<(), ScalingError> {
         let mapper = self.mapper.as_ref().ok_or(ScalingError::InvalidPolicy(
             "Dynamic scaling not enabled".into(),
         ))?;
-        mapper.activate(shard_id)?;
-        self.num_shards
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let transitioned = mapper.activate(shard_id)?;
+        if transitioned {
+            self.num_shards
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         Ok(())
     }
 
@@ -1447,5 +1458,45 @@ mod tests {
 
         // Sanity: shard 1 is gone from routing.
         assert!(manager.with_shard(1, |s| s.id).is_none());
+    }
+
+    /// BUG #35: `ShardManager::activate_shard` is idempotent at
+    /// the API level — two calls on the same shard return Ok(())
+    /// each — but pre-fix `num_shards` was bumped on every call
+    /// even when the mapper's `activate()` had already
+    /// transitioned the shard to Active. After repeated calls,
+    /// `num_shards` exceeded the actual count and `select_shard`'s
+    /// modulo arithmetic mis-routed.
+    #[test]
+    fn activate_shard_is_idempotent_in_num_shards_count() {
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 16,
+            cooldown: std::time::Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let manager = ShardManager::with_mapper(2, 1024, BackpressureMode::DropOldest, policy)
+            .expect("dynamic scaling enabled");
+        let initial = manager.num_shards();
+        assert_eq!(initial, 2);
+
+        // Add + activate a new shard. count goes 2 → 3.
+        let new_id = manager.add_shard().expect("add_shard");
+        manager.activate_shard(new_id).expect("first activate");
+        assert_eq!(
+            manager.num_shards(),
+            3,
+            "first activate must bump num_shards to 3"
+        );
+
+        // Repeat activate — must be a no-op on the count.
+        manager.activate_shard(new_id).expect("second activate (idempotent)");
+        manager.activate_shard(new_id).expect("third activate (idempotent)");
+        assert_eq!(
+            manager.num_shards(),
+            3,
+            "BUG #35: repeated activate_shard must NOT keep bumping num_shards; \
+             pre-fix this would be 5 after three calls",
+        );
     }
 }

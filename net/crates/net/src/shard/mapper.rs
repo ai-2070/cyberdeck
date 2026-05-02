@@ -749,12 +749,20 @@ impl ShardMapper {
 
     /// Transition a `Provisioning` shard to `Active`.
     ///
-    /// Idempotent for `Active` shards (returns `Ok(())` without
-    /// re-firing the callback). Returns `InvalidPolicy` for unknown
-    /// or `Draining`/`Stopped` shards — those states require a
-    /// different lifecycle path. Bumps `active_count` and notifies
-    /// the `on_shard_created` callback exactly once.
-    pub fn activate(&self, shard_id: u16) -> Result<(), ScalingError> {
+    /// Returns `Ok(true)` if a state transition actually occurred
+    /// (Provisioning → Active) and `Ok(false)` if the shard was
+    /// already `Active` — the latter is the idempotent path.
+    /// Returns `InvalidPolicy` for unknown or `Draining`/`Stopped`
+    /// shards — those states require a different lifecycle path.
+    /// Bumps `active_count` and notifies the `on_shard_created`
+    /// callback exactly once per real transition.
+    ///
+    /// BUG #35: pre-fix this returned `Result<(), ScalingError>`,
+    /// so callers (notably `ShardManager::activate_shard`) could
+    /// not tell whether they had bumped the live count or not and
+    /// double-incremented their own `num_shards` on every
+    /// idempotent call.
+    pub fn activate(&self, shard_id: u16) -> Result<bool, ScalingError> {
         let mut shards = self.shards.write();
         let shard = shards
             .iter_mut()
@@ -763,7 +771,7 @@ impl ShardMapper {
                 ScalingError::InvalidPolicy(format!("activate: shard {} not found", shard_id))
             })?;
         match shard.state {
-            ShardState::Active => return Ok(()),
+            ShardState::Active => return Ok(false),
             ShardState::Provisioning => {
                 // Gate activation on
                 // `active_count < max_shards`. The budget gate at
@@ -802,7 +810,7 @@ impl ShardMapper {
         if let Some(callback) = self.on_shard_created.read().as_ref() {
             callback(shard_id);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Drain a specific shard by id, transitioning it from `Active`
@@ -2006,5 +2014,47 @@ mod tests {
         // State should be `Stopped` (set by finalize_draining before
         // the lock was dropped).
         assert_eq!(observed[0].1, Some(ShardState::Stopped));
+    }
+
+    /// BUG #35: `activate` must signal whether a state transition
+    /// actually occurred so callers can avoid double-counting.
+    /// Pre-fix it returned `Result<(), _>`, so a caller that
+    /// invoked `activate` twice on the same shard incremented its
+    /// own external counter (e.g. `ShardManager::num_shards`)
+    /// twice for one logical transition.
+    #[test]
+    fn activate_returns_true_on_transition_and_false_on_idempotent_call() {
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 16,
+            cooldown: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let mapper = ShardMapper::new(2, 1024, policy).unwrap();
+
+        // Newly-provisioned shard 2 → Active: real transition.
+        let new_ids = mapper.scale_up_provisioning(1).unwrap();
+        assert_eq!(new_ids, vec![2]);
+        let first = mapper.activate(2).unwrap();
+        assert!(
+            first,
+            "first activate on a Provisioning shard must return true (BUG #35)"
+        );
+        assert_eq!(mapper.active_shard_count(), 3);
+
+        // Second activate on the same already-Active shard:
+        // idempotent, no transition.
+        let second = mapper.activate(2).unwrap();
+        assert!(
+            !second,
+            "activate on an already-Active shard must return false (BUG #35); \
+             pre-fix this returned Ok(()) and the caller couldn't tell"
+        );
+        // active_count must NOT have moved.
+        assert_eq!(
+            mapper.active_shard_count(),
+            3,
+            "idempotent activate must not bump active_count"
+        );
     }
 }
