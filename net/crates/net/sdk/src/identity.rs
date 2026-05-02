@@ -137,10 +137,14 @@ impl Identity {
     /// `delegation_depth = 0` disallows re-delegation (subject cannot
     /// mint further tokens from this one).
     ///
-    /// # Panics
-    /// Panics on a zero `ttl` (TTL of 0 seconds would produce a
-    /// born-expired token). For untrusted input prefer
-    /// [`Self::try_issue_token`].
+    /// `ttl == Duration::ZERO` is soft-clamped to 1 second (the
+    /// minimum non-born-expired TTL). In debug builds a
+    /// `debug_assert!` fires so the misuse surfaces in tests; in
+    /// release the SDK keeps a non-panicking surface for callers
+    /// that may receive a zero-duration value from upstream
+    /// configuration. Callers that need to *reject* zero TTLs at
+    /// the boundary should use [`Self::try_issue_token`], which
+    /// returns `TokenError::ZeroTtl`.
     pub fn issue_token(
         &self,
         subject: EntityId,
@@ -149,7 +153,17 @@ impl Identity {
         ttl: Duration,
         delegation_depth: u8,
     ) -> PermissionToken {
-        self.try_issue_token(subject, scope, channel, ttl, delegation_depth)
+        debug_assert!(
+            !ttl.is_zero(),
+            "Identity::issue_token called with Duration::ZERO; \
+             release builds soft-clamp to 1s, but the call site is likely a bug"
+        );
+        let effective_ttl = if ttl.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            ttl
+        };
+        self.try_issue_token(subject, scope, channel, effective_ttl, delegation_depth)
             .expect("Identity::issue_token: invalid input (use try_issue_token for fallible)")
     }
 
