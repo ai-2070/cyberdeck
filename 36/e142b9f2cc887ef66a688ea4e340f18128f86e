@@ -1,0 +1,25 @@
+net/crates/net/src/shard/mapper.rs
+  7cd1aa3948e2e296 752-765,774,813,2018-2059
+net/crates/net/src/shard/mod.rs
+  7cd1aa3948e2e296 792-800,805-809,1462-1501
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "36e142b9f2cc887ef66a688ea4e340f18128f86e",
+  "prompts": {
+    "7cd1aa3948e2e296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad152adb-b4ac-4388-af9c-44b44434d029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3593,
+      "total_deletions": 12,
+      "accepted_lines": 1138,
+      "overriden_lines": 0
+    }
+  }
+}
