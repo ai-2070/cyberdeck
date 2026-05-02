@@ -490,6 +490,22 @@ impl Adapter for JetStreamAdapter {
         let mut last_seen_seq: Option<u64> = None;
         let mut max_seq = max_seq;
         let mut max_seq_re_checked = false;
+        // BUG #54: pre-fix, on `stream.info()` failure for a
+        // cold/empty stream, `first_seq=0` and `max_seq=start_seq+
+        // fetch_limit*10` together caused the loop to walk every
+        // sequence from 1 to `max_seq`, doing one direct_get RTT
+        // per missing seq. With `fetch_limit=101`, that's ~1010
+        // RTTs per poll, observed as "JetStream is slow" in
+        // production.
+        //
+        // After K consecutive NotFound responses, declare the
+        // stream cold and bail. K is `max(64, fetch_limit / 2)` —
+        // big enough to skip ordinary gaps in a dense stream
+        // (the `first_sequence` jump above already collapses huge
+        // retention-rollover gaps in a single step) but small
+        // enough that a cold stream doesn't burn 1000+ RTTs.
+        let consecutive_not_found_cap = (fetch_limit / 2).max(64);
+        let mut consecutive_not_found = 0usize;
         while events.len() < fetch_limit {
             if current_seq > max_seq {
                 // Before declaring drain, re-read `info()` once to
@@ -513,6 +529,7 @@ impl Adapter for JetStreamAdapter {
             match stream.direct_get(current_seq).await {
                 Ok(msg) => {
                     last_seen_seq = Some(current_seq);
+                    consecutive_not_found = 0;
                     match Self::deserialize_event(current_seq, &msg.payload) {
                         Ok(event) => events.push(event),
                         Err(e) => {
@@ -530,7 +547,19 @@ impl Adapter for JetStreamAdapter {
                     use async_nats::jetstream::stream::DirectGetErrorKind;
                     match e.kind() {
                         DirectGetErrorKind::NotFound => {
-                            // Try next sequence (there might be gaps due to deletions)
+                            // Try next sequence (there might be gaps due to deletions),
+                            // but bail after `consecutive_not_found_cap` to avoid
+                            // burning RTTs on a cold stream (BUG #54).
+                            consecutive_not_found += 1;
+                            if consecutive_not_found >= consecutive_not_found_cap {
+                                tracing::debug!(
+                                    stream = %self.stream_name(shard_id),
+                                    consecutive_not_found,
+                                    current_seq,
+                                    "JetStream poll bailing after consecutive NotFounds"
+                                );
+                                break;
+                            }
                             current_seq += 1;
                         }
                         DirectGetErrorKind::InvalidSubject => {
