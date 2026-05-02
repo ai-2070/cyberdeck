@@ -1109,8 +1109,12 @@ mod tests {
             state: u64,
         }
         impl MeshDaemon for FailOnNth {
-            fn name(&self) -> &str { "fail-on-nth" }
-            fn requirements(&self) -> CapabilityFilter { CapabilityFilter::default() }
+            fn name(&self) -> &str {
+                "fail-on-nth"
+            }
+            fn requirements(&self) -> CapabilityFilter {
+                CapabilityFilter::default()
+            }
             fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
                 let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
                 if n == self.fail_at {
@@ -1150,11 +1154,13 @@ mod tests {
                     orchestrator_node: 0x2222,
                 },
                 kp.clone(),
-                move || Box::new(FailOnNth {
-                    count: count_for_factory.clone(),
-                    fail_at: 3,
-                    state: 0,
-                }),
+                move || {
+                    Box::new(FailOnNth {
+                        count: count_for_factory.clone(),
+                        fail_at: 3,
+                        state: 0,
+                    })
+                },
                 DaemonHostConfig::default(),
             )
             .unwrap();

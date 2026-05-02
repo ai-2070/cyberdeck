@@ -496,20 +496,23 @@ impl RedexFile {
         Ok(seq)
     }
 
-    /// Append many payloads. Returns the sequence of the FIRST event
-    /// in the batch. All entries land contiguously in the index.
+    /// Append many payloads. Returns `Some(seq)` of the FIRST event
+    /// in the batch, or `None` for an empty input. All entries
+    /// land contiguously in the index.
     ///
-    /// # Empty input
+    /// # Empty input (BUG #27)
     ///
-    /// BUG #27: an empty `payloads` slice returns `Ok(next_seq)` —
-    /// the seq value the next append *would* receive. Callers
-    /// **cannot** distinguish "wrote zero events with seq N" from
-    /// "wrote one event with seq N" via the return value alone.
-    /// The current behavior is preserved for backwards
-    /// compatibility (a stricter contract would be a breaking
-    /// API change), but callers iterating over a stream of
-    /// optionally-empty batches must check `payloads.is_empty()`
-    /// themselves and skip the call's return interpretation.
+    /// Pre-fix the signature was `Result<u64, RedexError>` and an
+    /// empty `payloads` returned `Ok(next_seq)` — the seq value
+    /// the next append *would* receive. Callers couldn't
+    /// distinguish "wrote zero, seq N would be next" from "wrote
+    /// one event with seq N" via the return value alone.
+    ///
+    /// Breaking change: signature is now
+    /// `Result<Option<u64>, RedexError>`. `None` ⇒ empty input,
+    /// no events appended; `Some(seq)` ⇒ first seq of the batch.
+    /// Callers iterating over optionally-empty batches no longer
+    /// need an `is_empty` pre-check.
     ///
     /// Failure atomicity:
     /// - seq numbers are allocated **after** the batch is validated
@@ -518,10 +521,10 @@ impl RedexFile {
     ///   any in-memory commit — on disk failure the seq allocation
     ///   rolls back and neither memory nor subscribers observe the
     ///   batch.
-    pub fn append_batch(&self, payloads: &[Bytes]) -> Result<u64, RedexError> {
+    pub fn append_batch(&self, payloads: &[Bytes]) -> Result<Option<u64>, RedexError> {
         self.check_not_closed()?;
         if payloads.is_empty() {
-            return Ok(self.inner.next_seq.load(Ordering::Acquire));
+            return Ok(None);
         }
 
         let ts = now_ns();
@@ -607,7 +610,7 @@ impl RedexFile {
         for event in &events {
             notify_watchers(&mut state.watchers, event);
         }
-        Ok(first_seq)
+        Ok(Some(first_seq))
     }
 
     /// Strictly-ordered variant of [`Self::append`].
@@ -721,10 +724,14 @@ impl RedexFile {
     /// atomic (all-or-nothing within the batch) and strictly
     /// seq-ordered relative to any other ordered writers. Same
     /// failure-atomicity contract as [`Self::append_batch`].
-    pub fn append_batch_ordered(&self, payloads: &[Bytes]) -> Result<u64, RedexError> {
+    ///
+    /// BUG #27 corollary: returns `Some(first_seq)` on a non-empty
+    /// batch and `None` on empty input — same convention as
+    /// `append_batch`.
+    pub fn append_batch_ordered(&self, payloads: &[Bytes]) -> Result<Option<u64>, RedexError> {
         self.check_not_closed()?;
         if payloads.is_empty() {
-            return Ok(self.inner.next_seq.load(Ordering::Acquire));
+            return Ok(None);
         }
         let ts = now_ns();
         let mut state = self.inner.state.lock();
@@ -800,7 +807,7 @@ impl RedexFile {
         for event in &events {
             notify_watchers(&mut state.watchers, event);
         }
-        Ok(first_seq)
+        Ok(Some(first_seq))
     }
 
     /// Append `value` (postcard-serialized) AND run `fold_fn` against
@@ -1340,7 +1347,7 @@ mod tests {
         let start = f
             .append_batch(&[Bytes::from_static(b"one"), Bytes::from_static(b"two")])
             .unwrap();
-        assert_eq!(start, 0);
+        assert_eq!(start, Some(0));
         assert_eq!(f.next_seq(), 2);
         let events = f.read_range(0, 2);
         assert_eq!(events[0].payload.as_ref(), b"one");
@@ -1511,7 +1518,10 @@ mod tests {
         assert!(
             matches!(first, Err(RedexError::Lagged)),
             "expected Lagged signal for from_seq=0 below retained head 7, got {:?}",
-            first.as_ref().map(|_| "Ok event").map_err(|e| format!("{:?}", e)),
+            first
+                .as_ref()
+                .map(|_| "Ok event")
+                .map_err(|e| format!("{:?}", e)),
         );
     }
 
@@ -1578,11 +1588,11 @@ mod tests {
         f.append(b"e5").unwrap(); // seq 0
         f.append(b"e6").unwrap(); // seq 1
         f.append(b"e7").unwrap(); // seq 2
-        // ... still nothing at seq 5 yet, so stream is idle.
-        // What we do assert: the backfill check did NOT push Lagged
-        // synchronously (which would be the next item polled).
-        // Instead, the watcher is registered live and waiting.
-        // Cancel via dropping.
+                                  // ... still nothing at seq 5 yet, so stream is idle.
+                                  // What we do assert: the backfill check did NOT push Lagged
+                                  // synchronously (which would be the next item polled).
+                                  // Instead, the watcher is registered live and waiting.
+                                  // Cancel via dropping.
         drop(stream);
         // No assertion failure means we didn't hit the Lagged path.
     }

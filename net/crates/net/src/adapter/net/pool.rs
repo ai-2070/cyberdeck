@@ -1256,8 +1256,9 @@ mod tests {
         // Fabricate `MAX_EVENTS_PER_PACKET + 1` empty events. The
         // payload bytes don't matter for the cap check — `build`
         // must reject before any frame writing.
-        let too_many: Vec<Bytes> =
-            (0..=NetHeader::MAX_EVENTS_PER_PACKET as usize).map(|_| Bytes::new()).collect();
+        let too_many: Vec<Bytes> = (0..=NetHeader::MAX_EVENTS_PER_PACKET as usize)
+            .map(|_| Bytes::new())
+            .collect();
         let _ = builder.build(0, 0, &too_many, PacketFlags::NONE);
     }
 
@@ -1269,8 +1270,9 @@ mod tests {
         let session_id = 0xBABEu64;
         let pool = ThreadLocalPool::new(2, &key, session_id);
         let mut builder = pool.get();
-        let too_many: Vec<Bytes> =
-            (0..=NetHeader::MAX_EVENTS_PER_PACKET as usize).map(|_| Bytes::new()).collect();
+        let too_many: Vec<Bytes> = (0..=NetHeader::MAX_EVENTS_PER_PACKET as usize)
+            .map(|_| Bytes::new())
+            .collect();
         let _ = builder.build_subprotocol(0, 0, &too_many, PacketFlags::NONE, 1);
     }
 
@@ -1296,8 +1298,9 @@ mod tests {
         let one_event = vec![Bytes::from_static(b"hi")];
         let _ = builder.build(0, 0, &one_event, PacketFlags::NONE);
 
-        let cap_events: Vec<Bytes> =
-            (0..NetHeader::MAX_EVENTS_PER_PACKET as usize).map(|_| Bytes::new()).collect();
+        let cap_events: Vec<Bytes> = (0..NetHeader::MAX_EVENTS_PER_PACKET as usize)
+            .map(|_| Bytes::new())
+            .collect();
         // No panic — boundary inclusive.
         let _ = builder.build(0, 1, &cap_events, PacketFlags::NONE);
     }

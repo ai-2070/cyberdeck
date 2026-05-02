@@ -1490,8 +1490,12 @@ mod tests {
         );
 
         // Repeat activate — must be a no-op on the count.
-        manager.activate_shard(new_id).expect("second activate (idempotent)");
-        manager.activate_shard(new_id).expect("third activate (idempotent)");
+        manager
+            .activate_shard(new_id)
+            .expect("second activate (idempotent)");
+        manager
+            .activate_shard(new_id)
+            .expect("third activate (idempotent)");
         assert_eq!(
             manager.num_shards(),
             3,

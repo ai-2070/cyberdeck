@@ -127,9 +127,8 @@ where
             // Use Box::pin (not tokio::pin!) so we can swap in a
             // fresh tail stream after a Lagged recovery without
             // restructuring the task.
-            let mut tail: Pin<
-                Box<dyn Stream<Item = Result<RedexEvent, RedexError>> + Send>,
-            > = Box::pin(task_file.tail(from_seq));
+            let mut tail: Pin<Box<dyn Stream<Item = Result<RedexEvent, RedexError>> + Send>> =
+                Box::pin(task_file.tail(from_seq));
 
             loop {
                 tokio::select! {
@@ -556,12 +555,10 @@ mod tests {
         // The index must reflect every post-lag event. Pre-fix the
         // task had already exited and `idx.get` would return
         // `None`.
-        let post_keys = idx
-            .get(&"post".to_string())
-            .expect(
-                "post-lag bucket missing — pre-fix the index task halted \
+        let post_keys = idx.get(&"post".to_string()).expect(
+            "post-lag bucket missing — pre-fix the index task halted \
                  permanently after Lagged and never observed these events (BUG #3)",
-            );
+        );
         assert_eq!(
             post_keys.len(),
             5,

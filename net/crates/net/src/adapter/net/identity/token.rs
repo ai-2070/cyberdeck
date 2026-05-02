@@ -787,12 +787,7 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert_eq!(
-            err,
-            TokenError::ZeroTtl,
-            "expected ZeroTtl, got {:?}",
-            err
-        );
+        assert_eq!(err, TokenError::ZeroTtl, "expected ZeroTtl, got {:?}", err);
     }
 
     /// BUG #22 corollary: TTL of 1 second is the lowest valid

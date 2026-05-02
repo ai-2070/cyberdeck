@@ -60,7 +60,10 @@ impl OrderedAppender {
     /// Append a batch. The whole batch lands under one lock hold —
     /// seqs are strictly contiguous within the batch AND strictly
     /// ordered relative to other ordered writers.
-    pub fn append_batch(&self, payloads: &[Bytes]) -> Result<u64, RedexError> {
+    ///
+    /// BUG #27 corollary: returns `Some(first_seq)` on non-empty
+    /// input, `None` on empty.
+    pub fn append_batch(&self, payloads: &[Bytes]) -> Result<Option<u64>, RedexError> {
         self.file.append_batch_ordered(payloads)
     }
 }

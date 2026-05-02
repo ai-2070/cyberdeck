@@ -140,10 +140,7 @@ fn compare_values(
 ///      i64::MAX is always greater than any negative i64.
 ///   4. At least one is a float → f64 fallback with the documented
 ///      lossy semantics.
-fn compare_numbers(
-    a: &serde_json::Number,
-    b: &serde_json::Number,
-) -> Option<std::cmp::Ordering> {
+fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Option<std::cmp::Ordering> {
     // 1. Both fit in i64.
     if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
         return Some(ai.cmp(&bi));

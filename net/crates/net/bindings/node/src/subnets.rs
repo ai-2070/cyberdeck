@@ -113,7 +113,10 @@ fn subnet_rule_from_js(r: SubnetRuleJs) -> Result<SubnetRule> {
         // with a single source-of-truth in the core.
         let tag_value_clone = tag_value.clone();
         rule = rule.try_map(tag_value, v).map_err(|e| {
-            Error::from_reason(format!("subnet: rule value for {:?}: {}", tag_value_clone, e))
+            Error::from_reason(format!(
+                "subnet: rule value for {:?}: {}",
+                tag_value_clone, e
+            ))
         })?;
     }
     Ok(rule)

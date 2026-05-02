@@ -109,9 +109,10 @@ impl CompositeCursor {
     /// surfaces a future schema change that breaks the invariant
     /// as a clear "BUG" panic rather than a silent restart.
     pub fn encode(&self) -> String {
-        let json = serde_json::to_string(&self.positions)
-            .expect("BUG #63: CompositeCursor::encode failed to serialize positions; \
-                     the schema (HashMap<u16, Arc<str>>) is supposed to be infallible");
+        let json = serde_json::to_string(&self.positions).expect(
+            "BUG #63: CompositeCursor::encode failed to serialize positions; \
+                     the schema (HashMap<u16, Arc<str>>) is supposed to be infallible",
+        );
         BASE64.encode(json.as_bytes())
     }
 
@@ -1742,19 +1743,13 @@ mod tests {
         // to PER_SHARD_FETCH_CAP (10 000).
         adapter.add_events(
             0,
-            (0..1).map(|i| StoredEvent::from_value(
-                format!("0-{}", i),
-                json!({}),
-                100,
-                0,
-            )).collect(),
+            (0..1)
+                .map(|i| StoredEvent::from_value(format!("0-{}", i), json!({}), 100, 0))
+                .collect(),
         );
 
         let merger = PollMerger::new(adapter, vec![0]);
-        let response = merger
-            .poll(ConsumeRequest::new(50_000))
-            .await
-            .unwrap();
+        let response = merger.poll(ConsumeRequest::new(50_000)).await.unwrap();
         assert!(
             response.truncated_at_per_shard_cap,
             "BUG #57: large limit must flag the per-shard cap clamp",
@@ -1768,7 +1763,12 @@ mod tests {
         let adapter = Arc::new(MockAdapter::new());
         adapter.add_events(
             0,
-            vec![StoredEvent::from_value("0-1".to_string(), json!({}), 100, 0)],
+            vec![StoredEvent::from_value(
+                "0-1".to_string(),
+                json!({}),
+                100,
+                0,
+            )],
         );
         let merger = PollMerger::new(adapter, vec![0]);
         let response = merger.poll(ConsumeRequest::new(100)).await.unwrap();

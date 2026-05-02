@@ -501,10 +501,7 @@ impl EventBus {
             //    code path that routes to a Provisioning shard
             //    or any race window that tucked an event in
             //    before `activate_shard` returned its error.
-            let stranded = self
-                .shard_manager
-                .remove_shard(new_id)
-                .unwrap_or_default();
+            let stranded = self.shard_manager.remove_shard(new_id).unwrap_or_default();
 
             // 3. Take ownership of the worker handles and await
             //    them gracefully. Order: drain first (it pumps

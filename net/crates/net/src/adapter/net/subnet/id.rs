@@ -41,8 +41,7 @@ impl SubnetId {
     /// Panics if more than 4 levels are provided. For untrusted
     /// input (config / FFI / JSON) prefer [`Self::try_new`].
     pub fn new(levels: &[u8]) -> Self {
-        Self::try_new(levels)
-            .expect("SubnetId::new: too many levels (use try_new for fallible)")
+        Self::try_new(levels).expect("SubnetId::new: too many levels (use try_new for fallible)")
     }
 
     /// Fallible variant of [`Self::new`].

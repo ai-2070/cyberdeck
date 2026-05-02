@@ -165,11 +165,8 @@ impl CorrelatedFailureDetector {
         // `other_side` orderings, breaking cross-node serialization
         // / reconcile-ordering / replay validation. Sort + dedup
         // gives a canonical Vec deterministic across processes.
-        let mut window_failures: Vec<u64> = self
-            .recent_failures
-            .iter()
-            .map(|e| e.node_id)
-            .collect();
+        let mut window_failures: Vec<u64> =
+            self.recent_failures.iter().map(|e| e.node_id).collect();
         window_failures.sort_unstable();
         window_failures.dedup();
 

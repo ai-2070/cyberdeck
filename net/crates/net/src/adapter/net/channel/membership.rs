@@ -272,9 +272,7 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
             // BUG #25: same strict-trailer rejection on the ACK
             // path.
             if cur.remaining() != 0 {
-                return Err(MembershipCodecError::Truncated(
-                    "trailing bytes after ack",
-                ));
+                return Err(MembershipCodecError::Truncated("trailing bytes after ack"));
             }
             Ok(MembershipMsg::Ack {
                 nonce,

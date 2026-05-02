@@ -493,8 +493,7 @@ impl PyStandbyGroup {
     /// BUG #6: promotion may run a snapshot-restore on the
     /// promoted standby; release the GIL.
     fn promote(&self, py: Python<'_>) -> PyResult<u32> {
-        py.allow_threads(|| self.inner.promote())
-            .map_err(group_err)
+        py.allow_threads(|| self.inner.promote()).map_err(group_err)
     }
 
     fn on_node_failure(&self, py: Python<'_>, failed_node_id: u64) -> PyResult<Option<u32>> {
