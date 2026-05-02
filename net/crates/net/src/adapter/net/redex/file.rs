@@ -1209,10 +1209,20 @@ impl RedexFile {
 
 impl std::fmt::Debug for RedexFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Read only lock-free state: `len` and the lock-taking
+        // `next_seq()` accessor would acquire `state.lock()` (the
+        // accessor takes it for read-after-rollback consistency).
+        // Two separate acquisitions in one Debug print also produce
+        // torn reads. More importantly, any future
+        // `tracing::?(?file, …)` inside a region that already holds
+        // `state` would deadlock. The atomic gives a possibly-stale
+        // (mid-append) value, which is acceptable for diagnostic
+        // output and is the same trade-off other lock-free Debug
+        // impls in this crate make.
         f.debug_struct("RedexFile")
             .field("name", &self.inner.name)
-            .field("len", &self.len())
-            .field("next_seq", &self.next_seq())
+            .field("next_seq_atomic", &self.inner.next_seq.load(Ordering::Relaxed))
+            .field("closed", &self.inner.closed.load(Ordering::Relaxed))
             .finish()
     }
 }
