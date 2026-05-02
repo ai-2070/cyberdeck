@@ -1,0 +1,23 @@
+.claude/skills/net-event-bus/runtime.md
+  7cd1aa3948e2e296 67-69,78-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "433059b83c320c14334e09c2d19400dea7b003f5",
+  "prompts": {
+    "7cd1aa3948e2e296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad152adb-b4ac-4388-af9c-44b44434d029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 13,
+      "overriden_lines": 0
+    }
+  }
+}
