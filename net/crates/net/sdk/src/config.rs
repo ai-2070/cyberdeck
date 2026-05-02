@@ -157,11 +157,38 @@ impl NetBuilder {
             // no-op — the mesh would generate a fresh keypair every
             // run and `node_id` / `entity_id` would drift across
             // restarts.
+            //
+            // BUG #5: pre-fix this unconditionally overwrote
+            // `net_cfg.entity_keypair`. A caller who configured the
+            // adapter via `.mesh(NetAdapterConfig::initiator(...).with_entity_keypair(kp_a))`
+            // and ALSO called `.identity(id_b)` got `id_b` silently
+            // — both inputs were caller-supplied keypairs and one
+            // was discarded with no error or precedence note. Both
+            // are load-bearing for `node_id` / `entity_id`, so the
+            // wrong one routes the node under the wrong identity.
+            // Fix: error on conflicting keypairs (different
+            // entity_ids); allow when both are set to the same
+            // keypair (idempotent); inject when only `identity()`
+            // was set (the original support path).
             #[cfg(feature = "net")]
             if let (Some(id), AdapterConfig::Net(ref mut net_cfg)) =
                 (self.identity.as_ref(), &mut adapter)
             {
-                net_cfg.entity_keypair = Some((**id.keypair()).clone());
+                let builder_kp = id.keypair();
+                if let Some(adapter_kp) = net_cfg.entity_keypair.as_ref() {
+                    if adapter_kp.entity_id() != builder_kp.entity_id() {
+                        return Err(crate::error::SdkError::Config(format!(
+                            "conflicting identities: NetAdapterConfig::with_entity_keypair \
+                             pinned entity_id {} but NetBuilder::identity pinned {}. \
+                             Set the keypair on exactly one of them.",
+                            adapter_kp.entity_id(),
+                            builder_kp.entity_id(),
+                        )));
+                    }
+                    // Same entity_id: identical key material, no-op.
+                } else {
+                    net_cfg.entity_keypair = Some((**builder_kp).clone());
+                }
             }
             self.inner = self.inner.adapter(adapter);
         }
@@ -238,6 +265,90 @@ mod tests {
         assert!(
             net_cfg.entity_keypair.is_none(),
             "entity_keypair must stay unset when the builder has no identity",
+        );
+    }
+
+    /// BUG #5: when both `NetAdapterConfig::with_entity_keypair`
+    /// and `NetBuilder::identity` are set with DIFFERENT entity
+    /// IDs, build_config must error rather than silently picking
+    /// one. Both inputs are caller-supplied; both are load-bearing
+    /// for `node_id` / `entity_id`; silently overriding routes the
+    /// node under the wrong identity.
+    #[test]
+    fn build_config_errors_on_conflicting_identities() {
+        let kp_a = net::adapter::net::identity::EntityKeypair::generate();
+        let kp_b_seed = [0xAAu8; 32];
+        let identity_b = crate::identity::Identity::from_seed(kp_b_seed);
+        // Sanity — distinct entity_ids.
+        assert_ne!(kp_a.entity_id(), identity_b.entity_id());
+
+        let mesh_cfg = sample_net_adapter().with_entity_keypair(kp_a);
+
+        let err = NetBuilder::new()
+            .mesh(mesh_cfg)
+            .identity(identity_b)
+            .build_config()
+            .expect_err(
+                "build_config must reject conflicting keypairs (BUG #5); \
+                 pre-fix it silently let identity() win",
+            );
+
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("conflicting identities"),
+            "expected 'conflicting identities' in error, got: {}",
+            msg
+        );
+    }
+
+    /// BUG #5 corollary: setting the SAME keypair on both sides is
+    /// idempotent and must build cleanly. Documents the
+    /// "identical key material, no-op" path.
+    #[test]
+    fn build_config_accepts_matching_identities_on_both_sides() {
+        let seed = [0x11u8; 32];
+        let identity = crate::identity::Identity::from_seed(seed);
+        let same_kp = (**identity.keypair()).clone();
+        let expected_id = identity.entity_id().clone();
+
+        let mesh_cfg = sample_net_adapter().with_entity_keypair(same_kp);
+
+        let config = NetBuilder::new()
+            .mesh(mesh_cfg)
+            .identity(identity)
+            .build_config()
+            .expect("matching keypairs on both sides must build");
+
+        let AdapterConfig::Net(net_cfg) = config.adapter else {
+            panic!("adapter lost its Net variant");
+        };
+        assert_eq!(
+            net_cfg.entity_keypair.as_ref().unwrap().entity_id(),
+            &expected_id,
+        );
+    }
+
+    /// BUG #5 corollary: setting the keypair via the adapter only
+    /// (no `.identity()` call) preserves the adapter's choice —
+    /// the build path must NOT overwrite it with a default.
+    #[test]
+    fn build_config_preserves_adapter_keypair_when_no_builder_identity() {
+        let kp = net::adapter::net::identity::EntityKeypair::generate();
+        let expected_id = kp.entity_id().clone();
+        let mesh_cfg = sample_net_adapter().with_entity_keypair(kp);
+
+        let config = NetBuilder::new()
+            .mesh(mesh_cfg)
+            .build_config()
+            .expect("build_config");
+
+        let AdapterConfig::Net(net_cfg) = config.adapter else {
+            panic!("adapter lost its Net variant");
+        };
+        assert_eq!(
+            net_cfg.entity_keypair.as_ref().unwrap().entity_id(),
+            &expected_id,
+            "adapter-side entity_keypair must survive when builder has no identity",
         );
     }
 }
