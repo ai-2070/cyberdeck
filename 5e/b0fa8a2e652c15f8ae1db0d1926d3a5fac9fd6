@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/subnet/assignment.rs
+  7cd1aa3948e2e296 9,72-89,91,135-154,156,390-436
+net/crates/net/src/adapter/net/subnet/id.rs
+  7cd1aa3948e2e296 41-42,44-60,65,300-326
+net/crates/net/src/adapter/net/subnet/mod.rs
+  7cd1aa3948e2e296 9,14
+net/crates/net/src/adapter/net/subnet/error.rs
+  7cd1aa3948e2e296 1-42
+net/crates/net/bindings/node/src/subnets.rs
+  7cd1aa3948e2e296 79-85,109-117,123-128,133-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "5eb0fa8a2e652c15f8ae1db0d1926d3a5fac9fd6",
+  "prompts": {
+    "7cd1aa3948e2e296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad152adb-b4ac-4388-af9c-44b44434d029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 206,
+      "total_deletions": 43,
+      "accepted_lines": 1230,
+      "overriden_lines": 0
+    }
+  }
+}
