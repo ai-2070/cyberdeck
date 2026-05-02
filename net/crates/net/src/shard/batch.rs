@@ -212,6 +212,22 @@ impl BatchWorker {
     /// Add events to the current batch.
     ///
     /// Returns a completed batch if thresholds are met, or None if more events are needed.
+    ///
+    /// # Empty-input side effect
+    ///
+    /// Passing an empty `events` vec is **not** a no-op. The
+    /// BatchWorker's recv-timeout arm calls `add_events(vec![])`
+    /// specifically to drive a `check_timeout` round, which may
+    /// flush the in-memory `current_batch` if `max_delay` has
+    /// elapsed since the last event arrived. Callers who want
+    /// "true no-op on empty input" must check `events.is_empty()`
+    /// themselves before calling.
+    ///
+    /// BUG #66: pre-fix this side effect was not documented and
+    /// surprised callers expecting `add_events([])` to be inert.
+    /// The fix is documentation only — the BatchWorker's timeout
+    /// flush relies on this behavior, so removing the side effect
+    /// would break the timeout-flush mechanism in bus.rs.
     pub fn add_events(&mut self, events: Vec<InternalEvent>) -> Option<Batch> {
         if events.is_empty() {
             return self.check_timeout();
