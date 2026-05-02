@@ -76,9 +76,13 @@ pub fn subnet_id_from_js(id: SubnetIdJs) -> Result<SubnetId> {
         }
         bytes[i] = *raw as u8;
     }
-    // `SubnetId::new` accepts &[u8] but only reads up to 4 entries
-    // and zero-fills the rest; we've already clamped to <=4.
-    Ok(SubnetId::new(&bytes[..id.levels.len()]))
+    // `SubnetId::try_new` returns Result instead of panicking on
+    // out-of-range input (BUG #9). The pre-validation above (length
+    // check at lines 63-68) makes this branch unreachable, but
+    // routing through the fallible API keeps the panic path off
+    // the FFI surface entirely.
+    SubnetId::try_new(&bytes[..id.levels.len()])
+        .map_err(|e| Error::from_reason(format!("subnet: {}", e)))
 }
 
 fn parse_u8(value: u32, ctx: &str) -> Result<u8> {
@@ -102,30 +106,33 @@ fn subnet_rule_from_js(r: SubnetRuleJs) -> Result<SubnetRule> {
     let mut rule = SubnetRule::new(r.tag_prefix, level);
     for (tag_value, level_value) in r.values {
         let v = parse_u8(level_value, &format!("rule value for {}", tag_value))?;
-        // `SubnetRule::map` panics when `v == 0` — zero is
-        // reserved by the core as "unmatched / no restriction" and
-        // must not appear as an explicit mapping. Reject on the
-        // NAPI boundary so JS callers get a clean `Error` instead
-        // of a native-side panic.
-        if v == 0 {
-            return Err(Error::from_reason(format!(
-                "subnet: rule value for {:?} must be in 1..=255 (0 is reserved)",
-                tag_value
-            )));
-        }
-        rule = rule.map(tag_value, v);
+        // BUG #9: route through `try_map` so a `level_value == 0`
+        // surfaces as a typed `SubnetError` (mapped to NAPI Error
+        // here) rather than a native-side panic. This replaces the
+        // earlier explicit `if v == 0` check at the NAPI boundary
+        // with a single source-of-truth in the core.
+        let tag_value_clone = tag_value.clone();
+        rule = rule.try_map(tag_value, v).map_err(|e| {
+            Error::from_reason(format!("subnet: rule value for {:?}: {}", tag_value_clone, e))
+        })?;
     }
     Ok(rule)
 }
 
 /// Validate + convert a JS `SubnetPolicyJs` into a core
-/// `SubnetPolicy`. `SubnetPolicy::add_rule` panics on level >= 4;
-/// we pre-validate above so the panic path is unreachable.
+/// `SubnetPolicy`.
+///
+/// BUG #9: routes through `try_add_rule` so any future loosening
+/// of the per-rule pre-validation in `subnet_rule_from_js` still
+/// surfaces an out-of-range `level` as a typed error rather than
+/// a native panic.
 pub fn subnet_policy_from_js(p: SubnetPolicyJs) -> Result<SubnetPolicy> {
     let mut policy = SubnetPolicy::new();
     for rule_js in p.rules {
         let rule = subnet_rule_from_js(rule_js)?;
-        policy = policy.add_rule(rule);
+        policy = policy
+            .try_add_rule(rule)
+            .map_err(|e| Error::from_reason(format!("subnet: {}", e)))?;
     }
     Ok(policy)
 }
