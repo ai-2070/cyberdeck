@@ -1054,6 +1054,19 @@ impl ShardMapper {
         stopped
     }
 
+    /// Remove a specific shard from the mapper if it is in the
+    /// `Stopped` state. Used by `ShardManager::remove_shard` so a
+    /// per-shard cleanup doesn't disturb sibling `Stopped`
+    /// entries — which a sequential `manual_scale_down` loop
+    /// still needs to look up state for. Returns `true` if the
+    /// shard existed and was Stopped (and was removed).
+    pub fn remove_specific_stopped_shard(&self, shard_id: u16) -> bool {
+        let mut shards = self.shards.write();
+        let before = shards.len();
+        shards.retain(|s| !(s.id == shard_id && s.state == ShardState::Stopped));
+        shards.len() < before
+    }
+
     /// Remove stopped shards from the mapper.
     pub fn remove_stopped_shards(&self) -> Vec<u16> {
         let mut shards = self.shards.write();

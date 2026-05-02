@@ -914,16 +914,24 @@ impl ShardManager {
         // `shards: RwLock<Vec<MappedShard>>` would keep growing
         // across scale-up/down cycles (every scale-up appends a
         // fresh entry; `Stopped` entries are only removed by an
-        // explicit `remove_stopped_shards` call). `evaluate_scaling`
+        // explicit `remove_specific_stopped_shard` /
+        // `remove_stopped_shards` call). `evaluate_scaling`
         // filters by state but still iterates the full list, so
         // per-tick cost would grow with cumulative scaling history.
         //
         // The scaling monitor calls `mapper.finalize_draining()`
         // before invoking `bus.remove_shard_internal(id)` (which is
         // what calls us), so by the time we run the matching
-        // `MappedShard` is already in `Stopped` state. Sweep the
-        // mapper here so it stays bounded.
-        mapper.remove_stopped_shards();
+        // `MappedShard` is already in `Stopped` state. We prune
+        // ONLY this shard here, not every Stopped one — a bulk
+        // sweep would prune sibling Stopped shards that a
+        // sequential `manual_scale_down` is about to look up
+        // state for in its next iteration's `remove_shard`. Once
+        // the mapper had `None` for a sibling shard, the
+        // `was_activated` gate above would observe it as
+        // never-activated and skip the `num_shards` decrement,
+        // leaving the counter one below the actual table size.
+        mapper.remove_specific_stopped_shard(shard_id);
 
         Ok(drained)
     }
