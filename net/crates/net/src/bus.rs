@@ -2482,14 +2482,27 @@ mod tests {
 
         // Jitter property: different shards at the same
         // attempt land on different backoffs. Sample 16 distinct
-        // shard ids and assert at least 8 unique backoff values
-        // — the hasher's distribution should easily clear that.
+        // shard ids and assert at least 4 unique backoff values.
+        //
+        // The bound is deliberately loose (4 / 16) because
+        // `DefaultHasher`'s exact distribution is **not stable**
+        // across Rust toolchain versions — a tighter check (e.g.
+        // ≥ 8) would empirically pass on every toolchain we test
+        // against today, but a future stdlib change to the hasher
+        // could shift the distribution and flake CI for a property
+        // (decorrelation across shards) that doesn't actually
+        // depend on a high collision-resistance bar. Asserting
+        // ≥ 4 unique values out of 16 is enough to catch a real
+        // regression (e.g. accidentally hashing only `attempt`
+        // and not `shard_id` would collapse all 16 to a single
+        // value) while staying robust to hasher-distribution
+        // drift.
         use std::collections::HashSet;
         let s_attempt2: HashSet<u128> = (0u16..16)
             .map(|s| retry_backoff(s, 2).as_millis())
             .collect();
         assert!(
-            s_attempt2.len() >= 8,
+            s_attempt2.len() >= 4,
             "jitter must decorrelate retries across shards; \
              only {} unique backoffs across 16 shards",
             s_attempt2.len()
