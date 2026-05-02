@@ -217,6 +217,16 @@ pub struct ConsumeResponse {
     pub next_id: Option<String>,
     /// True if there are more events available.
     pub has_more: bool,
+    /// `true` if the per-shard fetch was clamped by the internal
+    /// `PER_SHARD_FETCH_CAP` (10 000). Callers requesting very
+    /// large `limit` values across few shards may receive fewer
+    /// events than `limit` per `poll()` even when the underlying
+    /// streams have more — pagination via `next_id` still works.
+    ///
+    /// BUG #57: pre-fix this clamp was silent. The default is
+    /// `false`; tools building observability around large polls
+    /// can detect under-delivery via this flag.
+    pub truncated_at_per_shard_cap: bool,
 }
 
 impl ConsumeResponse {
@@ -226,9 +236,16 @@ impl ConsumeResponse {
             events: Vec::new(),
             next_id: None,
             has_more: false,
+            truncated_at_per_shard_cap: false,
         }
     }
 }
+
+/// Internal cap on per-shard `direct_get` / `XRANGE` fetch sizes,
+/// applied in `PollMerger::poll`. Bounds the adapter's per-call
+/// memory pressure for a single poll. Callers needing larger
+/// effective limits should paginate.
+pub const PER_SHARD_FETCH_CAP: usize = 10_000;
 
 /// Match a `StoredEvent` against a filter, surfacing parse failures.
 ///
@@ -307,14 +324,23 @@ impl PollMerger {
         }
 
         // Calculate per-shard limit (over-fetch to account for filtering)
-        // Use ceiling division to avoid truncating to 0 when limit < shard count
+        // Use ceiling division to avoid truncating to 0 when limit < shard count.
+        //
+        // BUG #57: pre-fix this `min(10_000)` clamp was silent —
+        // a caller with `limit=200_000` over 10 shards expected
+        // 20 000/shard plus over-fetch but got 10 000/shard with
+        // no diagnostic. Track whether the clamp triggered and
+        // surface it on the response so callers building
+        // observability around large polls can detect under-
+        // delivery.
         let over_fetch_factor = if request.filter.is_some() { 3 } else { 2 };
-        let per_shard_limit = request
+        let unclamped_per_shard = request
             .limit
             .div_ceil(shards.len())
             .max(1)
-            .saturating_mul(over_fetch_factor)
-            .min(10_000);
+            .saturating_mul(over_fetch_factor);
+        let per_shard_limit = unclamped_per_shard.min(PER_SHARD_FETCH_CAP);
+        let truncated_at_per_shard_cap = unclamped_per_shard > PER_SHARD_FETCH_CAP;
 
         // Poll all shards in parallel. Each future borrows its start
         // position directly from `cursor` (which outlives `join_all` below),
@@ -600,6 +626,7 @@ impl PollMerger {
             events: all_events,
             next_id,
             has_more,
+            truncated_at_per_shard_cap,
         })
     }
 }
@@ -1656,6 +1683,54 @@ mod tests {
 
         // Should get remaining 4 events
         assert_eq!(response2.events.len(), 4, "Should get remaining 4 events");
+    }
+
+    /// BUG #57: when the per-shard fetch hits the
+    /// PER_SHARD_FETCH_CAP clamp, the response must surface
+    /// `truncated_at_per_shard_cap = true` so callers can detect
+    /// the silent under-delivery.
+    #[tokio::test]
+    async fn poll_merger_surfaces_per_shard_cap_truncation() {
+        let adapter = Arc::new(MockAdapter::new());
+        // Single shard — over-fetch factor 2 — request limit
+        // 50 000 → unclamped per_shard would be 100 000 → clamped
+        // to PER_SHARD_FETCH_CAP (10 000).
+        adapter.add_events(
+            0,
+            (0..1).map(|i| StoredEvent::from_value(
+                format!("0-{}", i),
+                json!({}),
+                100,
+                0,
+            )).collect(),
+        );
+
+        let merger = PollMerger::new(adapter, vec![0]);
+        let response = merger
+            .poll(ConsumeRequest::new(50_000))
+            .await
+            .unwrap();
+        assert!(
+            response.truncated_at_per_shard_cap,
+            "BUG #57: large limit must flag the per-shard cap clamp",
+        );
+    }
+
+    /// BUG #57 corollary: a small request that fits well below
+    /// the cap must NOT flag truncation.
+    #[tokio::test]
+    async fn poll_merger_does_not_flag_truncation_on_small_limit() {
+        let adapter = Arc::new(MockAdapter::new());
+        adapter.add_events(
+            0,
+            vec![StoredEvent::from_value("0-1".to_string(), json!({}), 100, 0)],
+        );
+        let merger = PollMerger::new(adapter, vec![0]);
+        let response = merger.poll(ConsumeRequest::new(100)).await.unwrap();
+        assert!(
+            !response.truncated_at_per_shard_cap,
+            "small limits must not flag the cap",
+        );
     }
 
     #[tokio::test]
