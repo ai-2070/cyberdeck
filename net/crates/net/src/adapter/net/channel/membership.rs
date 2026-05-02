@@ -202,16 +202,47 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
                         } else {
                             let tstart = cur.position() as usize;
                             let tend = tstart + token_len;
+                            // Advance cur past the token bytes so
+                            // the trailing-byte check below operates
+                            // against the actual unconsumed remainder
+                            // rather than seeing the token as
+                            // "trailing".
+                            cur.set_position(tend as u64);
                             Some(data[tstart..tend].to_vec())
                         }
                     }
                 };
+                // BUG #25: enforce strict-trailer rejection after
+                // the token (now that cur is correctly past it).
+                // Pre-fix, SUBSCRIBE accepted arbitrary garbage
+                // after a valid token.
+                if cur.remaining() != 0 {
+                    return Err(MembershipCodecError::Truncated(
+                        "trailing bytes after subscribe token",
+                    ));
+                }
                 Ok(MembershipMsg::Subscribe {
                     channel,
                     nonce,
                     token,
                 })
             } else {
+                // Advance cur past the channel name we read by
+                // direct slice (the SUBSCRIBE branch above does
+                // this via `cur.set_position(end as u64)`; we
+                // mirror that here so the trailing-byte check
+                // below is meaningful).
+                cur.set_position(end as u64);
+                // BUG #25: pre-fix UNSUBSCRIBE returned Ok without
+                // checking that the buffer was fully consumed. A
+                // malformed peer could append arbitrary bytes
+                // after a valid Unsubscribe and the decoder
+                // accepted it, hiding upstream framer bugs.
+                if cur.remaining() != 0 {
+                    return Err(MembershipCodecError::Truncated(
+                        "trailing bytes after unsubscribe",
+                    ));
+                }
                 Ok(MembershipMsg::Unsubscribe { channel, nonce })
             }
         }
@@ -238,6 +269,13 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
                 ACK_REASON_TOO_MANY_CHANNELS => Some(AckReason::TooManyChannels),
                 other => return Err(MembershipCodecError::UnknownType(other)),
             };
+            // BUG #25: same strict-trailer rejection on the ACK
+            // path.
+            if cur.remaining() != 0 {
+                return Err(MembershipCodecError::Truncated(
+                    "trailing bytes after ack",
+                ));
+            }
             Ok(MembershipMsg::Ack {
                 nonce,
                 accepted,
@@ -449,5 +487,63 @@ mod tests {
         buf.push(name.len() as u8);
         buf.extend_from_slice(name);
         assert!(matches!(decode(&buf), Err(MembershipCodecError::Name(_))));
+    }
+
+    /// BUG #25: trailing bytes after a valid UNSUBSCRIBE must be
+    /// rejected. Pre-fix the decoder returned Ok without checking
+    /// `cur.remaining() == 0`, so a malformed peer could append
+    /// garbage that hid upstream framer bugs.
+    #[test]
+    fn unsubscribe_with_trailing_bytes_is_rejected() {
+        let msg = MembershipMsg::Unsubscribe {
+            channel: ch("control/estop"),
+            nonce: 42,
+        };
+        let mut bytes = encode(&msg);
+        bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let err = decode(&bytes).unwrap_err();
+        assert!(
+            matches!(err, MembershipCodecError::Truncated(s) if s.contains("unsubscribe")),
+            "expected trailing-after-unsubscribe error, got {:?}",
+            err
+        );
+    }
+
+    /// BUG #25: same strict-trailer rejection on the ACK path.
+    #[test]
+    fn ack_with_trailing_bytes_is_rejected() {
+        let msg = MembershipMsg::Ack {
+            nonce: 42,
+            accepted: true,
+            reason: None,
+        };
+        let mut bytes = encode(&msg);
+        bytes.push(0xAA);
+        let err = decode(&bytes).unwrap_err();
+        assert!(
+            matches!(err, MembershipCodecError::Truncated(s) if s.contains("ack")),
+            "expected trailing-after-ack error, got {:?}",
+            err
+        );
+    }
+
+    /// BUG #25: SUBSCRIBE-with-token must reject trailing bytes
+    /// after the token. Pre-fix this was the SUBSCRIBE path's
+    /// equivalent gap.
+    #[test]
+    fn subscribe_with_token_then_trailing_bytes_is_rejected() {
+        let msg = MembershipMsg::Subscribe {
+            channel: ch("sensors/lidar"),
+            nonce: 0xCAFE,
+            token: Some(vec![0xAB; 32]),
+        };
+        let mut bytes = encode(&msg);
+        bytes.extend_from_slice(&[0xDE, 0xAD]);
+        let err = decode(&bytes).unwrap_err();
+        assert!(
+            matches!(err, MembershipCodecError::Truncated(s) if s.contains("subscribe")),
+            "expected trailing-after-subscribe error, got {:?}",
+            err
+        );
     }
 }
