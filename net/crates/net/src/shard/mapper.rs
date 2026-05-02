@@ -822,6 +822,19 @@ impl ShardMapper {
                 // Provisioning shard stays in Provisioning state and
                 // the caller (e.g. `add_shard_internal`'s rollback)
                 // is responsible for tearing it down.
+                //
+                // The load-then-store pattern is safe here because
+                // both the read and the subsequent state mutation
+                // happen under the same `shards.write()` guard
+                // (acquired at the top of this function and held
+                // until the `drop(shards)` below). Two concurrent
+                // `activate(distinct_id)` calls serialize on the
+                // write lock, so one's `fetch_add` is observed by
+                // the other's `Acquire` load and the second hits
+                // `AtMaxShards`. A `compare_exchange` here would be
+                // belt-and-braces but the lock-held invariant is the
+                // primary correctness gate; do not relax it without
+                // also tightening this read.
                 let current = self.active_count.load(AtomicOrdering::Acquire);
                 if current >= self.policy.max_shards {
                     return Err(ScalingError::AtMaxShards);
