@@ -1420,6 +1420,18 @@ impl Drop for EventBus {
         self.drain_finalize_ready
             .store(true, AtomicOrdering::SeqCst);
 
+        // BUG #49: workers do NOT hold `Arc<EventBus>` — they hold
+        // independent `Arc<ShardManager>` / `Arc<dyn Adapter>`
+        // clones plus the channel halves. When `Drop` returns,
+        // those Arcs survive in the still-running tasks and they
+        // continue draining / dispatching until they observe the
+        // shutdown flag we just set. There's no partial-Drop UB
+        // risk: nothing on the worker side dereferences a
+        // dropped EventBus field. The flags promote the
+        // worker tasks from "blocked on recv / parked on
+        // drain_finalize_ready" to "observe shutdown=true and
+        // exit" so they don't linger indefinitely.
+        //
         // If `shutdown()` was never awaited, any events still in the
         // per-shard ring buffers or mpsc channels are lost — the
         // adapter's `flush()` and `shutdown()` won't run, so durable
