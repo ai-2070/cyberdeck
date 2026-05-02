@@ -17,6 +17,14 @@ use std::time::{Duration, Instant};
 use crate::config::BatchConfig;
 use crate::event::{Batch, InternalEvent};
 
+/// Cap on `AdaptiveBatcher::velocity_samples` to bound per-shard
+/// memory use under high throughput. `calculate_velocity` reads
+/// only `front()` and `back()`, so additional samples in between
+/// are pure overhead. 1 024 entries × ~24 bytes per tuple
+/// ≈ 24 KiB per shard — well below the 240 KiB pre-fix worst
+/// case at 100 k events/s × 100 ms `velocity_window`.
+const VELOCITY_SAMPLES_CAP: usize = 1024;
+
 /// Adaptive batch size calculator.
 ///
 /// Tracks recent ingestion velocity and adjusts batch size accordingly.
@@ -61,7 +69,7 @@ impl AdaptiveBatcher {
         // Add sample
         self.velocity_samples.push_back((now, self.total_events));
 
-        // Remove old samples outside the window
+        // Remove old samples outside the time window.
         let window_start = now - self.config.velocity_window;
         while let Some(&(ts, _)) = self.velocity_samples.front() {
             if ts < window_start {
@@ -69,6 +77,18 @@ impl AdaptiveBatcher {
             } else {
                 break;
             }
+        }
+
+        // BUG #65: also cap the deque by sample COUNT. Pre-fix the
+        // bound was time-only, so at 100k events/s with a 100 ms
+        // velocity_window the deque could grow to ~10 000 entries
+        // before time-eviction caught up, costing ~240 KiB per
+        // shard for samples never used (calculate_velocity reads
+        // only `front()` and `back()`). Cap at
+        // VELOCITY_SAMPLES_CAP so the memory footprint is bounded
+        // regardless of throughput.
+        while self.velocity_samples.len() > VELOCITY_SAMPLES_CAP {
+            self.velocity_samples.pop_front();
         }
 
         // Recalculate batch size periodically (not on every call)
