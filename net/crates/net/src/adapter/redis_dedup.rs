@@ -80,33 +80,43 @@ use std::sync::Arc;
 /// nanoseconds extra per new id, dwarfed by the heap allocation
 /// that already dominates insert cost.
 pub struct RedisStreamDedup {
-    /// Insertion-ordered queue, used for LRU eviction. Each entry
+    /// Insertion-ordered queue, used for FIFO eviction. Each entry
     /// is `Arc::clone`-shared with `seen` so we don't pay a second
     /// allocation per insert.
+    ///
+    /// BUG #73: pre-fix doc-comments described this as
+    /// "LRU eviction" but `is_duplicate` doesn't move re-observed
+    /// ids to the back of the queue — re-observation is a no-op
+    /// and the queue stays strictly insertion-ordered. The
+    /// eviction is FIFO, not LRU. Functionally it's a sliding
+    /// dedup window: any id older than `capacity` insertions ago
+    /// is forgotten, regardless of how often it's been observed.
+    /// Frequently-observed ids do NOT stay tracked longer than
+    /// rarely-observed ones. Docstrings updated for accuracy.
     order: VecDeque<Arc<str>>,
     /// Lookup index. Shares its `Arc<str>` entries with `order` —
     /// every id lives in exactly one heap allocation, refcounted.
     seen: HashSet<Arc<str>>,
     /// Maximum number of distinct ids tracked. Older ids are
-    /// evicted on insert when the set is at capacity.
+    /// evicted on insert when the set is at capacity (FIFO order).
     capacity: usize,
 }
 
 impl RedisStreamDedup {
-    /// Upper bound on the LRU capacity. Beyond this, [`Self::with_capacity`]
-    /// clamps. `1 << 24` (~16.7 M ids) is far above any realistic
-    /// dedup window and below the point where pre-allocation would
-    /// dominate the process heap (~256 MiB just for the
-    /// `HashSet` + `VecDeque` reservations).
+    /// Upper bound on the dedup capacity. Beyond this,
+    /// [`Self::with_capacity`] clamps. `1 << 24` (~16.7 M ids) is
+    /// far above any realistic dedup window and below the point
+    /// where pre-allocation would dominate the process heap
+    /// (~256 MiB just for the `HashSet` + `VecDeque` reservations).
     pub const MAX_CAPACITY: usize = 1 << 24;
 
     /// Create a helper with the given LRU capacity.
     ///
-    /// `capacity == 0` is treated as 1 — the LRU still works
-    /// (every insert evicts the prior id) but the dedup window is
-    /// effectively a single-id rolling window. Callers that want
-    /// "no dedup at all" should not construct this helper in the
-    /// first place.
+    /// `capacity == 0` is treated as 1 — the FIFO eviction still
+    /// works (every insert evicts the prior id) but the dedup
+    /// window is effectively a single-id rolling window. Callers
+    /// that want "no dedup at all" should not construct this
+    /// helper in the first place.
     ///
     /// BUG #42: pre-fix, `capacity` had no upper clamp. A
     /// misconfigured `usize::MAX` pre-allocated the `VecDeque`
