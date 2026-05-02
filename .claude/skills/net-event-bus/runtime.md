@@ -64,7 +64,9 @@ Verified against `net/crates/net/sdk/src/error.rs`. The full enum:
 | Variant | Meaning | Your action |
 |---|---|---|
 | `Shutdown` | Node was shut down before this call | Stop using the node. Don't retry. |
-| `Ingestion(String)` | Local ring buffer rejected the event | Usually backpressure — see `Backpressure` policy. May indicate misconfiguration. |
+| `Ingestion(String)` | Local ring buffer rejected the event for a reason that doesn't map to a more specific variant | Fallback / future-proof bucket. The structured causes (`Sampled`, `Unrouted`, `Backpressure`, `Shutdown`) are routed to their own variants via `From<IngestionError>` — pre-`bugfixes-8` everything came through here as a string and callers had to substring-match. |
+| `Sampled` | Event was deliberately dropped by a sampling / decimation policy | Retry is pointless. Producer should accept the drop or change the sampling rate. |
+| `Unrouted` | No routable shard for the event (typically a topology-transient state — concurrent scale-down or shard still provisioning) | Retry once topology stabilizes. Back-off-and-retry on `Backpressure` semantics is the wrong remediation. |
 | `Poll(String)` | Subscriber poll failed | Often transient. Caller decides retry policy. |
 | `Adapter(String)` | Underlying transport (Redis, JetStream, mesh) returned an error | Check transport config and connectivity. |
 | `Serialization(serde_json::Error)` | Could not serialize/deserialize the event | Fix the type. Indicates bug, not a transient error. |
@@ -73,7 +75,16 @@ Verified against `net/crates/net/sdk/src/error.rs`. The full enum:
 | `Backpressure` | Stream's per-stream send window full | Use `send_with_retry` (5–200ms exponential) or `send_blocking` helpers, or apply your own policy. |
 | `NotConnected` | Peer session is gone | Reconnect or reroute at the application layer. Mesh layer will already be trying. |
 | `ChannelRejected(Option<AckReason>)` | Publisher's ack rejected your subscribe/unsubscribe | Permission token issue or capacity limit. Inspect the reason. |
-| `Traversal { kind, message }` | NAT-traversal optimization failed | **Never a connectivity failure** — fallback path still works. Log and ignore unless tuning. *Only present when the SDK is built with `features = ["nat-traversal"]` (`net/crates/net/sdk/src/error.rs:55-66`)* — projects without that feature won't see this variant. |
+| `Traversal { kind, message }` | NAT-traversal optimization failed | **Never a connectivity failure** — fallback path still works. Log and ignore unless tuning. *Only present when the SDK is built with `features = ["nat-traversal"]`* — projects without that feature won't see this variant. |
+
+`SdkError` is `#[non_exhaustive]`. Match arms must include a wildcard
+(`_ => …` or a catch-all `Err(e) => …`) so a future variant addition is
+a minor-version change rather than a breaking one. The two most recent
+additions — `Sampled` and `Unrouted` — are exactly that case: they
+moved out of `Ingestion(String)` so callers can dispatch on the cause
+without substring-matching. Code that string-matched on
+`Ingestion(...)` for "no shards" or "sampled" silently stops matching
+on `bugfixes-8` and later.
 
 `pub type Result<T> = std::result::Result<T, SdkError>;` — most APIs return this.
 
