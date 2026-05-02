@@ -18,6 +18,39 @@
 //! All FFI functions are thread-safe. The event bus handle can be shared
 //! across threads.
 //!
+//! # Tokio runtime restriction (BUG #70)
+//!
+//! Internal FFI ops (`net_poll`, `net_flush`, `net_shutdown`,
+//! `net_redex_*`, `net_mesh_new`, the cortex FFI, the mesh FFI)
+//! drive the bus's tokio runtime via `Runtime::block_on`. That
+//! function panics with "Cannot start a runtime from within a
+//! runtime" if the calling thread is already inside a tokio
+//! runtime context. The functions are `extern "C"`, so a panic
+//! unwinds across the FFI boundary into C / Go-cgo / Python /
+//! NAPI — undefined behavior.
+//!
+//! **The common-case C / Go / Python caller has no Rust tokio
+//! runtime, so this is unreachable for them.** The narrow path is:
+//!
+//! - A **Rust** caller loads the cdylib and calls these
+//!   functions from inside its own `#[tokio::main]` (or any
+//!   thread that has called `Runtime::enter()`).
+//! - A non-Rust caller embeds a Rust library that runs its own
+//!   tokio runtime and forwards calls into this cdylib on the
+//!   same thread.
+//!
+//! Both forms are unusual but reachable. **Do not call any FFI
+//! op from a thread that already holds a tokio runtime
+//! context.** If you must, spawn the FFI call on a fresh OS
+//! thread that doesn't carry a runtime guard, or wrap the call
+//! with `tokio::task::spawn_blocking(|| net_xxx(...))` to escape
+//! the worker pool.
+//!
+//! `net_init` (`mod.rs:284-316`) hardens against this for runtime
+//! *construction*; the steady-state ops do not, since the cost
+//! of a `Handle::try_current()` check on every poll would be
+//! measurable for the common path that doesn't hit the bug.
+//!
 //! # Memory Management
 //!
 //! - Handles returned by `net_init` must be freed with `net_shutdown`
