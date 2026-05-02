@@ -1573,8 +1573,7 @@ mod tests {
     }
 
     /// CR-22: pin parity between the Rust-side `NetError` enum and
-    /// the two C-header copies (`include/net.h` and
-    /// `bindings/go/net/net.h`). The Rust enum is the source of
+    /// the two C-header copies. The Rust enum is the source of
     /// truth; C / Go consumers `errors.Is` against the named codes.
     /// Pre-CR-22 the headers were missing `-9` (IntOverflow) and
     /// `-10` (MismatchedHandles); a consumer receiving those values
@@ -1586,10 +1585,19 @@ mod tests {
     /// that each Rust-side value is present in BOTH headers. The
     /// test does NOT verify symbolic names; the sealing
     /// constraint is the numeric value alone.
+    ///
+    /// Both `include_str!` paths point inside `net/crates/net/`.
+    /// `include/net.go.h` is a manually-synced mirror of the
+    /// repo-root `go/net.h`. Reaching outside the crate root
+    /// (`include_str!("../../../../../go/net.h")`) breaks
+    /// `cargo publish` and any out-of-repo vendoring of this
+    /// crate, so the in-crate copy is the supported source. A
+    /// drift between the two surfaces here as a parity-test
+    /// failure: one of them will be missing the new value.
     #[test]
     fn cr22_c_header_parity_with_rust_neterror() {
         let primary = include_str!("../../include/net.h");
-        let go_copy = include_str!("../../../../../go/net.h");
+        let go_copy = include_str!("../../include/net.go.h");
 
         // The Rust enum's full set of values (mirrors `pub enum
         // NetError` above). When a new variant is added in the
