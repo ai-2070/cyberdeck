@@ -105,7 +105,22 @@ impl JetStreamAdapter {
         let value: serde_json::Value = serde_json::from_slice(data)?;
 
         let raw = value.get("r").cloned().unwrap_or(serde_json::Value::Null);
-        let raw_bytes = Bytes::from(serde_json::to_vec(&raw).unwrap_or_default());
+        // BUG #53: pre-fix used `unwrap_or_default()` on the
+        // re-serialize, so a malformed/oversized `r` value whose
+        // serialization failed silently became empty bytes. The
+        // event was then "delivered" with an empty payload
+        // instead of surfacing the corruption — silent on-wire
+        // data loss. `serde_json::to_vec` on a serde_json::Value
+        // can't actually fail under normal conditions (the value
+        // came from a successful from_slice round-trip just
+        // above), but the audit's concern stands as defense in
+        // depth: surface any failure as a fatal parse error so
+        // the corruption is observable.
+        let raw_bytes = Bytes::from(serde_json::to_vec(&raw).map_err(|e| {
+            AdapterError::Fatal(format!(
+                "JetStream stored event seq={seq}: re-serialize of `r` field failed: {e}"
+            ))
+        })?);
         let insertion_ts = value.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
 
         // BUG #39: pre-fix this was `... as u16`, which silently
