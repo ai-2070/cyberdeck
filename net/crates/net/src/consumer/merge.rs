@@ -98,8 +98,20 @@ impl CompositeCursor {
     }
 
     /// Encode the cursor as a base64 string.
+    ///
+    /// BUG #63: pre-fix used `unwrap_or_default()`, which silently
+    /// produced an empty string on serialization failure. The
+    /// empty cursor then base64-encoded to an empty string and
+    /// the consumer's next poll restarted from the beginning of
+    /// the stream — silent rewind. For the current `positions`
+    /// schema (`HashMap<u16, Arc<str>>`), serialization is
+    /// infallible, so the failure path is unreachable. `expect`
+    /// surfaces a future schema change that breaks the invariant
+    /// as a clear "BUG" panic rather than a silent restart.
     pub fn encode(&self) -> String {
-        let json = serde_json::to_string(&self.positions).unwrap_or_default();
+        let json = serde_json::to_string(&self.positions)
+            .expect("BUG #63: CompositeCursor::encode failed to serialize positions; \
+                     the schema (HashMap<u16, Arc<str>>) is supposed to be infallible");
         BASE64.encode(json.as_bytes())
     }
 
