@@ -90,11 +90,27 @@ impl TimestampGenerator {
 
             // Guard against u64::MAX exhaustion: saturating_add(1) at MAX
             // would return MAX again, breaking strict monotonicity.
+            //
+            // BUG #61: pre-fix, at `last == u64::MAX - 1` we'd return
+            // `u64::MAX` (via `.max()` clamp) and the NEXT call
+            // would panic on `checked_add(1)`. That gap leaves the
+            // generator briefly stalled at MAX before failure —
+            // not a monotonicity violation, but the caller sees a
+            // "value progression" that's actually clamped. Panic
+            // preemptively when the result would be u64::MAX so
+            // the failure mode is one consistent panic, not
+            // "return MAX once then panic on retry."
             let next = match last.checked_add(1) {
                 Some(inc) => inc,
                 None => panic!("TimestampGenerator: timestamp space exhausted (u64::MAX)"),
             };
             let ts = now.max(next);
+            if ts == u64::MAX {
+                panic!(
+                    "TimestampGenerator: timestamp space exhausted (would return u64::MAX); \
+                     last={last}, now={now}",
+                );
+            }
 
             match self
                 .last
