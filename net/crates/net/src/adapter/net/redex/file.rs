@@ -353,7 +353,21 @@ impl RedexFile {
 
     /// Next sequence to be assigned (== total append count since open,
     /// including any evicted head).
+    ///
+    /// BUG #11: pre-fix this read `next_seq` outside the state
+    /// lock. `append` / `append_batch` etc. allocate a seq via
+    /// `fetch_add` before the disk write and `fetch_sub`-rollback
+    /// on failure — both within the state-lock critical section.
+    /// A concurrent reader without the lock could observe the
+    /// temporarily-bumped value: external observers (metrics,
+    /// snapshot logic, an `IndexStart::FromSeq(next_seq())`
+    /// re-tail) believed a seq existed that was never durably
+    /// appended. Taking the state lock here serializes the read
+    /// with the append's commit-or-rollback, so callers only
+    /// observe values that have been durably committed (or
+    /// never assigned).
     pub fn next_seq(&self) -> u64 {
+        let _state = self.inner.state.lock();
         self.inner.next_seq.load(Ordering::Acquire)
     }
 
