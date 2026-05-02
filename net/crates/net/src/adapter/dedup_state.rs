@@ -240,9 +240,21 @@ impl PersistentProducerNonce {
         // Post-fix uses a single writable handle for write+sync
         // and propagates both errors. `OpenOptions` with
         // `create_new(true)` matches the per-call-unique tmp_path
-        // contract; if a stale tempfile happens to exist (prior
-        // crash), the create_new fails and the caller retries
-        // with a fresh tmp name.
+        // contract.
+        //
+        // Pre-emptively remove any zombie tempfile at this exact
+        // path. The path hash mixes pid + tid + nanos + freshly-
+        // sampled nonce, so a same-named file can only be a
+        // crashed prior run of the SAME process+thread that
+        // happened to land on the identical nanos+nonce — vanishingly
+        // unlikely, but observable in practice if a system clock
+        // rewinds across a crash. Without this, `create_new` fails
+        // with `AlreadyExists` and there is no retry path; every
+        // subsequent save then errors out and the producer nonce
+        // never persists. `remove_file().ok()` is safe because no
+        // concurrent caller can be holding this exact path (the
+        // hash is unique per-call by construction).
+        let _ = fs::remove_file(&tmp_path);
         {
             use std::io::Write;
             let mut f = fs::OpenOptions::new()
