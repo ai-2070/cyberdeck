@@ -391,14 +391,33 @@ impl Adapter for JetStreamAdapter {
     ) -> Result<ShardPollResult, AdapterError> {
         let mut stream = self.get_or_create_stream(shard_id).await?;
 
-        // Parse the cursor (sequence number)
+        // Parse the cursor (sequence number).
+        //
+        // BUG #69: pre-fix, `seq + 1` panicked in debug or wrapped
+        // to 0 in release on a caller-supplied cursor of `u64::MAX`,
+        // silently restarting polling from the start of the stream
+        // and re-delivering everything. Cursors are produced by the
+        // adapter today, so the in-tree path is safe — but
+        // `bus.poll()` accepts any base64 `CompositeCursor`, so a
+        // hand-crafted cursor lands here. `checked_add(1).unwrap_or(seq)`
+        // saturates at `u64::MAX` so a max-cursor stays parked at
+        // the end of the stream rather than restarting at 0.
         let start_seq = from_id
             .and_then(|id| id.parse::<u64>().ok())
-            .map(|seq| seq + 1) // Exclusive: start after the given sequence
+            .map(|seq| seq.checked_add(1).unwrap_or(seq)) // Exclusive: start after the given sequence
             .unwrap_or(1); // Start from beginning if no cursor
 
-        // Fetch one extra to detect has_more
-        let fetch_limit = limit + 1;
+        // Fetch one extra to detect has_more.
+        //
+        // BUG #71: `limit + 1` panicked in debug or wrapped to 0 in
+        // release on `limit == usize::MAX`. The FFI poll-request
+        // JSON path does `usize::try_from` but doesn't bound the
+        // value, so an attacker could craft a request that returns
+        // an empty result with no error — silent under-delivery.
+        // `saturating_add(1)` clamps at `usize::MAX`, after which
+        // the per-event walk below is bounded by `max_seq` so the
+        // saturating value cannot itself cause an overflow.
+        let fetch_limit = limit.saturating_add(1);
 
         // Get messages directly from the stream
         let mut events = Vec::with_capacity(limit);
@@ -659,5 +678,36 @@ mod tests {
         assert!(!is_transient_error(&PublishError::new(
             PublishErrorKind::WrongLastSequence
         )));
+    }
+
+    /// BUG #69: a cursor of `u64::MAX` must not overflow `seq + 1`.
+    /// Pre-fix this panicked in debug or wrapped to `0` in release,
+    /// silently restarting polling from the beginning of the
+    /// stream. The fix uses `checked_add(1).unwrap_or(seq)` to
+    /// saturate at `u64::MAX`, parking the cursor at the end.
+    #[test]
+    fn cursor_at_u64_max_does_not_overflow() {
+        // Replicate the parsing pattern from poll_shard. We test
+        // the arithmetic in isolation since spinning up a real
+        // JetStream is out-of-scope for unit tests.
+        let cursor_id = u64::MAX.to_string();
+        let parsed: u64 = cursor_id.parse().unwrap();
+        // The post-fix expression — must NOT panic and must NOT
+        // produce 0 (which would re-poll from the start of the
+        // stream).
+        let start_seq = parsed.checked_add(1).unwrap_or(parsed);
+        assert_ne!(start_seq, 0, "BUG #69: u64::MAX cursor must not wrap to 0");
+        assert_eq!(start_seq, u64::MAX, "must saturate at u64::MAX");
+    }
+
+    /// BUG #71: `limit + 1` must not overflow on `limit ==
+    /// usize::MAX`. Pre-fix this panicked / wrapped to 0;
+    /// `saturating_add(1)` clamps at `usize::MAX`.
+    #[test]
+    fn fetch_limit_with_usize_max_does_not_overflow() {
+        let limit: usize = usize::MAX;
+        let fetch_limit = limit.saturating_add(1);
+        assert_ne!(fetch_limit, 0, "BUG #71: usize::MAX must not wrap to 0");
+        assert_eq!(fetch_limit, usize::MAX);
     }
 }

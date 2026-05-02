@@ -440,8 +440,18 @@ impl Adapter for RedisAdapter {
             .map(|id| format!("({}", id)) // Exclusive: "(1702123456789-0"
             .unwrap_or_else(|| "-".to_string()); // "-" = from beginning
 
-        // Fetch one extra to detect has_more
-        let fetch_limit = limit + 1;
+        // Fetch one extra to detect has_more.
+        //
+        // BUG #71: pre-fix `limit + 1` panicked in debug or wrapped
+        // to 0 in release on `limit == usize::MAX`, silently
+        // returning an empty result with no error. The FFI
+        // poll-request JSON path does `usize::try_from` but doesn't
+        // bound the value, so this is reachable from an
+        // attacker-controlled cursor. `saturating_add(1)` clamps
+        // at `usize::MAX`; Redis accepts the COUNT arg as i64 and
+        // will simply cap to its own maximum, returning whatever
+        // is in the stream.
+        let fetch_limit = limit.saturating_add(1);
 
         // XRANGE key start + COUNT limit
         // Returns array of [id, [field, value, field, value, ...]]
