@@ -141,6 +141,28 @@ fn compare_values(
 ///   4. At least one is a float → f64 fallback with the documented
 ///      lossy semantics.
 fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Option<std::cmp::Ordering> {
+    // We don't enable serde_json's `arbitrary_precision` feature in
+    // this tree, but a transitive dependency could turn it on
+    // workspace-wide via Cargo's feature unification. With it, a
+    // big-integer literal stops fitting in any of `as_i64` /
+    // `as_u64` / `as_f64` (all three return `None`) and the rule
+    // would silently fail to fire — quota gates, threshold checks,
+    // and policy rules become no-ops with no diagnostic. The
+    // `debug_assert!` makes the misuse loud during dev/test; in
+    // release we still return `None` so the rule fails closed.
+    debug_assert!(
+        a.is_i64() || a.is_u64() || a.is_f64(),
+        "compare_numbers: lhs is neither i64/u64/f64 — likely \
+         `serde_json/arbitrary_precision` got enabled via feature \
+         unification. Rule will silently fail closed in release."
+    );
+    debug_assert!(
+        b.is_i64() || b.is_u64() || b.is_f64(),
+        "compare_numbers: rhs is neither i64/u64/f64 — likely \
+         `serde_json/arbitrary_precision` got enabled via feature \
+         unification. Rule will silently fail closed in release."
+    );
+
     // 1. Both fit in i64.
     if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
         return Some(ai.cmp(&bi));
