@@ -1,0 +1,29 @@
+net/crates/net/bindings/python/python/net/_net.pyi
+  7cd1aa3948e2e296 300-302
+net/crates/net/bindings/node/src/cortex.rs
+  7cd1aa3948e2e296 277-278,280-284,286,295
+net/crates/net/bindings/node/test/redex.test.ts
+  7cd1aa3948e2e296 32-33,45-51
+net/crates/net/bindings/python/src/cortex.rs
+  7cd1aa3948e2e296 319-327
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "04bb24dab405e71f151cdde1c49e00e358ff08ef",
+  "prompts": {
+    "7cd1aa3948e2e296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad152adb-b4ac-4388-af9c-44b44434d029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 4304,
+      "total_deletions": 8,
+      "accepted_lines": 1058,
+      "overriden_lines": 0
+    }
+  }
+}
