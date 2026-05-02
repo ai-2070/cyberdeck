@@ -734,6 +734,13 @@ impl ScalingPolicy {
 
     /// Create a policy optimized for high-throughput GPU workloads.
     /// Uses more aggressive scaling with higher max shard count.
+    ///
+    /// `max_shards` is capped at `u16::MAX` (65 535) because shard
+    /// ids are 16-bit. On hosts with more than 32 767 CPUs the
+    /// "2× CPU count" target saturates rather than wraps — this is
+    /// the intended behavior (BUG #62: pre-fix this was just an
+    /// implicit `saturating_mul` artifact; the cap is now
+    /// documented and the saturation is explicit).
     pub fn high_throughput() -> Self {
         let cpus = num_cpus();
         Self {
@@ -741,7 +748,9 @@ impl ScalingPolicy {
             push_latency_threshold_ns: 3,
             flush_latency_threshold_us: 500,
             min_shards: 4.min(cpus),
-            max_shards: cpus.saturating_mul(2), // Allow up to 2x CPU count for GPU workloads
+            // `saturating_mul` clamps at u16::MAX (65 535).
+            // Documented cap; not silently wrapped.
+            max_shards: cpus.saturating_mul(2),
             cooldown: Duration::from_millis(500),
             scale_down_delay: Duration::from_secs(30),
             underutilized_threshold: 0.05,
