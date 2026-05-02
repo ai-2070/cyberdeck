@@ -1556,7 +1556,7 @@ mod tests {
     #[test]
     fn cr22_c_header_parity_with_rust_neterror() {
         let primary = include_str!("../../include/net.h");
-        let go_copy = include_str!("../../bindings/go/net/net.h");
+        let go_copy = include_str!("../../../../../go/net.h");
 
         // The Rust enum's full set of values (mirrors `pub enum
         // NetError` above). When a new variant is added in the
