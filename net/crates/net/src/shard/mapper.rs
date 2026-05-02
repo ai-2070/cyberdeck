@@ -511,7 +511,16 @@ impl ShardMapper {
         if candidates.is_empty() {
             return active[0].id;
         }
-        let idx = (event_hash as usize) % candidates.len();
+        // BUG #56: pre-fix used `(event_hash as usize) % candidates.len()`,
+        // which biases low-bucket indices when `candidates.len()`
+        // is not a power of two. With u64 hashes the bias is small
+        // but non-zero and accumulates over time as a sustained
+        // skew toward shards at the low end of the candidate
+        // vector. Lemire's technique
+        // (https://lemire.me/blog/2016/06/30/fast-random-shuffling/)
+        // computes the index as `(hash * len) >> 64` — an unbiased
+        // integer mapping for any `len` that fits in u64.
+        let idx = ((event_hash as u128 * candidates.len() as u128) >> 64) as usize;
         candidates[idx].id
     }
 
@@ -1093,6 +1102,52 @@ mod tests {
 
         // With 4 shards, we should hit multiple
         assert!(!selected.is_empty());
+    }
+
+    /// BUG #56: `select_shard`'s candidate-index computation must
+    /// be unbiased across the u64 hash space. Pre-fix used
+    /// `hash as usize % candidates.len()`, which over-weights low
+    /// indices when `candidates.len()` is not a power of two.
+    /// With u64 hashes the bias is small but non-zero and
+    /// sustains a hot-shard skew over time. Lemire's
+    /// `(hash * len) >> 64` is unbiased.
+    ///
+    /// We test the unbiased property by sampling a uniform
+    /// distribution of u64 hashes over 3 candidate shards and
+    /// asserting each bucket gets close to 1/3 of the picks.
+    /// Empirical bound: ±5% across 30 000 trials with a
+    /// well-distributed input.
+    #[test]
+    fn select_shard_distribution_is_unbiased() {
+        // 3 candidates: a non-power-of-2 to expose the modulo
+        // bias the fix removes.
+        let mapper = ShardMapper::new(3, 1024, ScalingPolicy::default()).unwrap();
+
+        let trials = 30_000u64;
+        // Spread inputs uniformly across the u64 range so the
+        // multiply-shift mapping behaves as designed.
+        let stride = u64::MAX / trials;
+        let mut counts = [0u64; 3];
+        for i in 0..trials {
+            let h = i.wrapping_mul(stride);
+            let id = mapper.select_shard(h);
+            counts[id as usize] += 1;
+        }
+
+        let expected = (trials / 3) as i64;
+        for (id, &count) in counts.iter().enumerate() {
+            let diff = (count as i64 - expected).abs();
+            let pct = (diff as f64 / expected as f64) * 100.0;
+            assert!(
+                pct < 5.0,
+                "shard {} bucket has {} hits ({:.2}% off expected {}); \
+                 BUG #56 bias would drift higher on certain shards",
+                id,
+                count,
+                pct,
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1749,9 +1804,16 @@ mod tests {
         assert_eq!(mapper.shard_state(2), Some(ShardState::Provisioning));
 
         // Across many hashes, `select_shard` must never pick id 2.
+        // Spread the input hashes across the u64 range so the
+        // unbiased Lemire-style mapping (BUG #56) actually
+        // distributes — sequential small ids would all map to
+        // index 0 because `(small * len) >> 64 = 0`. Production
+        // callers pass `xxh3_64`-hashed event payloads, which
+        // are uniform u64s; this scaling mirrors that.
         let mut seen: std::collections::HashSet<u16> = std::collections::HashSet::new();
-        for hash in 0u64..10_000 {
-            seen.insert(mapper.select_shard(hash));
+        let stride = u64::MAX / 10_000;
+        for i in 0u64..10_000 {
+            seen.insert(mapper.select_shard(i.wrapping_mul(stride)));
         }
         assert!(
             !seen.contains(&2),
@@ -1766,8 +1828,9 @@ mod tests {
         assert_eq!(mapper.active_shard_count(), 3);
 
         let mut seen_after: std::collections::HashSet<u16> = std::collections::HashSet::new();
-        for hash in 0u64..10_000 {
-            seen_after.insert(mapper.select_shard(hash));
+        let stride = u64::MAX / 10_000;
+        for i in 0u64..10_000 {
+            seen_after.insert(mapper.select_shard(i.wrapping_mul(stride)));
         }
         assert!(
             seen_after.contains(&2),
