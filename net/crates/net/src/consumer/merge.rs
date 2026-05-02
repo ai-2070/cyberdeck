@@ -278,6 +278,15 @@ impl ConsumeResponse {
 /// applied in `PollMerger::poll`. Bounds the adapter's per-call
 /// memory pressure for a single poll. Callers needing larger
 /// effective limits should paginate.
+///
+/// Marked `#[doc(hidden)]` because the value is an internal
+/// tuning knob, not part of the consumer's public API. Surfacing
+/// it on the docs would invite downstreams to match against it
+/// and turn a silent tuning change into a breaking-change
+/// negotiation. Callers that need to know whether a poll was
+/// truncated should read `ConsumeResponse::truncated_at_per_shard_cap`
+/// rather than comparing against this constant directly.
+#[doc(hidden)]
 pub const PER_SHARD_FETCH_CAP: usize = 10_000;
 
 /// Match a `StoredEvent` against a filter, surfacing parse failures.
