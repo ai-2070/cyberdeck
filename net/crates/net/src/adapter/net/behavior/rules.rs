@@ -1240,18 +1240,38 @@ impl RuleEngine {
     // Record an execution
     fn record_execution(&mut self, rule_id: &str) {
         let now = Instant::now();
+
+        // BUG #17: pre-fix this incremented `execution_count`
+        // unconditionally, even for rules without a rate_limit.
+        // A rule that toggled rate-limited → unlimited carried
+        // its old count forever; on toggle BACK to rate-limited
+        // with the same window, the count was already at-or-
+        // above max and every execution was immediately blocked
+        // — silent stuck-rule on hot reload.
+        //
+        // Fix: only touch rate-limit-specific state when the
+        // current rule actually has a rate_limit. The
+        // last_execution timestamp is independently used by
+        // cooldown-based gating, so it advances regardless.
+        let has_rate_limit = self
+            .rules_by_id
+            .get(rule_id)
+            .and_then(|r| r.rate_limit.as_ref())
+            .is_some();
+
         let state = self.execution_state.entry(rule_id.to_string()).or_default();
-
         state.last_execution = Some(now);
-        state.execution_count += 1;
 
-        // Reset window if needed
-        if let Some(rule) = self.rules_by_id.get(rule_id) {
-            if let Some(ref limit) = rule.rate_limit {
-                let window_duration = Duration::from_secs(limit.window_secs as u64);
-                if now.duration_since(state.window_start) >= window_duration {
-                    state.window_start = now;
-                    state.execution_count = 1;
+        if has_rate_limit {
+            state.execution_count += 1;
+            // Reset window if needed.
+            if let Some(rule) = self.rules_by_id.get(rule_id) {
+                if let Some(ref limit) = rule.rate_limit {
+                    let window_duration = Duration::from_secs(limit.window_secs as u64);
+                    if now.duration_since(state.window_start) >= window_duration {
+                        state.window_start = now;
+                        state.execution_count = 1;
+                    }
                 }
             }
         }
