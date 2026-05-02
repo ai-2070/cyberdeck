@@ -3,6 +3,31 @@
 //! The `OriginStamp` holds the entity identity and provides the cached
 //! `origin_hash` value that gets written into every outbound packet header.
 //! This is computed once at session creation — zero per-packet crypto.
+//!
+//! # Threat model — origin spoofability inside an authenticated channel
+//!
+//! BUG #29: `origin_hash` is written verbatim into the wire header
+//! and protected only by the channel's AEAD seal. There is **no
+//! per-packet signature** binding the payload to the originator's
+//! keypair. Any peer with the session key (i.e., any node admitted
+//! to the channel via the handshake) can mint packets claiming an
+//! arbitrary `origin_hash` value.
+//!
+//! This is a **deliberate design trade-off**: per-packet signatures
+//! would add ~64 bytes of overhead and a signature verification per
+//! packet, both load-bearing on the "wire-speed forwarding" promise.
+//! The mitigation is at the membership layer:
+//!
+//! - Channels can require capability tokens for join (`ChannelConfig::with_require_token`).
+//! - Tokens are scoped + signed by the issuer.
+//! - Once a peer is admitted, it's trusted to act under any
+//!   `origin_hash` within the channel — including spoofing
+//!   another channel member's origin.
+//!
+//! Callers needing **end-to-end origin authentication** must layer
+//! a signed envelope inside the encrypted payload (e.g., via
+//! `PermissionToken`'s signing primitives or an application-level
+//! signature scheme). The bus deliberately does not enforce this.
 
 use super::entity::{EntityId, EntityKeypair};
 
