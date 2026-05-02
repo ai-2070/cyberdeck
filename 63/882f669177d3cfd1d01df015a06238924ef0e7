@@ -1,0 +1,23 @@
+net/crates/net/src/shard/batch.rs
+  7cd1aa3948e2e296 215-230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "63882f669177d3cfd1d01df015a06238924ef0e7",
+  "prompts": {
+    "7cd1aa3948e2e296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad152adb-b4ac-4388-af9c-44b44434d029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 16,
+      "total_deletions": 0,
+      "accepted_lines": 1042,
+      "overriden_lines": 0
+    }
+  }
+}
