@@ -96,6 +96,19 @@ impl NetAdapterConfig {
     /// Default handshake timeout
     pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+    /// Upper bound on `packet_pool_size`. BUG #18 — pre-fix this
+    /// was unbounded, so a typo'd `with_pool_size(1_000_000_000)`
+    /// walked past validate() and OOMed at first allocation. The
+    /// 1 << 20 (1 048 576) cap is far above any realistic
+    /// production setting; the default is 64.
+    pub const MAX_PACKET_POOL_SIZE: usize = 1 << 20;
+
+    /// Upper bound on `handshake_retries`. BUG #18 — pre-fix
+    /// unbounded; a misconfigured large value just took forever to
+    /// fail. 1024 covers any realistic flaky-network policy; the
+    /// default is 3.
+    pub const MAX_HANDSHAKE_RETRIES: usize = 1024;
+
     /// Create a new initiator configuration.
     ///
     /// The initiator must know the responder's static public key.
@@ -235,8 +248,43 @@ impl NetAdapterConfig {
             return Err("packet_pool_size must be > 0".into());
         }
 
+        // BUG #18: pre-fix only the zero / ordering checks were
+        // enforced. A typo'd `with_pool_size(1_000_000_000)` (or
+        // an env-var-fed `usize::MAX`) walked past validation and
+        // OOMed at first allocation. Bound the pool size at a
+        // generous-but-bounded ceiling.
+        if self.packet_pool_size > Self::MAX_PACKET_POOL_SIZE {
+            return Err(format!(
+                "packet_pool_size {} exceeds upper bound {}",
+                self.packet_pool_size,
+                Self::MAX_PACKET_POOL_SIZE
+            ));
+        }
+
+        // BUG #18: handshake_retries had no upper clamp. A
+        // misconfigured large value would just take forever to
+        // fail. Bound at 1024 (covers any realistic flaky
+        // network).
+        if self.handshake_retries > Self::MAX_HANDSHAKE_RETRIES {
+            return Err(format!(
+                "handshake_retries {} exceeds upper bound {}",
+                self.handshake_retries,
+                Self::MAX_HANDSHAKE_RETRIES
+            ));
+        }
+
         if self.heartbeat_interval.is_zero() {
             return Err("heartbeat_interval must be > 0".into());
+        }
+
+        // BUG #18: pre-fix `heartbeat_interval = 1ns` passed.
+        // Floor at 10 ms — heartbeats faster than that are not a
+        // real use case and would just drown the network.
+        if self.heartbeat_interval < Duration::from_millis(10) {
+            return Err(format!(
+                "heartbeat_interval {:?} is below the 10ms minimum",
+                self.heartbeat_interval
+            ));
         }
 
         if self.session_timeout.is_zero() {
@@ -401,5 +449,66 @@ mod tests {
         .with_num_shards(0);
 
         assert!(config.validate().is_err());
+    }
+
+    fn make_initiator() -> NetAdapterConfig {
+        NetAdapterConfig::initiator(
+            "127.0.0.1:9000".parse().unwrap(),
+            "127.0.0.1:9001".parse().unwrap(),
+            [0x42u8; 32],
+            [0x24u8; 32],
+        )
+    }
+
+    /// BUG #18: pathological `packet_pool_size` (e.g. usize::MAX
+    /// from a misconfigured env var) must be rejected at validate
+    /// time, not OOM at first allocation.
+    #[test]
+    fn validate_rejects_pathological_packet_pool_size() {
+        let config = make_initiator().with_pool_size(usize::MAX);
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("packet_pool_size") && err.contains("upper bound"),
+            "expected upper-bound error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_accepts_max_packet_pool_size_boundary() {
+        let config = make_initiator().with_pool_size(NetAdapterConfig::MAX_PACKET_POOL_SIZE);
+        assert!(
+            config.validate().is_ok(),
+            "exactly MAX_PACKET_POOL_SIZE must validate (boundary)"
+        );
+    }
+
+    /// BUG #18: 1ns heartbeat is below any realistic floor and
+    /// would drown the network.
+    #[test]
+    fn validate_rejects_heartbeat_below_minimum() {
+        let mut config = make_initiator();
+        config.heartbeat_interval = Duration::from_nanos(1);
+        config.session_timeout = Duration::from_secs(30);
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("heartbeat_interval") && err.contains("10ms"),
+            "expected 10ms-min error, got: {}",
+            err
+        );
+    }
+
+    /// BUG #18: handshake_retries far above realistic values must
+    /// be rejected.
+    #[test]
+    fn validate_rejects_pathological_handshake_retries() {
+        let mut config = make_initiator();
+        config.handshake_retries = usize::MAX;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("handshake_retries") && err.contains("upper bound"),
+            "expected upper-bound error, got: {}",
+            err
+        );
     }
 }
