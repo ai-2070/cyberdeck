@@ -232,9 +232,16 @@ impl EventBus {
             ))
         };
 
-        // Create poll merger
-        let poll_merger =
-            arc_swap::ArcSwap::from_pointee(PollMerger::new(adapter.clone(), config.num_shards));
+        // Create poll merger.
+        //
+        // BUG #67: pass the live id set rather than the count. At
+        // initial construction the ids are dense (`0..num_shards`),
+        // but using `shard_ids()` here keeps a single code path with
+        // the post-scaling re-stores below.
+        let poll_merger = arc_swap::ArcSwap::from_pointee(PollMerger::new(
+            adapter.clone(),
+            shard_manager.shard_ids(),
+        ));
 
         // Shutdown flag and drain-finalize gate. See `drain_finalize_ready`
         // doc on `EventBus` for the synchronization contract.
@@ -468,10 +475,10 @@ impl EventBus {
             return Err(AdapterError::Fatal(e.to_string()));
         }
 
-        // Update poll merger
+        // Update poll merger with the post-add id set (BUG #67).
         self.poll_merger.store(Arc::new(PollMerger::new(
             self.adapter.clone(),
-            self.shard_manager.num_shards(),
+            self.shard_manager.shard_ids(),
         )));
 
         tracing::info!(shard_id = new_id, "Added new shard");
@@ -622,10 +629,14 @@ impl EventBus {
             }
         }
 
-        // Update poll merger
+        // Update poll merger with the post-remove id set (BUG #67).
+        // Without this, a default-shards poll (`request.shards == None`)
+        // would still iterate `0..num_shards` and skip the live shard
+        // whose id is now the largest, while polling a nonexistent /
+        // recreated shard at the bottom of the range.
         self.poll_merger.store(Arc::new(PollMerger::new(
             self.adapter.clone(),
-            self.shard_manager.num_shards(),
+            self.shard_manager.shard_ids(),
         )));
 
         tracing::info!(shard_id = shard_id, "Removed shard");

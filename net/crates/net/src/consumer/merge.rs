@@ -257,17 +257,31 @@ fn event_matches_filter(event: &StoredEvent, filter: &Filter) -> bool {
 pub struct PollMerger {
     /// Adapter for polling shards.
     adapter: Arc<dyn Adapter>,
-    /// Total number of shards.
-    num_shards: u16,
+    /// Active shard IDs to poll when the request omits an explicit
+    /// `shards` list.
+    ///
+    /// BUG #67: previously stored only `num_shards: u16` and generated
+    /// `(0..num_shards)` on every default-shards poll. After a dynamic
+    /// scale-down (`ShardMapper::scale_down` evicts the lowest-weight
+    /// shard, not necessarily the highest id), the active id set can
+    /// become sparse — e.g. `{1, 2}` after id 0 was drained — but
+    /// `num_shards == 2` still produces `[0, 1]`, polling a stale or
+    /// nonexistent shard 0 and skipping the live shard 2 entirely.
+    /// Captured at construction; the bus replaces the merger via
+    /// `ArcSwap` whenever topology changes (`add_shard`,
+    /// `remove_shard_internal`).
+    shard_ids: Vec<u16>,
 }
 
 impl PollMerger {
     /// Create a new poll merger.
-    pub fn new(adapter: Arc<dyn Adapter>, num_shards: u16) -> Self {
-        Self {
-            adapter,
-            num_shards,
-        }
+    ///
+    /// `shard_ids` should be the snapshot of currently-active shard IDs
+    /// (e.g. `ShardManager::shard_ids()`). Passing `0..num_shards` is
+    /// only correct when ids are guaranteed dense from 0 — i.e. the
+    /// static-shards path with no scaling.
+    pub fn new(adapter: Arc<dyn Adapter>, shard_ids: Vec<u16>) -> Self {
+        Self { adapter, shard_ids }
     }
 
     /// Poll events according to the request.
@@ -286,7 +300,7 @@ impl PollMerger {
         let shards: Vec<u16> = request
             .shards
             .clone()
-            .unwrap_or_else(|| (0..self.num_shards).collect());
+            .unwrap_or_else(|| self.shard_ids.clone());
 
         if shards.is_empty() {
             return Ok(ConsumeResponse::empty());
@@ -1115,14 +1129,76 @@ mod tests {
     #[tokio::test]
     async fn test_poll_merger_new() {
         let adapter = Arc::new(MockAdapter::new());
-        let merger = PollMerger::new(adapter, 4);
-        assert_eq!(merger.num_shards, 4);
+        let merger = PollMerger::new(adapter, vec![0, 1, 2, 3]);
+        assert_eq!(merger.shard_ids, vec![0, 1, 2, 3]);
+    }
+
+    /// BUG #67: when the active shard id set is sparse (e.g. shard 0
+    /// was scaled down, leaving `{1, 2}`), a poll with no explicit
+    /// `request.shards` must hit shards 1 and 2 — not generate
+    /// `[0, 1]` from a stale count and miss the live shard 2.
+    ///
+    /// Pre-fix, `PollMerger` stored only `num_shards: u16` and the
+    /// default branch generated `(0..num_shards).collect()`, so
+    /// shard 2's events were silently invisible to default-shards
+    /// consumers after a scale-down.
+    #[tokio::test]
+    async fn poll_merger_default_shards_uses_active_id_set_after_scale_down() {
+        let adapter = Arc::new(MockAdapter::new());
+
+        // Shard 0 (drained / no longer active): would mis-poll
+        // pre-fix and could return stale data on adapters that
+        // recreate streams on demand. We don't add events here.
+        // Shard 1 + Shard 2: active set after a scale-down that
+        // evicted shard 0.
+        adapter.add_events(
+            1,
+            vec![StoredEvent::from_value(
+                "1-a".to_string(),
+                json!({"shard": 1}),
+                100,
+                1,
+            )],
+        );
+        adapter.add_events(
+            2,
+            vec![StoredEvent::from_value(
+                "2-a".to_string(),
+                json!({"shard": 2}),
+                200,
+                2,
+            )],
+        );
+
+        // Sparse id set — shard 0 is NOT in the active list.
+        let merger = PollMerger::new(adapter, vec![1, 2]);
+
+        // Default-shards request (no `shards` override).
+        let request = ConsumeRequest::new(100);
+        let response = merger.poll(request).await.unwrap();
+
+        let returned: std::collections::HashSet<u16> =
+            response.events.iter().map(|e| e.shard_id).collect();
+        assert!(
+            returned.contains(&1),
+            "default-shards poll must include shard 1 (active)",
+        );
+        assert!(
+            returned.contains(&2),
+            "default-shards poll must include shard 2 — pre-fix this was silently \
+             skipped because the merger generated `0..num_shards` = `[0, 1]`",
+        );
+        assert!(
+            !returned.contains(&0),
+            "default-shards poll must NOT touch shard 0 — it was evicted",
+        );
+        assert_eq!(response.events.len(), 2);
     }
 
     #[tokio::test]
     async fn test_poll_merger_empty_limit() {
         let adapter = Arc::new(MockAdapter::new());
-        let merger = PollMerger::new(adapter, 4);
+        let merger = PollMerger::new(adapter, vec![0, 1, 2, 3]);
 
         let request = ConsumeRequest::new(0);
         let response = merger.poll(request).await.unwrap();
@@ -1135,7 +1211,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_merger_empty_shards() {
         let adapter = Arc::new(MockAdapter::new());
-        let merger = PollMerger::new(adapter, 4);
+        let merger = PollMerger::new(adapter, vec![0, 1, 2, 3]);
 
         let request = ConsumeRequest::new(100).shards(vec![]);
         let response = merger.poll(request).await.unwrap();
@@ -1169,7 +1245,7 @@ mod tests {
             )],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
 
         let request = ConsumeRequest::new(100);
         let response = merger.poll(request).await.unwrap();
@@ -1200,7 +1276,7 @@ mod tests {
             )],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
 
         let request = ConsumeRequest::new(100).ordering(Ordering::InsertionTs);
         let response = merger.poll(request).await.unwrap();
@@ -1225,7 +1301,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 1);
+        let merger = PollMerger::new(adapter, vec![0]);
 
         let request = ConsumeRequest::new(100).filter(Filter::eq("type", json!("token")));
         let response = merger.poll(request).await.unwrap();
@@ -1249,7 +1325,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 1);
+        let merger = PollMerger::new(adapter, vec![0]);
 
         let request = ConsumeRequest::new(2);
         let response = merger.poll(request).await.unwrap();
@@ -1290,7 +1366,7 @@ mod tests {
             )],
         );
 
-        let merger = PollMerger::new(adapter, 3);
+        let merger = PollMerger::new(adapter, vec![0, 1, 2]);
 
         // Only poll shard 0 and 2
         let request = ConsumeRequest::new(100).shards(vec![0, 2]);
@@ -1316,7 +1392,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 1);
+        let merger = PollMerger::new(adapter, vec![0]);
 
         // First poll
         let request = ConsumeRequest::new(2);
@@ -1363,7 +1439,7 @@ mod tests {
             .collect();
         adapter.add_events(1, shard1_events);
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
 
         // Poll in pages of 10 and collect all events
         let mut all_events = Vec::new();
@@ -1427,7 +1503,7 @@ mod tests {
             adapter.add_events(shard_id, events);
         }
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
 
         // Poll in small pages
         let mut all_event_ids = Vec::new();
@@ -1490,7 +1566,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
 
         // Poll with ordering, page size 2
         let mut all_events = Vec::new();
@@ -1546,7 +1622,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
 
         // First poll with limit 2 - should get 2 events and cursor should reflect only those 2
         let response1 = merger.poll(ConsumeRequest::new(2)).await.unwrap();
@@ -1601,7 +1677,7 @@ mod tests {
             );
         }
 
-        let merger = PollMerger::new(adapter, num_shards);
+        let merger = PollMerger::new(adapter, (0..num_shards).collect());
 
         // Request fewer events than shards — should still work
         let request = ConsumeRequest::new(3);
@@ -1638,7 +1714,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let filter = Filter::eq("type", json!("token"));
 
         // First poll: should return only the "token" events from shard 0
@@ -1716,7 +1792,7 @@ mod tests {
             .collect();
         adapter.add_events(1, shard1_events);
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let filter = Filter::eq("type", json!("token"));
 
         let mut all_events = Vec::new();
@@ -1787,7 +1863,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 1);
+        let merger = PollMerger::new(adapter, vec![0]);
         let filter = Filter::eq("type", json!("signal"));
 
         let response = merger
@@ -1835,7 +1911,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let filter = Filter::eq("type", json!("token"));
 
         // 4 matches exist; asking for 2 must yield the two earliest
@@ -1899,7 +1975,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 1);
+        let merger = PollMerger::new(adapter, vec![0]);
 
         // Filtered: corrupt event must be dropped, valid event kept.
         let filtered = merger
@@ -1965,7 +2041,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let filter = Filter::eq("type", json!("token"));
 
         // Page through with a small limit — over many polls every
@@ -2032,7 +2108,7 @@ mod tests {
             ],
         );
 
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let filter = Filter::eq("type", json!("token"));
 
         let mut all_returned: Vec<String> = Vec::new();
@@ -2108,7 +2184,7 @@ mod tests {
         }
 
         let adapter: Arc<dyn Adapter> = Arc::new(LiarAdapter);
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let response = merger.poll(ConsumeRequest::new(100)).await.unwrap();
 
         assert!(
@@ -2155,7 +2231,7 @@ mod tests {
         );
 
         // Poll many times; the order must be stable.
-        let merger = PollMerger::new(adapter, 2);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
         let mut prior_order: Option<Vec<String>> = None;
         for iter in 0..20 {
             let r = merger
