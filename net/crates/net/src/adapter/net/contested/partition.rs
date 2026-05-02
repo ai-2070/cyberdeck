@@ -201,6 +201,22 @@ impl PartitionDetector {
     ///
     /// If the node was in any partition's `other_side`, transitions
     /// the partition toward healing.
+    ///
+    /// # Overlapping partitions
+    ///
+    /// BUG #32: a single node id can appear in `other_side` of
+    /// multiple active partition records (e.g., a noisy detector
+    /// classified one physical outage into two records). This
+    /// function intentionally walks **all** matching records and
+    /// updates each independently — each record is the source of
+    /// truth for its own healing state.
+    ///
+    /// Downstream consumers that fire side-effecting healing
+    /// actions per partition (replica rebalance, alert dispatch)
+    /// must be idempotent over `(partition_id, recovered_node)`
+    /// pairs, otherwise overlapping records will double-count
+    /// one physical recovery. The detector layer is the place to
+    /// prevent overlaps; this layer is just bookkeeping.
     pub fn on_node_recovery(&mut self, node_id: u64) {
         for record in &mut self.active_partitions {
             if !record.other_side.contains(&node_id) {
