@@ -1216,13 +1216,21 @@ impl EventBus {
             tokio::task::yield_now().await;
         }
 
-        // 1b. Release the drain-finalize gate. The Release here pairs
-        // with the drain worker's Acquire load below, transitively
-        // making every push observed-pre-shutdown visible to the
-        // drain worker's final sweep. Set this even on the timeout
-        // path so a stuck producer doesn't deadlock the workers.
+        // 1b. Release the drain-finalize gate.
+        //
+        // BUG #60: pre-fix used `Ordering::Release` for this store
+        // and relied on the SeqCst spin above (loading
+        // `in_flight_ingests`) to provide the happens-before for
+        // every observed-pre-shutdown push. That works today
+        // because SeqCst loads carry an implicit fence, but a
+        // future change to the spin's ordering (Relaxed for perf,
+        // say) would silently break the drain worker's final-sweep
+        // contract — producer pushes might not be visible to
+        // `pop_batch_into`. Promote to SeqCst so the load-bearing
+        // happens-before is explicit at this site, not derived
+        // from another atomic's ordering choice.
         self.drain_finalize_ready
-            .store(true, AtomicOrdering::Release);
+            .store(true, AtomicOrdering::SeqCst);
 
         // Stop the scaling monitor first — it's independent of the
         // ingestion path and just needs to observe the flag.
