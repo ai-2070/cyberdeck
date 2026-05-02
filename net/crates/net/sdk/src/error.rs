@@ -2,7 +2,18 @@
 
 use thiserror::Error;
 
+/// Unified SDK error.
+///
+/// Marked `#[non_exhaustive]` so adding a new variant is a minor-version
+/// change — external `match` statements must include a wildcard arm.
+/// The most recent variant additions (`Sampled`, `Unrouted`) tightened
+/// `From<IngestionError>` so structured backpressure / sampling /
+/// no-route signals stop being funnelled into a stringly-typed
+/// `Ingestion(String)`. Callers that previously matched on the
+/// string content of `Ingestion` need to be updated to match the
+/// new variants.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum SdkError {
     #[error("node has been shut down")]
     Shutdown,
