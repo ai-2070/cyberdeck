@@ -8,8 +8,27 @@ Loosely inspired by the Net from Cyberpunk 2077 — a flat, encrypted mesh where
 
 Net is what the internet would look like if it were built today, the network science fiction imagined and systems engineers said was impossible. It is a latency-first encrypted mesh network. Every computer, device, and application is an equal node on a flat topology. There are no clients, no servers, no coordinators. The mesh propagates state, not connections. Existing networks operate in milliseconds (10⁻³). Net operates in nanoseconds (10⁻⁹).
 
+## Install
+
+```bash
+# Rust
+cargo add ai2070-net-sdk
+
+# TypeScript / Node
+npm install @ai2070/net-sdk @ai2070/net
+
+# Python
+pip install ai2070-net-sdk
+
+# Go
+go get github.com/ai-2070/net/net/crates/net/bindings/go/net
+```
+
+The Rust crate, npm scope, and PyPI dist all publish under `ai2070-net*` / `@ai2070/net*`. Source-level imports stay as `net_sdk` / `@ai2070/net-sdk` / `from net_sdk import ...`. See [SDKs](#sdks) for the lower-level core packages and full per-language usage.
+
 ## Contents
 
+- [Install](#install)
 - [Why not best-effort](#why-not-best-effort)
 - [A new class of systems](#a-new-class-of-systems)
 - [Properties](#properties)
@@ -478,7 +497,7 @@ All SDKs wrap the same Rust core. The SDK is the developer experience, the engin
 | **TypeScript** | [`@ai2070/net-sdk`](https://www.npmjs.com/package/@ai2070/net-sdk) ([source](net/crates/net/sdk-ts)) | `npm install @ai2070/net-sdk @ai2070/net` |
 | **Python** | [`ai2070-net-sdk`](https://pypi.org/project/ai2070-net-sdk/) ([source](net/crates/net/sdk-py)) | `pip install ai2070-net-sdk` |
 | **C** | [`net.h`](net/crates/net/include/net.h) | `cargo build --release --features ffi,net` (build cdylib + bundle the header) |
-| **Go** | [`net`](net/crates/net/bindings/go) | `go get github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net` |
+| **Go** | [`net`](net/crates/net/bindings/go) | `go get github.com/ai-2070/net/net/crates/net/bindings/go/net` |
 
 Lower-level bindings (skip the SDK ergonomics, talk directly to the engine):
 

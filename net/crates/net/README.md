@@ -4,8 +4,35 @@ High-performance encrypted mesh runtime.
 
 For the design philosophy, architecture rationale, and benchmarks, see the [project README](../../README.md).
 
+## Install
+
+```bash
+# Rust SDK
+cargo add ai2070-net-sdk
+
+# TypeScript / Node SDK
+npm install @ai2070/net-sdk @ai2070/net
+
+# Python SDK
+pip install ai2070-net-sdk
+
+# Go binding
+go get github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net
+```
+
+Lower-level packages (skip the SDK ergonomics, talk directly to the engine):
+
+```bash
+cargo add ai2070-net          # Rust core
+npm install @ai2070/net       # NAPI binding
+pip install ai2070-net        # PyO3 binding
+```
+
+Crate / module names inside source code (`net::`, `net_sdk::`, `from net import`, `from net_sdk import`) stayed stable across the rename via package aliasing. The registry-side names are `ai2070-net*` / `@ai2070/net*`. Per-language usage in [SDKs](#sdks); building the C SDK in [Building](#building).
+
 ## Contents
 
+- [Install](#install)
 - [Key Concepts](#key-concepts)
 - [Stack](#stack)
 - [Architecture](#architecture)
@@ -737,7 +764,7 @@ All SDKs wrap the same Rust core. Every language gets the same performance.
 | **Rust** | [`ai2070-net-sdk`](https://crates.io/crates/ai2070-net-sdk) | `cargo add ai2070-net-sdk` | Builder pattern, async streams, typed subscriptions |
 | **TypeScript** | [`@ai2070/net-sdk`](https://www.npmjs.com/package/@ai2070/net-sdk) | `npm install @ai2070/net-sdk @ai2070/net` | AsyncIterator, typed channels, Zod support |
 | **Python** | [`ai2070-net-sdk`](https://pypi.org/project/ai2070-net-sdk/) | `pip install ai2070-net-sdk` | Generators, dataclass/Pydantic, context manager |
-| **Go** | [`net`](bindings/go/) | `go get github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net` | CGO bindings, zero allocations on raw ingest |
+| **Go** | [`net`](bindings/go/) | `go get github.com/ai-2070/net/net/crates/net/bindings/go/net` | CGO bindings, zero allocations on raw ingest |
 | **C** | [`net.h`](include/net.h) | `cargo build --release --features ffi,net` then bundle the header | One header, structured types, zero JSON overhead |
 
 The Rust SDK imports as `use net_sdk::...`; the TypeScript SDK as `from '@ai2070/net-sdk'`; the Python SDK as `from net_sdk import ...`. The Rust core (`ai2070-net`), Node binding (`@ai2070/net`), and Python binding (`ai2070-net`) are the lower-level packages — useful when you want to skip the SDK ergonomics. Crate / module names inside the code (`net::`, `net._net`) stayed stable across the rename via package aliasing.
