@@ -105,15 +105,23 @@ impl CompositeCursor {
     /// the consumer's next poll restarted from the beginning of
     /// the stream — silent rewind. For the current `positions`
     /// schema (`HashMap<u16, Arc<str>>`), serialization is
-    /// infallible, so the failure path is unreachable. `expect`
-    /// surfaces a future schema change that breaks the invariant
-    /// as a clear "BUG" panic rather than a silent restart.
-    pub fn encode(&self) -> String {
-        let json = serde_json::to_string(&self.positions).expect(
-            "CompositeCursor::encode failed to serialize positions; \
-                     the schema (HashMap<u16, Arc<str>>) is supposed to be infallible",
-        );
-        BASE64.encode(json.as_bytes())
+    /// infallible, so the failure path is unreachable.
+    ///
+    /// We surface that as a `ConsumerError::InvalidCursor` rather
+    /// than a panic. `poll()` is an `async fn`, and a panic that
+    /// propagates from there can abort the surrounding tokio
+    /// runtime worker. Returning `Err` lets `poll()` stay
+    /// non-panicking even if a future schema change breaks the
+    /// invariant; the caller will see a structured error and can
+    /// retry / log instead of taking down a worker.
+    pub fn encode(&self) -> Result<String, ConsumerError> {
+        let json = serde_json::to_string(&self.positions).map_err(|e| {
+            ConsumerError::InvalidCursor(format!(
+                "CompositeCursor::encode failed to serialize positions \
+                 (HashMap<u16, Arc<str>> should be infallible): {e}"
+            ))
+        })?;
+        Ok(BASE64.encode(json.as_bytes()))
     }
 
     /// Decode a cursor from a base64 string.
@@ -662,7 +670,7 @@ impl PollMerger {
         // the same events forever. The cursor is None only when nothing was
         // fetched at all (truly empty shards).
         let next_id = if we_made_progress {
-            Some(final_cursor.encode())
+            Some(final_cursor.encode()?)
         } else {
             None
         };
@@ -689,7 +697,7 @@ mod tests {
         cursor.set(1, "1702123456790-0".to_string());
         cursor.set(5, "1702123456795-0".to_string());
 
-        let encoded = cursor.encode();
+        let encoded = cursor.encode().unwrap();
         let decoded = CompositeCursor::decode(&encoded).unwrap();
 
         assert_eq!(decoded.get(0), Some("1702123456789-0"));
@@ -955,7 +963,7 @@ mod tests {
     #[test]
     fn test_composite_cursor_empty_encode() {
         let cursor = CompositeCursor::new();
-        let encoded = cursor.encode();
+        let encoded = cursor.encode().unwrap();
         let decoded = CompositeCursor::decode(&encoded).unwrap();
         assert!(decoded.positions.is_empty());
     }
@@ -1093,7 +1101,7 @@ mod tests {
             cursor.set(i, format!("pos-{}", i));
         }
 
-        let encoded = cursor.encode();
+        let encoded = cursor.encode().unwrap();
         let decoded = CompositeCursor::decode(&encoded).unwrap();
 
         for i in 0..100u16 {
