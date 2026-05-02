@@ -1565,7 +1565,10 @@ mod tests {
         // `fetch_sub(1)` unconditionally and dropped num_shards
         // below the table size.
         let stranded = manager.remove_shard(new_id).expect("rollback remove");
-        assert!(stranded.is_empty(), "fresh provisioning shard has no events");
+        assert!(
+            stranded.is_empty(),
+            "fresh provisioning shard has no events"
+        );
         assert_eq!(
             manager.num_shards(),
             initial,
@@ -1576,8 +1579,14 @@ mod tests {
         // so the gate is symmetric with activate_shard's fetch_add.
         let activated_id = manager.add_shard().expect("add for activated path");
         manager.activate_shard(activated_id).expect("activate");
-        assert_eq!(manager.num_shards(), initial + 1, "activate bumps num_shards");
-        manager.remove_shard(activated_id).expect("remove activated");
+        assert_eq!(
+            manager.num_shards(),
+            initial + 1,
+            "activate bumps num_shards"
+        );
+        manager
+            .remove_shard(activated_id)
+            .expect("remove activated");
         assert_eq!(
             manager.num_shards(),
             initial,

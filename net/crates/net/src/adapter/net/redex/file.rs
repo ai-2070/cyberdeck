@@ -1221,7 +1221,10 @@ impl std::fmt::Debug for RedexFile {
         // impls in this crate make.
         f.debug_struct("RedexFile")
             .field("name", &self.inner.name)
-            .field("next_seq_atomic", &self.inner.next_seq.load(Ordering::Relaxed))
+            .field(
+                "next_seq_atomic",
+                &self.inner.next_seq.load(Ordering::Relaxed),
+            )
             .field("closed", &self.inner.closed.load(Ordering::Relaxed))
             .finish()
     }
