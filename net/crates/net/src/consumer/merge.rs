@@ -239,6 +239,17 @@ pub struct ConsumeResponse {
     /// `false`; tools building observability around large polls
     /// can detect under-delivery via this flag.
     pub truncated_at_per_shard_cap: bool,
+    /// Shards that reported `has_more=true` but contributed no
+    /// events and no cursor advance to this poll. The merger
+    /// suppresses the aggregate `has_more` flag for caller-
+    /// protection (preventing infinite loops), but operators
+    /// monitoring adapter health should know which shards are
+    /// stuck.
+    ///
+    /// BUG #64: pre-fix the suppression was logged at warn but
+    /// invisible to callers. Empty on the happy path; populated
+    /// only when a stall was detected and suppressed.
+    pub stalled_shards: Vec<u16>,
 }
 
 impl ConsumeResponse {
@@ -249,6 +260,7 @@ impl ConsumeResponse {
             next_id: None,
             has_more: false,
             truncated_at_per_shard_cap: false,
+            stalled_shards: Vec::new(),
         }
     }
 }
@@ -380,6 +392,14 @@ impl PollMerger {
             .sum();
         let mut all_events = Vec::with_capacity(total_events);
         let mut any_has_more = false;
+        // BUG #64: track which shards reported `has_more=true` so
+        // we can surface them on the response when the merger
+        // suppresses has_more for caller-protection. Pre-fix, an
+        // adapter stuck reporting `has_more=true` with no events
+        // and no cursor advance was logged at warn but invisible
+        // to callers — they saw a clean "no more events" and
+        // exited.
+        let mut shards_reporting_has_more: Vec<u16> = Vec::new();
         // `new_cursor` (fetched-position tracking) is only consulted on the
         // filter path — building it for unfiltered polls wastes a full
         // HashMap clone plus a `set()` per shard every poll.
@@ -402,7 +422,10 @@ impl PollMerger {
                     if let (Some(nc), Some(next_id)) = (new_cursor.as_mut(), next_id) {
                         nc.set(shard_id, next_id);
                     }
-                    any_has_more |= has_more;
+                    if has_more {
+                        any_has_more = true;
+                        shards_reporting_has_more.push(shard_id);
+                    }
                     all_events.extend(events);
                 }
                 Err(e) => {
@@ -618,12 +641,21 @@ impl PollMerger {
         // response and must back off rather than spin.
         let we_made_progress = !all_events.is_empty() || cursor_advanced;
         let has_more = (any_has_more || had_extra || all_filtered) && we_made_progress;
-        if any_has_more && !we_made_progress {
+        // BUG #64: when we suppress has_more for caller-protection
+        // (an adapter stuck at has_more=true with no progress),
+        // surface the offending shard ids on the response so
+        // operators can alert. Pre-fix the suppression was warn-
+        // logged only.
+        let stalled_shards: Vec<u16> = if any_has_more && !we_made_progress {
             tracing::warn!(
+                stalled_shards = ?shards_reporting_has_more,
                 "PollMerger: an adapter reported has_more=true with no events \
                  and no cursor advance — suppressing to avoid caller infinite-loop"
             );
-        }
+            shards_reporting_has_more
+        } else {
+            Vec::new()
+        };
         // Return the cursor even when all events were filtered out, so the
         // caller advances past the filtered region instead of re-fetching
         // the same events forever. The cursor is None only when nothing was
@@ -639,6 +671,7 @@ impl PollMerger {
             next_id,
             has_more,
             truncated_at_per_shard_cap,
+            stalled_shards,
         })
     }
 }
