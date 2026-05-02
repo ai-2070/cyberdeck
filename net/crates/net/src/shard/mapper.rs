@@ -375,6 +375,22 @@ pub struct ShardMapper {
     /// Ring buffer capacity for new shards.
     ring_buffer_capacity: usize,
     /// Last scaling operation timestamp.
+    ///
+    /// BUG #72: this RwLock is **logically** scoped to the
+    /// outer `shards.write()` lock — `scale_up`, `scale_down`,
+    /// and `scale_up_provisioning` all read this field and write
+    /// to it while holding `shards.write()`. The cooldown gate
+    /// is therefore atomic with the scale mutation: no caller
+    /// can pass the cooldown check, observe stale `last_scaling`,
+    /// and have its mutation interleave with another caller.
+    ///
+    /// **If you narrow `shards.write()`'s scope in any of those
+    /// callers, this implicit serialization breaks.** Either:
+    ///   - Keep the cooldown read+write inside the outer lock, OR
+    ///   - Use a `compare_exchange`-style update on a single
+    ///     `AtomicI64` of nanos so the gate is atomic on its own.
+    /// The doc-comment is here so a future refactorer doesn't
+    /// silently break the contract.
     last_scaling: RwLock<Option<Instant>>,
     /// Callback for shard creation (provided by ShardManager).
     on_shard_created: RwLock<Option<ShardCallback>>,
