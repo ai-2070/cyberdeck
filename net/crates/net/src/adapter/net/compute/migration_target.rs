@@ -1210,5 +1210,29 @@ mod tests {
              permanently lost when the first batch errored"
         );
         assert_eq!(handler.replayed_through(origin), Some(5));
+
+        // Second drain must NOT redeliver the prefix that already
+        // landed on the first drain. The daemon's `process()` call
+        // count tracks every entry; with the prefix-skip invariant
+        // the total should be:
+        //   first drain  : 1, 2 (OK), 3 (fail)        →  3 calls
+        //   second drain : 3, 4, 5 (OK)               →  3 calls
+        //   total                                     →  6 calls
+        // If the prefix were redelivered, we'd see 8 (1, 2 again
+        // before 3, 4, 5). The pre-`count.store(100, …)` value of
+        // 3 is the count after first drain; the post-second-drain
+        // value should advance by exactly 3, not 5.
+        //
+        // The store-to-100 is needed so the daemon stops failing
+        // — the assertion compares `count - 100` (what advanced
+        // during the second drain) against the expected 3.
+        let total_after_second = count.load(Ordering::SeqCst);
+        let second_drain_calls = total_after_second.saturating_sub(100);
+        assert_eq!(
+            second_drain_calls, 3,
+            "second drain processed {second_drain_calls} events; expected 3 \
+             (seq 3, 4, 5). Anything more means the already-delivered \
+             prefix (seq 1, 2) was redelivered — duplicate-delivery hazard"
+        );
     }
 }
