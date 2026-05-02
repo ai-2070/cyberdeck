@@ -125,9 +125,21 @@ pub struct PublishReport {
 }
 
 impl PublishReport {
-    /// True if every attempted peer saw the payload.
+    /// True if every attempted peer saw the payload — including
+    /// the vacuous case where the roster was empty (zero peers
+    /// attempted, zero failures, every attempt succeeded).
+    ///
+    /// BUG #26: pre-fix this required `attempted > 0`, so a
+    /// publish with zero subscribers was simultaneously
+    /// `is_empty() == true` AND `all_delivered() == false`.
+    /// Callers branching on `all_delivered()` for the "everything
+    /// went fine" path treated an empty roster as failure — a
+    /// real-world hazard right after a `remove_peer` GC. Pair
+    /// with [`Self::is_empty`] when the caller actually wants to
+    /// distinguish "roster was empty" from "roster was full and
+    /// delivered to all".
     pub fn all_delivered(&self) -> bool {
-        self.attempted > 0 && self.delivered == self.attempted && self.errors.is_empty()
+        self.delivered == self.attempted && self.errors.is_empty()
     }
 
     /// True if no subscribers were attempted (empty roster).
@@ -175,13 +187,22 @@ mod tests {
 
     #[test]
     fn test_report_helpers() {
+        // BUG #26: empty roster is `all_delivered()` (vacuously
+        // true). Pre-fix this returned false, which made callers
+        // branching on `all_delivered()` for "all good" treat
+        // empty rosters as failure — a real hazard after
+        // `remove_peer` GC. Pair with `is_empty()` when the
+        // caller cares about the distinction.
         let empty = PublishReport {
             attempted: 0,
             delivered: 0,
             errors: vec![],
         };
         assert!(empty.is_empty());
-        assert!(!empty.all_delivered());
+        assert!(
+            empty.all_delivered(),
+            "empty roster must be vacuously all_delivered (BUG #26)"
+        );
 
         let full = PublishReport {
             attempted: 3,
