@@ -4,21 +4,6 @@ v0.9 is a hardening release. No new features, no new transports, no new SDK surf
 
 The work was driven by four parallel-pass internal audits totalling 102 items across the bus, the shard manager, the RedEX append log and its CortEX fold, the JetStream and Redis adapters, the mesh transport, the FFI surface, and every binding.
 
-**By the numbers**
-
-- 110 commits on `bugfixes-8` over `master`
-- 74 audit items: 51 code fixes, 13 doc-only, 4 rejected as non-bugs, 1 already correct, 5 categorized
-- 23 review concerns: all addressed in code or doc
-- 4 cubic-ai bug reports: all fixed
-- 36 new regression tests
-- Lib test count: 1391 → 1427 → 1435+ (passing)
-- `cargo clippy --all-features --all-targets -- -D warnings`: clean
-- `cargo doc --all-features`: clean
-
-The diff is roughly +5 200 / -440 lines. Most of it is one-line fixes
-plus the cluster of comments that explain *why* the line had to change
-— a v0.9 commit that doesn't carry an explanatory comment is rare.
-
 ---
 
 ## Addressed in this release
