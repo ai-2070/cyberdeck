@@ -1,0 +1,23 @@
+net/crates/net/src/config.rs
+  7cd1aa3948e2e296 737-743,751-753
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "1a21618465807f01987de75e2cb319d9b4ceccaf",
+  "prompts": {
+    "7cd1aa3948e2e296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ad152adb-b4ac-4388-af9c-44b44434d029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 10,
+      "total_deletions": 1,
+      "accepted_lines": 1036,
+      "overriden_lines": 0
+    }
+  }
+}
