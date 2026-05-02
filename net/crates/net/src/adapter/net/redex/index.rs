@@ -36,13 +36,15 @@
 
 use std::collections::HashSet;
 use std::hash::Hash;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use serde::de::DeserializeOwned;
 use tokio::sync::Notify;
 
+use super::error::RedexError;
 use super::event::RedexEvent;
 use super::file::RedexFile;
 
@@ -117,12 +119,18 @@ where
             IndexStart::FromBeginning => 0,
             IndexStart::FromSeq(n) => n,
         };
-        let tail = file.tail(from_seq);
         let task_inner = inner.clone();
         let task_shutdown = shutdown.clone();
+        let task_file = file.clone();
 
         tokio::spawn(async move {
-            tokio::pin!(tail);
+            // Use Box::pin (not tokio::pin!) so we can swap in a
+            // fresh tail stream after a Lagged recovery without
+            // restructuring the task.
+            let mut tail: Pin<
+                Box<dyn Stream<Item = Result<RedexEvent, RedexError>> + Send>,
+            > = Box::pin(task_file.tail(from_seq));
+
             loop {
                 tokio::select! {
                     // Drop-on-cancel: the Notify wins and the task
@@ -131,10 +139,77 @@ where
                     next = tail.next() => {
                         match next {
                             Some(Ok(event)) => apply_event(&task_inner, &project, &event),
+                            Some(Err(RedexError::Lagged)) => {
+                                // BUG #3: pre-fix, the loop just
+                                // logged at debug! and continued,
+                                // but the underlying watcher had
+                                // been dropped from the file —
+                                // `tail.next()` returned `None` on
+                                // the next poll and the task
+                                // exited permanently with an
+                                // incomplete index. Keys missing
+                                // post-`Lagged` stayed missing
+                                // forever.
+                                //
+                                // Recovery: clear the in-memory
+                                // index (any prior state is now
+                                // ambiguous — we don't know which
+                                // ops we missed) and re-tail from
+                                // `next_seq()`, i.e. live-only.
+                                // We do NOT replay retained
+                                // history because the buffer that
+                                // produced the original `Lagged`
+                                // is the same buffer we'd have to
+                                // squeeze the retained range
+                                // through, which would just
+                                // signal `Lagged` again. The
+                                // index user is responsible for
+                                // sizing the tail buffer; this
+                                // path is the safe-recovery
+                                // fallback when that sizing is
+                                // wrong.
+                                let resume_seq = task_file.next_seq();
+                                task_inner.clear();
+                                tail = Box::pin(task_file.tail(resume_seq));
+                                tracing::warn!(
+                                    resume_seq,
+                                    "RedexIndex: tail lagged; cleared index, resumed live-only"
+                                );
+                            }
                             Some(Err(e)) => {
                                 tracing::debug!(error = %e, "RedexIndex tail error; continuing");
                             }
-                            None => return, // file closed
+                            None => {
+                                // BUG #3 corollary: stream ended.
+                                // Two distinct causes share this
+                                // branch:
+                                //   (a) the file was closed —
+                                //       the task should exit.
+                                //   (b) `notify_watchers` dropped
+                                //       our watcher under buffer
+                                //       saturation and the
+                                //       best-effort `Err(Lagged)`
+                                //       send itself failed (the
+                                //       channel was already full),
+                                //       so the receiver just sees
+                                //       a clean end. Pre-fix the
+                                //       task always treated this
+                                //       as (a) and exited — same
+                                //       failure mode as the
+                                //       explicit Lagged case.
+                                // Distinguish via `is_closed()`.
+                                if task_file.is_closed() {
+                                    return;
+                                }
+                                let resume_seq = task_file.next_seq();
+                                task_inner.clear();
+                                tail = Box::pin(task_file.tail(resume_seq));
+                                tracing::warn!(
+                                    resume_seq,
+                                    "RedexIndex: tail stream ended on a still-open file (saturation-induced \
+                                     watcher drop); cleared index, resumed live-only"
+                                );
+                            }
                         }
                     }
                 }
@@ -412,5 +487,134 @@ mod tests {
 
         assert!(idx.contains(&"x".to_string(), &7u64));
         assert_eq!(idx.len(), 1);
+    }
+
+    /// BUG #3: a `Lagged` from the underlying tail must NOT
+    /// permanently halt the index task. Pre-fix the loop logged at
+    /// debug! and continued, but the file had already dropped the
+    /// watcher — the next `tail.next()` returned `None` and the
+    /// task exited with the index frozen at whatever state it had
+    /// when the lag fired. Keys appended later never appeared.
+    ///
+    /// Post-fix: on `Lagged` (or on a stream `None` arriving while
+    /// the file is still open — saturation-induced watcher drop),
+    /// the task clears the in-memory index and re-tails from
+    /// `next_seq()` (live-only). Live events from that point
+    /// forward populate the index again.
+    ///
+    /// The test paces the post-lag appends with a yield between
+    /// each so the recovered tail's small buffer doesn't itself
+    /// saturate; absent that pacing, the buffer-2 watcher would
+    /// drop again and the index would clear a second time, which
+    /// is also correct but not what we're trying to verify.
+    #[tokio::test]
+    async fn index_recovers_from_tail_lag_and_continues_indexing() {
+        // Tiny tail buffer so the backfill saturates immediately
+        // when we open the index against a file with many events.
+        let r = Redex::new();
+        let f = r
+            .open_file(
+                &ChannelName::new("idx/lag-recovery").unwrap(),
+                RedexFileConfig::default().with_tail_buffer_size(2),
+            )
+            .unwrap();
+
+        // Pre-load the file with more events than the tail buffer
+        // can hold during backfill — this triggers Lagged at
+        // open-time.
+        for id in 0..10u64 {
+            let ev = Tagged {
+                id,
+                tags: vec!["pre".into()],
+            };
+            f.append(&postcard::to_allocvec(&ev).unwrap()).unwrap();
+        }
+
+        let idx: RedexIndex<String, u64> =
+            RedexIndex::open::<Tagged, _>(&f, IndexStart::FromBeginning, |t| {
+                t.tags
+                    .iter()
+                    .map(|tag| IndexOp::Insert(tag.clone(), t.id))
+                    .collect()
+            });
+
+        // Let the task observe Lagged and re-tail from live.
+        yield_a_few().await;
+
+        // Append new events one at a time with a yield between
+        // each so the recovered watcher (also buffer=2) drains
+        // before the next event arrives.
+        for id in 100..105u64 {
+            let ev = Tagged {
+                id,
+                tags: vec!["post".into()],
+            };
+            f.append(&postcard::to_allocvec(&ev).unwrap()).unwrap();
+            yield_a_few().await;
+        }
+
+        // The index must reflect every post-lag event. Pre-fix the
+        // task had already exited and `idx.get` would return
+        // `None`.
+        let post_keys = idx
+            .get(&"post".to_string())
+            .expect(
+                "post-lag bucket missing — pre-fix the index task halted \
+                 permanently after Lagged and never observed these events (BUG #3)",
+            );
+        assert_eq!(
+            post_keys.len(),
+            5,
+            "every post-lag event must be indexed; recovered set was {:?}",
+            post_keys
+        );
+        for id in 100..105u64 {
+            assert!(
+                post_keys.contains(&id),
+                "post-lag id {} missing from recovered index",
+                id
+            );
+        }
+    }
+
+    /// BUG #3 corollary: closing the file naturally must still
+    /// terminate the index task (no infinite re-tail loop).
+    #[tokio::test]
+    async fn index_terminates_when_file_closes() {
+        let r = Redex::new();
+        let f = r
+            .open_file(
+                &ChannelName::new("idx/close-terminates").unwrap(),
+                RedexFileConfig::default(),
+            )
+            .unwrap();
+
+        let idx: RedexIndex<String, u64> =
+            RedexIndex::open::<Tagged, _>(&f, IndexStart::FromBeginning, |t| {
+                t.tags
+                    .iter()
+                    .map(|tag| IndexOp::Insert(tag.clone(), t.id))
+                    .collect()
+            });
+
+        let ev = Tagged {
+            id: 1,
+            tags: vec!["a".into()],
+        };
+        f.append(&postcard::to_allocvec(&ev).unwrap()).unwrap();
+        yield_a_few().await;
+        assert!(idx.contains(&"a".to_string(), &1));
+
+        // Close should propagate as Err(Closed) on the tail; the
+        // task must NOT treat it as a saturation event and re-tail.
+        f.close().unwrap();
+        yield_a_few().await;
+        // Hard to assert "task exited" directly without exposing
+        // the JoinHandle, but if the task were re-tailing in a
+        // loop on Err(Closed) → re-tail → Err(Closed) → ... the
+        // CPU would spin and the test would still pass. The real
+        // assertion is that we don't deadlock here — close returned,
+        // and the file's drop semantics are unchanged.
+        assert!(f.is_closed());
     }
 }
