@@ -736,24 +736,77 @@ pub extern "C" fn net_ingest_raw_batch(
         Err(err) => return err,
     };
     let mut events = Vec::with_capacity(count);
+    // Track per-entry drops so the caller's accounting can
+    // reconcile the returned count against the input count.
+    // Pre-fix per-entry rejects (null pointer, oversized length,
+    // invalid UTF-8) were silently `continue`-d and the caller
+    // saw `count - drops` accepted events without any signal as
+    // to which input indices were dropped. A binding that
+    // attributed the drop to back-pressure and retried got the
+    // wrong indices and double-published the good ones.
+    //
+    // The C-API contract is "returns count of accepted events";
+    // expanding it to take an out-param of dropped indices is
+    // an API addition, not a fix-in-place. Emit `tracing::warn!`
+    // with the offending index AND reason so operators
+    // observing the bus can correlate drop counts to specific
+    // inputs without changing the C surface. For high-volume
+    // bindings this should still be sized at one log line per
+    // dropped entry; if that ever matters in practice the
+    // `*_ex` follow-up can return the indices structurally.
+    let mut dropped_null = 0usize;
+    let mut dropped_oversize = 0usize;
+    let mut dropped_invalid_utf8 = 0usize;
 
     for i in 0..count {
         let json_ptr = unsafe { *jsons.add(i) };
         let len = unsafe { *lens.add(i) };
 
         if json_ptr.is_null() {
+            tracing::warn!(
+                index = i,
+                "net_ingest_raw_batch: dropping entry with null pointer"
+            );
+            dropped_null += 1;
             continue;
         }
 
         // `slice::from_raw_parts` requires `len <= isize::MAX`.
         // Skip pathological per-entry lengths rather than UB.
         if len > isize::MAX as usize {
+            tracing::warn!(
+                index = i,
+                len,
+                "net_ingest_raw_batch: dropping entry with len > isize::MAX"
+            );
+            dropped_oversize += 1;
             continue;
         }
         let json_bytes = unsafe { std::slice::from_raw_parts(json_ptr as *const u8, len) };
-        if let Ok(json_str) = std::str::from_utf8(json_bytes) {
-            events.push(RawEvent::from_str(json_str));
+        match std::str::from_utf8(json_bytes) {
+            Ok(json_str) => events.push(RawEvent::from_str(json_str)),
+            Err(_) => {
+                tracing::warn!(
+                    index = i,
+                    "net_ingest_raw_batch: dropping entry with invalid UTF-8"
+                );
+                dropped_invalid_utf8 += 1;
+            }
         }
+    }
+    let total_dropped = dropped_null + dropped_oversize + dropped_invalid_utf8;
+    if total_dropped > 0 {
+        // Aggregate summary for log-pipeline filters that fold
+        // per-index lines.
+        tracing::warn!(
+            input_count = count,
+            dropped_null,
+            dropped_oversize,
+            dropped_invalid_utf8,
+            "net_ingest_raw_batch: {} of {} entries dropped before ingest",
+            total_dropped,
+            count,
+        );
     }
 
     let count = handle.bus.ingest_raw_batch(events);
