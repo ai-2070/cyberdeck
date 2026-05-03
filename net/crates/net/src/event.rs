@@ -142,10 +142,21 @@ impl RawEvent {
     /// Create a raw event from a JSON value.
     ///
     /// This serializes the value once and caches the result.
+    ///
+    /// `serde_json::to_vec(&JsonValue)` is infallible by
+    /// construction — the value tree is a known-good JSON
+    /// structure with no fallible serializer in the path —
+    /// modulo OOM, which the global allocator handles via
+    /// abort. The `unwrap_or_default()` fallback keeps the
+    /// non-panic contract for a hypothetical future serde-json
+    /// change that introduced a fallible path on `Value`. Pre-
+    /// fix `expect("Value serialization is infallible")` panicked
+    /// at the call site if the assumption ever broke; the panic
+    /// would unwind across `from_value`'s callers (bus ingest,
+    /// FFI ingest paths) where the contract is non-panicking.
     #[inline]
     pub fn from_value(value: JsonValue) -> Self {
-        let bytes =
-            Bytes::from(serde_json::to_vec(&value).expect("Value serialization is infallible"));
+        let bytes = Bytes::from(serde_json::to_vec(&value).unwrap_or_default());
         let hash = xxhash_rust::xxh3::xxh3_64(&bytes);
         Self { bytes, hash }
     }
@@ -249,10 +260,12 @@ impl InternalEvent {
     }
 
     /// Create from a JSON value (serializes once).
+    ///
+    /// See `RawEvent::from_value` for the rationale on
+    /// `unwrap_or_default()` instead of `expect()`.
     #[inline]
     pub fn from_value(value: JsonValue, insertion_ts: u64, shard_id: u16) -> Self {
-        let raw =
-            Bytes::from(serde_json::to_vec(&value).expect("Value serialization is infallible"));
+        let raw = Bytes::from(serde_json::to_vec(&value).unwrap_or_default());
         Self {
             raw,
             insertion_ts,
@@ -465,10 +478,12 @@ impl StoredEvent {
     }
 
     /// Create a new stored event from a JSON value (serializes once).
+    ///
+    /// See `RawEvent::from_value` for the rationale on
+    /// `unwrap_or_default()` instead of `expect()`.
     #[inline]
     pub fn from_value(id: String, value: JsonValue, insertion_ts: u64, shard_id: u16) -> Self {
-        let raw =
-            Bytes::from(serde_json::to_vec(&value).expect("Value serialization is infallible"));
+        let raw = Bytes::from(serde_json::to_vec(&value).unwrap_or_default());
         Self {
             id,
             raw,
