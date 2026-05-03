@@ -184,6 +184,14 @@ pub struct NetHandle {
     /// `bus` / `runtime`, defending against a contract-violating
     /// caller that races a post-shutdown call.
     bus_taken: std::sync::atomic::AtomicBool,
+    /// Set to `true` after `bus.shutdown()` returns from the
+    /// first `net_shutdown` call. A second/third concurrent
+    /// `net_shutdown` caller spins until this flips before
+    /// returning success — without this gate the second caller
+    /// observed `bus_taken == true` and returned `Success` while
+    /// the first caller was still mid-`block_on(bus.shutdown())`,
+    /// falsely signaling completion of an in-progress shutdown.
+    shutdown_completed: std::sync::atomic::AtomicBool,
 }
 
 /// Maximum time `net_shutdown` will wait for in-flight FFI operations
@@ -558,6 +566,7 @@ fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut NetHandl
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         active_ops: std::sync::atomic::AtomicU32::new(0),
         bus_taken: std::sync::atomic::AtomicBool::new(false),
+        shutdown_completed: std::sync::atomic::AtomicBool::new(false),
     });
 
     Box::into_raw(handle)
@@ -1130,14 +1139,36 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
             return NetError::Unknown.into();
         }
 
-        // Idempotent shutdown: if a previous `net_shutdown` already moved
-        // out the bus/runtime, do not call `ManuallyDrop::take` a second
-        // time (that would be UB). The first call has already done the
-        // work; report success.
+        // Idempotent shutdown: if a previous `net_shutdown` already
+        // moved out the bus/runtime, do not call `ManuallyDrop::take`
+        // a second time (that would be UB). The first call may still
+        // be inside `runtime.block_on(bus.shutdown())` though — pre-
+        // fix the second caller observed `bus_taken == true` and
+        // returned `Success` immediately, falsely signaling
+        // completion of an in-progress shutdown. Spin on
+        // `shutdown_completed` (set by the first caller AFTER
+        // `bus.shutdown()` returns) so subsequent callers wait for
+        // the actual completion.
         if handle_ref
             .bus_taken
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
+            // Wait for the first caller to actually finish.
+            // Bounded by the same FFI_SHUTDOWN_DEADLINE as the
+            // `active_ops` drain — if the first caller is wedged
+            // longer than that, we surface a Transient error rather
+            // than block forever.
+            let inner_deadline = std::time::Instant::now() + FFI_SHUTDOWN_DEADLINE;
+            while !handle_ref
+                .shutdown_completed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                if std::time::Instant::now() >= inner_deadline {
+                    return NetError::Unknown.into();
+                }
+                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             return NetError::Success.into();
         }
         drained
@@ -1171,6 +1202,15 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
 
     // `bus` and `runtime` go out of scope here and are dropped.
     // The leaked box keeps the atomics alive for any straggler ops.
+
+    // Signal completion to any second/third caller spinning on
+    // `shutdown_completed` in the idempotent path above. Done
+    // AFTER `bus.shutdown()` returns and AFTER the bus / runtime
+    // drop, so subsequent callers can rely on this flag as a
+    // hard "shutdown is fully done" barrier.
+    unsafe { &*handle }
+        .shutdown_completed
+        .store(true, std::sync::atomic::Ordering::Release);
 
     match result {
         Ok(()) => NetError::Success.into(),
