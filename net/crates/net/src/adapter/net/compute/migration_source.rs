@@ -236,9 +236,22 @@ impl MigrationSourceHandler {
         self.migrations.contains_key(&daemon_origin)
     }
 
-    /// Get buffered events for transfer to the target (during replay phase).
+    /// Get buffered events for transfer to the target (during
+    /// snapshot/transfer/restore/replay phases — i.e. the same
+    /// phases that `buffer_event` accepts writes in).
     ///
     /// Drains the buffer — events are moved, not copied.
+    ///
+    /// Returns `WrongPhase` if invoked after cutover. Pre-fix
+    /// the call had no phase guard, so a caller that drained
+    /// post-cutover would silently get an empty `Vec` (since
+    /// `on_cutover` already drained the buffer to its return
+    /// value and any post-cutover writes are rejected by
+    /// `buffer_event`). Distinguishing "no events were
+    /// buffered" from "you called drain in the wrong phase" via
+    /// a typed error catches the latter at the boundary instead
+    /// of letting it manifest as missing-event diagnostics
+    /// downstream.
     pub fn take_buffered_events(
         &self,
         daemon_origin: u32,
@@ -249,7 +262,16 @@ impl MigrationSourceHandler {
             .ok_or(MigrationError::DaemonNotFound(daemon_origin))?;
 
         let mut state = entry.lock();
-        Ok(std::mem::take(&mut state.buffered_events))
+        match state.phase {
+            MigrationPhase::Snapshot
+            | MigrationPhase::Transfer
+            | MigrationPhase::Restore
+            | MigrationPhase::Replay => Ok(std::mem::take(&mut state.buffered_events)),
+            other => Err(MigrationError::WrongPhase {
+                expected: MigrationPhase::Replay,
+                got: other,
+            }),
+        }
     }
 
     /// Phase 4: Cutover — stop accepting writes for this daemon.
@@ -460,5 +482,39 @@ mod tests {
 
         assert!(!handler.is_migrating(origin));
         assert!(reg.contains(origin)); // daemon still registered
+    }
+
+    /// Regression: `take_buffered_events` must refuse to drain
+    /// after `on_cutover` has transitioned the daemon into the
+    /// `Cutover` phase. Pre-fix the call had no phase guard, so
+    /// a caller invoking it post-cutover silently received an
+    /// empty `Vec` (since `on_cutover` already drained the
+    /// buffer to its return value). The empty result was
+    /// indistinguishable from "no events were ever buffered,"
+    /// pushing diagnosis of the misuse to whatever downstream
+    /// code consumed the empty list. Post-fix it returns
+    /// `WrongPhase { expected: Replay, got: Cutover }` so the
+    /// programming error surfaces at the boundary.
+    #[test]
+    fn take_buffered_events_after_cutover_returns_wrong_phase() {
+        let (reg, origin) = setup();
+        let handler = MigrationSourceHandler::new(reg);
+
+        handler.start_snapshot(origin, 0x2222, 0x1111).unwrap();
+        handler.buffer_event(origin, make_event(origin, 1)).unwrap();
+        // on_cutover drains and transitions to Cutover phase.
+        let _ = handler.on_cutover(origin).unwrap();
+
+        let err = handler.take_buffered_events(origin).unwrap_err();
+        match err {
+            MigrationError::WrongPhase { expected, got } => {
+                assert_eq!(expected, MigrationPhase::Replay);
+                assert_eq!(got, MigrationPhase::Cutover);
+            }
+            other => panic!(
+                "expected WrongPhase {{ expected: Replay, got: Cutover }}, got {:?}",
+                other
+            ),
+        }
     }
 }
