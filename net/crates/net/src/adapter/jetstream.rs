@@ -241,6 +241,32 @@ impl Adapter for JetStreamAdapter {
             return Ok(());
         }
 
+        // Re-init after shutdown: `shutdown` flips `initialized =
+        // false` and `drain()`s the client, but doesn't (and
+        // can't, behind `&self`) clear `self.client` /
+        // `self.jetstream`. A reconnect path that calls `init`
+        // here would fall through and overwrite `self.client =
+        // Some(new_client)` below, dropping the prior client
+        // without draining it. If `shutdown` had not run the
+        // drain (e.g. `init` is called WITHOUT a preceding
+        // `shutdown`, just on a re-init flow), in-flight
+        // publishes piggybacking on the prior client would be
+        // silently lost. Drain the prior client first so the
+        // overwrite is safe regardless of whether `shutdown` ran.
+        if let Some(prior) = self.client.take() {
+            if let Err(e) = prior.drain().await {
+                tracing::warn!(
+                    adapter = "jetstream",
+                    error = %e,
+                    "init: failed to drain prior client before overwrite \
+                     (may have been already drained by shutdown)"
+                );
+            }
+            // Drop the prior jetstream context too; it borrows
+            // a clone of the now-drained client.
+            self.jetstream = None;
+        }
+
         let client = async_nats::ConnectOptions::new()
             .connection_timeout(self.config.connect_timeout)
             .request_timeout(Some(self.config.request_timeout))
