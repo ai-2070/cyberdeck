@@ -490,9 +490,22 @@ impl Adapter for JetStreamAdapter {
         // jumps `current_seq` to `first_sequence` in one step.
         let (max_seq, first_seq) = match stream.info().await {
             Ok(info) => (info.state.last_sequence, info.state.first_sequence),
-            Err(_) => {
-                let span = (fetch_limit as u64).saturating_mul(10);
-                (start_seq.saturating_add(span), 0)
+            // Pre-fix, an `info()` error fabricated `first_seq = 0`
+            // (treating it as a cold/empty stream) and a synthetic
+            // `max_seq`. That made `cold_stream_bail_enabled` true
+            // below, so a populated stream with a deletion gap
+            // would bail after 64 NotFounds — the consumer would
+            // believe the stream had drained while events were
+            // still ahead. Surface the failure as `Transient`
+            // instead so the caller retries the poll once the
+            // backend recovers; pre-fix this was a recoverable
+            // condition silently converted to under-delivery.
+            Err(e) => {
+                return Err(AdapterError::Transient(format!(
+                    "JetStream stream.info() failed for shard {} (poll \
+                     suspended; retry after backoff): {}",
+                    shard_id, e
+                )));
             }
         };
         // Apply the retention-rollover jump up-front: if
@@ -543,10 +556,10 @@ impl Adapter for JetStreamAdapter {
         // max_seq` is the natural stop. Applying the cap there
         // would truncate polling on a *sparse* populated stream
         // (events at e.g. seq 1, 500, 1000) by breaking before
-        // reaching later valid sequences. `first_seq == 0` covers
-        // both genuinely empty streams and `info()` failures (the
-        // fallback uses `first_seq = 0`); both want the early-
-        // bail protection.
+        // reaching later valid sequences. `first_seq == 0` now
+        // means a genuinely empty stream — `info()` failures are
+        // surfaced as `Transient` above, never reaching this
+        // branch with a fabricated `first_seq = 0`.
         let consecutive_not_found_cap = (fetch_limit / 2).max(64);
         let cold_stream_bail_enabled = first_seq == 0;
         let mut consecutive_not_found = 0usize;
