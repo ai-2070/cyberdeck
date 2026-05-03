@@ -1379,9 +1379,22 @@ impl EventBus {
         // deadline too — pre-fix the `std::time::Instant`
         // was wall-clock and ignored the test's paused clock.
         let in_flight_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Snapshot of `(stranded, ingested, dispatched)` at the
+        // deadline — Some(...) iff we hit the deadline path. The
+        // post-drain reconciliation reads this to compute the
+        // actual drop count (see comment further down).
+        let mut deadline_snapshot: Option<(u64, u64, u64)> = None;
         while self.in_flight_ingests.load(AtomicOrdering::SeqCst) > 0 {
             if tokio::time::Instant::now() >= in_flight_deadline {
                 let stranded = self.in_flight_ingests.load(AtomicOrdering::SeqCst);
+                let ingested_now = self
+                    .stats
+                    .events_ingested
+                    .load(AtomicOrdering::Acquire);
+                let dispatched_now = self
+                    .stats
+                    .events_dispatched
+                    .load(AtomicOrdering::Acquire);
                 tracing::warn!(
                     in_flight = stranded,
                     lossy = true,
@@ -1390,20 +1403,24 @@ impl EventBus {
                      past final drain (documented data-loss path)",
                     stranded,
                 );
-                // Surface the stranded count via `events_dropped`
-                // so SDK consumers reading `bus.stats()` see the
-                // loss, matching the bus's at-least-once-or-
-                // surfaced-as-dropped contract.
-                self.stats
-                    .events_dropped
-                    .fetch_add(stranded, AtomicOrdering::Relaxed);
-                // Also set the dedicated lossy-shutdown
-                // flag so `shutdown_via_ref` callers can detect a
-                // lossy outcome without parsing log lines or
-                // diffing `events_dropped` snapshots.
+                // Set the lossy flag immediately so a fast `is_*`
+                // poll observes the outcome before the drain
+                // finishes. The actual `events_dropped` bump is
+                // deferred until after the final drain runs (see
+                // "post-drain reconciliation" below) so we don't
+                // double-count events that the drain still
+                // successfully delivers — pre-fix this bumped
+                // `events_dropped += stranded` here and the same
+                // events that the final sweep then drained landed
+                // in BOTH `events_ingested` and `events_dropped`,
+                // breaking the bus's
+                // `ingested == dispatched + dropped` invariant
+                // and turning `shutdown_was_lossy` into a false
+                // positive on every deadline-triggered shutdown.
                 self.stats
                     .shutdown_was_lossy
                     .store(true, AtomicOrdering::Release);
+                deadline_snapshot = Some((stranded, ingested_now, dispatched_now));
                 break;
             }
             // Park instead of `yield_now`. The producers we're
@@ -1529,6 +1546,57 @@ impl EventBus {
         let result = tokio::time::timeout(timeout, self.adapter.shutdown())
             .await
             .map_err(|_| AdapterError::Fatal("adapter shutdown timed out".into()))?;
+
+        // Post-drain reconciliation for the lossy-shutdown path.
+        //
+        // If we hit the in-flight deadline above, `deadline_snapshot`
+        // holds `(stranded, ingested@deadline, dispatched@deadline)`.
+        // Some of those `stranded` producers' events landed in the
+        // ring AFTER our deadline check but BEFORE the
+        // `drain_finalize_ready` gate flipped — those events are
+        // now successfully ingested, drained, and dispatched through
+        // the adapter. They appear in `events_dispatched` (the
+        // delta since the deadline), so:
+        //
+        //   actual_drops = stranded
+        //                  - (dispatched_after_drain - dispatched@deadline)
+        //                  - (ingested_after_drain - ingested@deadline)
+        //                       only counting events that landed but
+        //                       weren't dispatched (dropped under
+        //                       backpressure, etc.)
+        //
+        // The cleaner reconciliation: events that completed
+        // `try_enter_ingest` AFTER the deadline either completed
+        // ingest (bumping `events_ingested`) or were dropped on
+        // backpressure (bumping `events_dropped` from the existing
+        // backpressure paths). The `stranded - delta_ingested`
+        // remainder is producers whose `try_enter_ingest` succeeded
+        // but never reached `shard_manager.ingest()` — those are
+        // the genuinely-lost events we should account for.
+        if let Some((stranded, ingested_at_deadline, _dispatched_at_deadline)) =
+            deadline_snapshot
+        {
+            let ingested_after = self
+                .stats
+                .events_ingested
+                .load(AtomicOrdering::Acquire);
+            let post_deadline_ingests = ingested_after.saturating_sub(ingested_at_deadline);
+            let actual_drops = stranded.saturating_sub(post_deadline_ingests);
+            if actual_drops > 0 {
+                self.stats
+                    .events_dropped
+                    .fetch_add(actual_drops, AtomicOrdering::Relaxed);
+            }
+            tracing::warn!(
+                stranded_at_deadline = stranded,
+                post_deadline_ingests,
+                actual_drops,
+                "lossy shutdown reconciled: post-drain `events_dropped` bumped \
+                 by stranded - post-deadline-ingests (pre-fix this bumped by \
+                 the full `stranded` count, double-counting events the drain \
+                 still successfully delivered)",
+            );
+        }
 
         // Mark shutdown as completed so Drop knows not to warn.
         self.shutdown_completed.store(true, AtomicOrdering::Release);
