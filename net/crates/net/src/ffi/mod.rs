@@ -1457,7 +1457,7 @@ pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
         return;
     }
 
-    let result = unsafe { &*result };
+    let result = unsafe { &mut *result };
 
     // Free events array and all id/raw allocations.
     free_events_array(result.events, result.count);
@@ -1468,6 +1468,17 @@ pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
             drop(std::ffi::CString::from_raw(result.next_id));
         }
     }
+
+    // Null the fields so a second `net_free_poll_result` on the
+    // same struct is a safe no-op rather than a double-free. The
+    // C header's contract just says "free a poll result"; without
+    // this clear, a defensive caller calling free twice (or two
+    // wrappers each calling free in their destructor) would
+    // re-`Box::from_raw` an already-freed pointer.
+    result.events = std::ptr::null_mut();
+    result.count = 0;
+    result.next_id = std::ptr::null_mut();
+    result.has_more = 0;
 }
 
 /// Get stats without JSON serialization.

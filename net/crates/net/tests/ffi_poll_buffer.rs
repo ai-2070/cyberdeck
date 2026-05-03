@@ -25,7 +25,9 @@
 use std::os::raw::c_char;
 use std::ptr;
 
-use net::ffi::{net_init, net_poll, net_shutdown};
+use net::ffi::{
+    net_free_poll_result, net_init, net_poll, net_poll_ex, net_shutdown, NetEvent, NetPollResult,
+};
 
 const NET_ERR_BUFFER_TOO_SMALL: i32 = -7;
 
@@ -64,6 +66,52 @@ fn net_poll_rejects_buffers_below_minimum_without_polling() {
         "10-byte buffer must be rejected with BufferTooSmall, got {}",
         code,
     );
+
+    let _ = net_shutdown(handle);
+}
+
+/// Pin: `net_free_poll_result` must be idempotent. Pre-fix it
+/// freed `events` and `next_id` but left the `NetPollResult`
+/// fields holding the already-freed pointers; a second call —
+/// from a defensive caller, a destructor wrapper, or a
+/// double-free in a binding — would re-`Box::from_raw` the dead
+/// pointers and crash. Post-fix the function nulls the fields
+/// after free, so subsequent calls are no-ops.
+#[test]
+fn net_free_poll_result_is_idempotent() {
+    let handle = net_init(ptr::null());
+    assert!(!handle.is_null(), "net_init failed");
+
+    let mut result = NetPollResult {
+        events: ptr::null_mut::<NetEvent>(),
+        count: 0,
+        next_id: ptr::null_mut::<c_char>(),
+        has_more: 0,
+    };
+
+    // First poll — populates the result. Default config + noop
+    // adapter returns no events, so `events` and `next_id` may
+    // both be null. The idempotency check still holds.
+    let code = net_poll_ex(handle, 16, ptr::null::<c_char>(), &mut result as *mut _);
+    assert_eq!(code, 0, "net_poll_ex returned {} (expected 0)", code);
+
+    // First free — releases whatever was allocated and nulls
+    // the fields.
+    net_free_poll_result(&mut result as *mut _);
+    assert!(result.events.is_null(), "events not nulled after free");
+    assert_eq!(result.count, 0);
+    assert!(result.next_id.is_null(), "next_id not nulled after free");
+    assert_eq!(result.has_more, 0);
+
+    // Second free — must be a no-op. Pre-fix this would
+    // double-free the boxed slice and CString.
+    net_free_poll_result(&mut result as *mut _);
+
+    // And a third, just to be sure.
+    net_free_poll_result(&mut result as *mut _);
+
+    // Null pointer is also handled.
+    net_free_poll_result(ptr::null_mut::<NetPollResult>());
 
     let _ = net_shutdown(handle);
 }
