@@ -53,8 +53,20 @@ impl TokenScope {
     }
 
     /// Check if this scope includes another.
+    ///
+    /// A scope never "contains" `NONE`: the bit-mask identity
+    /// `(self.bits & 0) == 0` would otherwise return true for every
+    /// token, so a caller that builds `action: TokenScope` from
+    /// external input — e.g. a wire `u32` masked into a smaller
+    /// subset — that happens to mask to `NONE` would receive a
+    /// blanket `true` against any token. Short-circuit `NONE` so the
+    /// caller's "do they have permission X" question rejects the
+    /// no-op action.
     #[inline]
     pub const fn contains(self, other: Self) -> bool {
+        if other.bits == 0 {
+            return false;
+        }
         (self.bits & other.bits) == other.bits
     }
 
@@ -1215,6 +1227,47 @@ mod tests {
         assert_eq!(parsed.channel_hash, 0xBEEF);
         assert_eq!(parsed.delegation_depth, 3);
         assert_eq!(parsed.nonce, token.nonce);
+    }
+
+    /// `TokenScope::contains(NONE)` must return `false` — the bit
+    /// identity `(bits & 0) == 0` is unconditionally true, so any
+    /// token would otherwise "contain" the no-op action. A caller
+    /// that builds `action: TokenScope` from external input (e.g. a
+    /// wire `u32` masked into a smaller subset) would then receive
+    /// a blanket `true` against any token whenever the masked input
+    /// happened to land on `NONE`.
+    #[test]
+    fn token_scope_does_not_contain_none() {
+        // Any defined scope must NOT contain NONE.
+        for s in [
+            TokenScope::PUBLISH,
+            TokenScope::SUBSCRIBE,
+            TokenScope::ADMIN,
+            TokenScope::DELEGATE,
+            TokenScope::WILDCARD,
+            TokenScope::ALL,
+            TokenScope::PUBLISH.union(TokenScope::SUBSCRIBE),
+        ] {
+            assert!(
+                !s.contains(TokenScope::NONE),
+                "scope {:?} must not contain NONE",
+                s.bits(),
+            );
+        }
+        // Even NONE itself does not "contain" NONE — the question is
+        // "do you authorize this action," and the no-op action is
+        // never authorized.
+        assert!(
+            !TokenScope::NONE.contains(TokenScope::NONE),
+            "NONE.contains(NONE) must be false (no token authorizes the no-op action)",
+        );
+
+        // Sanity: contains is still correct for non-NONE arguments.
+        assert!(TokenScope::ALL.contains(TokenScope::PUBLISH));
+        assert!(!TokenScope::PUBLISH.contains(TokenScope::ADMIN));
+        assert!(TokenScope::PUBLISH
+            .union(TokenScope::SUBSCRIBE)
+            .contains(TokenScope::SUBSCRIBE));
     }
 
     #[test]
