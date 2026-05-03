@@ -760,13 +760,30 @@ impl ShardManager {
     ///
     /// [`activate_shard`]: Self::activate_shard
     pub fn add_shard(&self) -> Result<u16, ScalingError> {
+        self.add_shard_inner(false)
+    }
+
+    /// Like [`add_shard`] but bypasses the auto-scaling cooldown.
+    ///
+    /// Used by operator-initiated `manual_scale_up` so a deliberate
+    /// scale-up is not rate-limited by the auto-scaling cadence.
+    /// The `max_shards` budget check still applies.
+    pub fn add_shard_force(&self) -> Result<u16, ScalingError> {
+        self.add_shard_inner(true)
+    }
+
+    fn add_shard_inner(&self, force: bool) -> Result<u16, ScalingError> {
         let mapper = self.mapper.as_ref().ok_or(ScalingError::InvalidPolicy(
             "Dynamic scaling not enabled".into(),
         ))?;
 
         // Allocate the shard in `Provisioning` state — not yet
         // selectable.
-        let new_ids = mapper.scale_up_provisioning(1)?;
+        let new_ids = if force {
+            mapper.scale_up_provisioning_force(1)?
+        } else {
+            mapper.scale_up_provisioning(1)?
+        };
         let new_id = new_ids[0];
 
         let metrics = mapper.metrics_collector(new_id).ok_or_else(|| {

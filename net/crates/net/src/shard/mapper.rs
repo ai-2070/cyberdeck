@@ -662,11 +662,32 @@ impl ShardMapper {
         state: ShardState,
         shards: &mut Vec<MappedShard>,
     ) -> Result<Vec<u16>, ScalingError> {
+        self.allocate_shards_inner_with_policy(count, state, shards, false)
+    }
+
+    fn allocate_shards_inner_with_policy(
+        &self,
+        count: u16,
+        state: ShardState,
+        shards: &mut Vec<MappedShard>,
+        force: bool,
+    ) -> Result<Vec<u16>, ScalingError> {
         // Re-check budget under the write lock — two concurrent
         // scale-up callers could both pass the read-locked early
         // check, both serialize through `shards.write()`, and both
         // succeed without this re-check.
-        self.check_scale_up_budget(count)?;
+        if force {
+            // Budget only — skip cooldown for operator-initiated paths.
+            let current = self.active_count.load(AtomicOrdering::Acquire);
+            let would_be = current
+                .checked_add(count)
+                .ok_or(ScalingError::AtMaxShards)?;
+            if would_be > self.policy.max_shards {
+                return Err(ScalingError::AtMaxShards);
+            }
+        } else {
+            self.check_scale_up_budget(count)?;
+        }
 
         let first_id = self.next_shard_id.load(AtomicOrdering::Relaxed);
         let last_needed = first_id
@@ -779,6 +800,42 @@ impl ShardMapper {
         // Intentionally do NOT fire `on_shard_created` here — the
         // callback signals "shard is live"; provisioning shards are
         // not. `activate` fires it instead.
+        Ok(new_ids)
+    }
+
+    /// Allocate `count` Provisioning shards, bypassing the cooldown gate.
+    ///
+    /// Used by operator-initiated `manual_scale_up` paths. The
+    /// cooldown exists to prevent the auto-scaling monitor from
+    /// scaling-up too aggressively in response to transient
+    /// load spikes; a manual call from an operator is a
+    /// deliberate request that should not be rate-limited by
+    /// the auto-scaling cadence. The budget check (against
+    /// `max_shards`) still applies.
+    ///
+    /// Pre-fix `manual_scale_up(N)` looped `add_shard()` N
+    /// times, each call invoking `scale_up_provisioning(1)`
+    /// which bumped `last_scaling`. The second call then
+    /// immediately failed with `InCooldown` (default 30s
+    /// cooldown), leaving the first shard half-added and
+    /// returning an error to the operator with no rollback.
+    pub fn scale_up_provisioning_force(&self, count: u16) -> Result<Vec<u16>, ScalingError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut shards = self.shards.write();
+        let new_ids = self.allocate_shards_inner_with_policy(
+            count,
+            ShardState::Provisioning,
+            &mut shards,
+            true, // skip cooldown
+        )?;
+
+        // Still bump the cooldown timestamp so the next
+        // *auto-scaling* tick respects the cooldown floor.
+        *self.last_scaling.write() = Some(Instant::now());
+        drop(shards);
         Ok(new_ids)
     }
 

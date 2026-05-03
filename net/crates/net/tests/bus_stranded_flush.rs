@@ -302,6 +302,50 @@ async fn events_in_flight_at_finalize_reach_adapter() {
     );
 }
 
+/// Pin: `manual_scale_up(N>1)` succeeds against a non-zero
+/// cooldown. Pre-fix the loop called `add_shard_internal`
+/// which routed to `scale_up_provisioning(1)`, bumping
+/// `last_scaling = Instant::now()` on each call. Iteration 1+
+/// then immediately failed with `InCooldown` (default 30s
+/// cooldown), leaving the first shard half-added (workers
+/// spawned, routing entry installed) and returning the error
+/// to the operator with no rollback. Post-fix `manual_scale_up`
+/// bypasses the auto-scaling cooldown so a deliberate operator
+/// request can scale up by N in one call regardless of the
+/// cooldown setting.
+#[tokio::test]
+async fn manual_scale_up_succeeds_with_nonzero_cooldown() {
+    let (adapter, _batches, _msg_ids) = RecordingAdapter::new();
+    // Realistic operator-deploy config: a multi-second
+    // cooldown to dampen the auto-scaling monitor.
+    let policy = ScalingPolicy {
+        min_shards: 1,
+        max_shards: 8,
+        cooldown: Duration::from_secs(30),
+        ..Default::default()
+    };
+    let cfg = EventBusConfig::builder()
+        .num_shards(1)
+        .ring_buffer_capacity(1024)
+        .scaling(policy)
+        .build()
+        .unwrap();
+    let bus = EventBus::new_with_adapter(cfg, Box::new(adapter))
+        .await
+        .unwrap();
+
+    // Scale up by 4 in one call. Pre-fix this would error on
+    // the second iteration (the first call bumped last_scaling,
+    // the second hit cooldown).
+    let added = bus
+        .manual_scale_up(4)
+        .await
+        .expect("manual_scale_up under nonzero cooldown must succeed");
+    assert_eq!(added.len(), 4, "all 4 requested shards must be added");
+
+    bus.shutdown().await.unwrap();
+}
+
 /// `SlowRecordingAdapter` sleeps for `delay` inside `on_batch`,
 /// which lets the BatchWorker's mpsc channel back up + lets events
 /// pile in the ring buffer while a scale-down is in flight. This

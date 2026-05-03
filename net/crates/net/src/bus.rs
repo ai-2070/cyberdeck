@@ -414,11 +414,26 @@ impl EventBus {
     ///   3. `activate_shard()` flips state to `Active`. Only now
     ///      does `select_shard` start routing producer pushes.
     async fn add_shard_internal(&self) -> Result<u16, AdapterError> {
+        self.add_shard_internal_with_cooldown_policy(false).await
+    }
+
+    /// Like [`add_shard_internal`] but bypasses the auto-scaling
+    /// cooldown. See [`ShardManager::add_shard_force`].
+    async fn add_shard_internal_force(&self) -> Result<u16, AdapterError> {
+        self.add_shard_internal_with_cooldown_policy(true).await
+    }
+
+    async fn add_shard_internal_with_cooldown_policy(
+        &self,
+        force: bool,
+    ) -> Result<u16, AdapterError> {
         // Step 1: provisioning add — not yet selectable.
-        let new_id = self
-            .shard_manager
-            .add_shard()
-            .map_err(|e| AdapterError::Fatal(e.to_string()))?;
+        let new_id = if force {
+            self.shard_manager.add_shard_force()
+        } else {
+            self.shard_manager.add_shard()
+        }
+        .map_err(|e| AdapterError::Fatal(e.to_string()))?;
 
         // Step 2: spawn workers and register the sender.
         let (tx, rx) = mpsc::channel::<Vec<crate::event::InternalEvent>>(1024);
@@ -1494,10 +1509,19 @@ impl EventBus {
     }
 
     /// Manually trigger a scale-up (for testing or manual intervention).
+    ///
+    /// Bypasses the auto-scaling cooldown so a deliberate operator
+    /// request isn't rate-limited by the auto-scaling cadence.
+    /// Pre-fix this looped `add_shard_internal()` N times, each
+    /// of which bumped `last_scaling`, so iteration 1+ failed
+    /// with `InCooldown` against any non-zero cooldown — the
+    /// first shard was left half-added (workers spawned, routing
+    /// entry installed) while the error propagated to the
+    /// caller. The `max_shards` budget check still applies.
     pub async fn manual_scale_up(&self, count: u16) -> Result<Vec<u16>, AdapterError> {
         let mut new_ids = Vec::with_capacity(count as usize);
         for _ in 0..count {
-            let id = self.add_shard_internal().await?;
+            let id = self.add_shard_internal_force().await?;
             new_ids.push(id);
         }
         Ok(new_ids)
