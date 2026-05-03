@@ -369,12 +369,37 @@ fn parse_config_json(json_str: &str) -> Option<EventBusConfig> {
         builder = builder.ring_buffer_capacity(capacity);
     }
 
-    if let Some(mode) = value.get("backpressure_mode").and_then(|v| v.as_str()) {
-        let bp_mode = match mode {
-            "DropNewest" | "drop_newest" => crate::config::BackpressureMode::DropNewest,
-            "DropOldest" | "drop_oldest" => crate::config::BackpressureMode::DropOldest,
-            "FailProducer" | "fail_producer" => crate::config::BackpressureMode::FailProducer,
-            _ => crate::config::BackpressureMode::DropNewest,
+    if let Some(bp_value) = value.get("backpressure_mode") {
+        let bp_mode = if let Some(mode) = bp_value.as_str() {
+            match mode {
+                "DropNewest" | "drop_newest" => crate::config::BackpressureMode::DropNewest,
+                "DropOldest" | "drop_oldest" => crate::config::BackpressureMode::DropOldest,
+                "FailProducer" | "fail_producer" => crate::config::BackpressureMode::FailProducer,
+                // Pre-fix every other string silently fell back to
+                // `DropNewest`. A typo (`"DropOldset"`) thus
+                // changed durability profile at deploy time with
+                // no error. Reject unknowns to match the contract
+                // already enforced by `parse_poll_request_json`.
+                _ => return None,
+            }
+        } else if let Some(obj) = bp_value.as_object() {
+            // Object form: `{"Sample": {"rate": N}}` for the
+            // sampling mode that has an associated value.
+            if let Some(sample) = obj.get("Sample").or_else(|| obj.get("sample")) {
+                let rate = sample.get("rate").and_then(|v| v.as_u64())?;
+                let rate = u32::try_from(rate).ok()?;
+                if rate == 0 {
+                    // Validated again by `EventBusConfig::validate`,
+                    // but reject earlier so the parser surface
+                    // matches the validator surface.
+                    return None;
+                }
+                crate::config::BackpressureMode::Sample { rate }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
         };
         builder = builder.backpressure_mode(bp_mode);
     }
@@ -1554,6 +1579,65 @@ mod tests {
     fn test_parse_config_empty() {
         let config = parse_config_json(r#"{}"#);
         assert!(config.is_some(), "empty config should use defaults");
+    }
+
+    /// Pin: known `backpressure_mode` strings round-trip; an
+    /// unknown value (typo) is rejected with `None`, not silently
+    /// downgraded to `DropNewest`. Pre-fix a deploy-time typo
+    /// like `"DropOldset"` swapped the operator's intended
+    /// durability for `DropNewest` with no diagnostic.
+    #[test]
+    fn parse_config_rejects_unknown_backpressure_mode() {
+        // Known values still parse.
+        for s in [
+            "DropNewest",
+            "drop_newest",
+            "DropOldest",
+            "drop_oldest",
+            "FailProducer",
+            "fail_producer",
+        ] {
+            let cfg = parse_config_json(&format!(r#"{{"backpressure_mode": "{}"}}"#, s));
+            assert!(cfg.is_some(), "known mode `{}` must parse", s);
+        }
+
+        // Typos must fail.
+        for s in ["DropOldset", "FailProduce", "drop_oldst", "garbage", ""] {
+            let cfg = parse_config_json(&format!(r#"{{"backpressure_mode": "{}"}}"#, s));
+            assert!(
+                cfg.is_none(),
+                "unknown mode `{}` must reject (pre-fix this silently \
+                 fell through to DropNewest)",
+                s,
+            );
+        }
+
+        // Wrong JSON type also fails — pre-fix this hit the
+        // `and_then(|v| v.as_str())` short-circuit and was
+        // ignored entirely.
+        let cfg = parse_config_json(r#"{"backpressure_mode": 42}"#);
+        assert!(cfg.is_none(), "non-string non-object backpressure_mode must reject");
+        let cfg = parse_config_json(r#"{"backpressure_mode": true}"#);
+        assert!(cfg.is_none(), "boolean backpressure_mode must reject");
+    }
+
+    /// Pin: the `Sample { rate }` mode is reachable from JSON
+    /// via `{"backpressure_mode": {"Sample": {"rate": N}}}`,
+    /// and a zero rate is rejected (validator already rejects
+    /// it; the parser must too, so the surface is consistent).
+    #[test]
+    fn parse_config_supports_sample_mode_with_validation() {
+        let cfg = parse_config_json(r#"{"backpressure_mode": {"Sample": {"rate": 10}}}"#);
+        assert!(
+            cfg.is_some(),
+            "Sample with non-zero rate must parse"
+        );
+
+        let cfg = parse_config_json(r#"{"backpressure_mode": {"Sample": {"rate": 0}}}"#);
+        assert!(cfg.is_none(), "Sample with rate=0 must reject");
+
+        let cfg = parse_config_json(r#"{"backpressure_mode": {"Sample": {}}}"#);
+        assert!(cfg.is_none(), "Sample missing rate must reject");
     }
 
     // Regression: the Go binding's `Poll(limit, cursor)` serializes a
