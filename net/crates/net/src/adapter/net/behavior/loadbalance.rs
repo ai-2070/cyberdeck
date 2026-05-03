@@ -966,7 +966,16 @@ impl LoadBalancer {
     ) -> Selection {
         let total_weight: f64 = endpoints.iter().map(|e| e.effective_weight()).sum();
 
-        if total_weight <= 0.0 {
+        // Use `!(total_weight > 0.0)` rather than `total_weight <= 0.0`:
+        // NaN compares unequal to everything (including itself), so
+        // `NaN <= 0.0` is `false` — the gate would fall through to
+        // the weighted path below where `total_weight.ceil() as u64`
+        // is undefined for NaN, and the cumulative loop never
+        // exceeds NaN (the `>` comparison is also false), causing
+        // the function to fall through to the fallback-first path
+        // and silently bias every selection to `endpoints[0]`. The
+        // negated-greater check catches NaN as well as ≤ 0.0.
+        if !(total_weight > 0.0) {
             return self.select_round_robin_at(endpoints, counter as usize);
         }
 
