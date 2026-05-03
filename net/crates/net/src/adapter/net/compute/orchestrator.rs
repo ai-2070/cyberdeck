@@ -582,6 +582,18 @@ pub const MAX_SNAPSHOT_SIZE: usize = u32::MAX as usize * MAX_SNAPSHOT_CHUNK_SIZE
 /// that will never arrive.
 pub const MAX_TOTAL_CHUNKS: u32 = 700_000;
 
+/// Hard upper bound on bytes buffered for a SINGLE in-flight reassembly.
+///
+/// `MAX_TOTAL_CHUNKS × MAX_SNAPSHOT_CHUNK_SIZE` ≈ 4.3 GiB; combined with the
+/// fact that `seq_through == latest` doesn't trigger eviction, an attacker
+/// can park up to that much memory per `(daemon_origin, seq_through)` and
+/// refresh forever without ever completing the snapshot. This cap is a
+/// hard ceiling on the per-entry buffer regardless of the declared
+/// `total_chunks`. Real daemon snapshots run in the megabytes, not
+/// gigabytes — 64 MiB leaves plenty of headroom while bounding the
+/// flood-amplification a malicious peer can produce.
+pub const MAX_PENDING_REASSEMBLY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Split a snapshot into chunked `SnapshotReady` messages.
 ///
 /// Small snapshots (<= `MAX_SNAPSHOT_CHUNK_SIZE`) produce a single message
@@ -666,6 +678,18 @@ pub enum ReassemblyError {
         /// The newest `seq_through` we've accepted for this daemon.
         latest: u64,
     },
+    /// Buffered bytes for this `(daemon_origin, seq_through)` would
+    /// exceed `MAX_PENDING_REASSEMBLY_BYTES`. Refusing the chunk
+    /// bounds the memory amplification a peer can drive by sending
+    /// only some of the chunks for an outsized declared snapshot.
+    TooManyPendingBytes {
+        /// Bytes already buffered for this entry.
+        buffered: usize,
+        /// Length of the chunk being rejected.
+        incoming: usize,
+        /// Per-entry cap.
+        cap: usize,
+    },
 }
 
 impl std::fmt::Display for ReassemblyError {
@@ -700,6 +724,15 @@ impl std::fmt::Display for ReassemblyError {
                 "seq_through {} is older than latest accepted {} for this daemon",
                 got, latest
             ),
+            Self::TooManyPendingBytes {
+                buffered,
+                incoming,
+                cap,
+            } => write!(
+                f,
+                "buffered {} + incoming {} would exceed per-entry cap {}",
+                buffered, incoming, cap
+            ),
         }
     }
 }
@@ -723,6 +756,11 @@ pub struct SnapshotReassembler {
 struct ReassemblyState {
     total_chunks: u32,
     chunks: std::collections::BTreeMap<u32, Vec<u8>>,
+    /// Sum of `chunks` values' lengths. Maintained explicitly (rather
+    /// than recomputed via `chunks.values().map(Vec::len).sum()` per
+    /// feed) so the `MAX_PENDING_REASSEMBLY_BYTES` gate is O(1) per
+    /// chunk instead of O(chunks).
+    bytes_buffered: usize,
 }
 
 impl SnapshotReassembler {
@@ -799,6 +837,7 @@ impl SnapshotReassembler {
         let state = self.pending.entry(key).or_insert_with(|| ReassemblyState {
             total_chunks,
             chunks: std::collections::BTreeMap::new(),
+            bytes_buffered: 0,
         });
 
         // The first chunk fixes total_chunks; later chunks must agree.
@@ -809,7 +848,33 @@ impl SnapshotReassembler {
             });
         }
 
+        // Per-entry bytes cap. Refuse a chunk that would push the
+        // accumulated buffer past `MAX_PENDING_REASSEMBLY_BYTES`.
+        // Re-sending the same chunk index doesn't double-count: we
+        // subtract the displaced chunk's length below before
+        // re-checking. A peer that declares an oversized snapshot
+        // and ships only some of the chunks can no longer park
+        // ~4 GiB indefinitely — the cap forces the entry to be
+        // refused once buffered bytes exceed the ceiling.
+        let displaced_len = state.chunks.get(&chunk_index).map(Vec::len).unwrap_or(0);
+        let projected = state
+            .bytes_buffered
+            .saturating_sub(displaced_len)
+            .saturating_add(snapshot_bytes.len());
+        if projected > MAX_PENDING_REASSEMBLY_BYTES {
+            return Err(ReassemblyError::TooManyPendingBytes {
+                buffered: state.bytes_buffered,
+                incoming: snapshot_bytes.len(),
+                cap: MAX_PENDING_REASSEMBLY_BYTES,
+            });
+        }
+
+        let new_len = snapshot_bytes.len();
         state.chunks.insert(chunk_index, snapshot_bytes);
+        state.bytes_buffered = state
+            .bytes_buffered
+            .saturating_sub(displaced_len)
+            .saturating_add(new_len);
 
         // With `chunk_index < total_chunks` enforced above, the BTreeMap's
         // keys are all in 0..total_chunks. Reaching total_chunks entries
@@ -855,6 +920,31 @@ struct MigrationRecord {
     state: MigrationState,
     superposition: SuperpositionState,
     started_at: Instant,
+}
+
+/// Outcome of [`MigrationOrchestrator::buffer_event`].
+///
+/// A `bool` return conflated two distinct caller responses
+/// ("no migration → route to source" vs. "post-cutover →
+/// route to target"); see the method's doc-comment for the
+/// concrete failure mode the bool produced. Branch on this
+/// enum instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferOutcome {
+    /// Event was added to the daemon's migration buffer.
+    /// The migration is between Snapshot and Replay phases.
+    Buffered,
+    /// A migration record exists for this daemon but it has
+    /// already entered Cutover or Complete — the source has
+    /// stopped accepting writes and the target is now (or
+    /// will shortly become) the authoritative copy. Caller
+    /// should route the event to the target node, not the
+    /// source.
+    PostCutover,
+    /// No migration record exists for this daemon. Caller
+    /// should route the event normally (to the source, which
+    /// is still authoritative).
+    NoMigration,
 }
 
 /// Coordinates all 6 phases of daemon migration.
@@ -927,7 +1017,7 @@ impl MigrationOrchestrator {
         daemon_origin: u32,
         source_node: u64,
         target_node: u64,
-    ) -> Result<MigrationMessage, MigrationError> {
+    ) -> Result<Vec<MigrationMessage>, MigrationError> {
         // Atomic check-and-insert via entry() to prevent TOCTOU races
         let entry = match self.migrations.entry(daemon_origin) {
             dashmap::mapref::entry::Entry::Occupied(_) => {
@@ -1018,13 +1108,20 @@ impl MigrationOrchestrator {
                 started_at: Instant::now(),
             }));
 
-            Ok(MigrationMessage::SnapshotReady {
-                daemon_origin,
-                snapshot_bytes,
-                seq_through,
-                chunk_index: 0,
-                total_chunks: 1,
-            })
+            // Pre-fix this returned a single `SnapshotReady`
+            // with `chunk_index: 0, total_chunks: 1` regardless
+            // of `snapshot_bytes.len()`. Any snapshot larger
+            // than `MAX_SNAPSHOT_CHUNK_SIZE` (7 KB) was
+            // rejected at the wire encoder
+            // (`migration_handler.rs:336`) and the receiver
+            // dropped it as `ChunkTooLarge`. Locally-initiated
+            // migration of any stateful daemon with a
+            // non-trivial state vector (cached models, large
+            // bindings, behaviour history) thus could not be
+            // sent at all. Route through `chunk_snapshot` so a
+            // multi-chunk snapshot returns multiple messages
+            // for the caller to dispatch in order.
+            chunk_snapshot(daemon_origin, snapshot_bytes, seq_through)
         } else {
             let source_head = CausalLink::genesis(daemon_origin, 0);
             let superposition = SuperpositionState::new(daemon_origin, source_head);
@@ -1035,10 +1132,10 @@ impl MigrationOrchestrator {
                 started_at: Instant::now(),
             }));
 
-            Ok(MigrationMessage::TakeSnapshot {
+            Ok(vec![MigrationMessage::TakeSnapshot {
                 daemon_origin,
                 target_node,
-            })
+            }])
         }
     }
 
@@ -1055,14 +1152,20 @@ impl MigrationOrchestrator {
         source_node: u64,
         scheduler: &super::Scheduler,
         daemon_filter: &crate::adapter::net::behavior::capability::CapabilityFilter,
-    ) -> Result<(u64, MigrationMessage), MigrationError> {
+    ) -> Result<(u64, Vec<MigrationMessage>), MigrationError> {
+        // Map a scheduler "no candidate" / "index unavailable"
+        // outcome to the typed `NoTargetAvailable` variant. Pre-
+        // fix this used `TargetUnavailable(0)`, surfacing
+        // "target node 0x0 unavailable" to operators — confusing
+        // because no specific node id was ever attempted; the
+        // auto-placement found nobody to attempt against.
         let placement = scheduler
             .place_migration(daemon_filter, source_node)
-            .map_err(|_| MigrationError::TargetUnavailable(0))?;
+            .map_err(|_| MigrationError::NoTargetAvailable)?;
 
         let target_node = placement.node_id;
-        let msg = self.start_migration(daemon_origin, source_node, target_node)?;
-        Ok((target_node, msg))
+        let msgs = self.start_migration(daemon_origin, source_node, target_node)?;
+        Ok((target_node, msgs))
     }
 
     /// Handle snapshot taken on source (phase 1→2).
@@ -1277,19 +1380,31 @@ impl MigrationOrchestrator {
 
     /// Buffer an event for a daemon that is currently migrating.
     ///
-    /// Returns `true` if the event was buffered (migration in progress),
-    /// `false` if no migration is active for this daemon.
-    pub fn buffer_event(&self, daemon_origin: u32, event: CausalEvent) -> bool {
+    /// Pre-fix this returned a `bool`: `true` if buffered,
+    /// `false` for both "no migration" AND "migration past
+    /// cutover." A caller checking `if !buffer_event(...)
+    /// { route_to_source(...) }` would, post-cutover, route the
+    /// event to a source that has stopped accepting writes for
+    /// this daemon — silently lost. The two `false` cases need
+    /// different remediation: no-migration means "route to the
+    /// source as normal," post-cutover means "route to the
+    /// target (the new authoritative copy)."
+    ///
+    /// Return a typed [`BufferOutcome`] so the caller can branch
+    /// on the actual state instead of inferring the wrong
+    /// behavior from an ambiguous bool.
+    pub fn buffer_event(&self, daemon_origin: u32, event: CausalEvent) -> BufferOutcome {
         if let Some(entry) = self.migrations.get(&daemon_origin) {
             let mut record = entry.lock();
             let phase = record.state.phase();
             // Buffer during Snapshot through Replay phases
             if phase != MigrationPhase::Cutover && phase != MigrationPhase::Complete {
                 record.state.buffer_event(event);
-                return true;
+                return BufferOutcome::Buffered;
             }
+            return BufferOutcome::PostCutover;
         }
-        false
+        BufferOutcome::NoMigration
     }
 
     /// Abort a migration at any phase.
@@ -1307,6 +1422,15 @@ impl MigrationOrchestrator {
     }
 
     /// Abort a migration with a caller-supplied structured reason.
+    ///
+    /// Removes the orchestrator's record AND, if wired, also clears
+    /// the matching entry on the local `MigrationSourceHandler`.
+    /// Pre-fix only the orchestrator entry was removed; the source
+    /// handler's `migrations` map retained the entry, so
+    /// `is_migrating()` stayed true forever and `buffer_event` kept
+    /// stuffing the now-undrained buffered_events vector. Subsequent
+    /// retry attempts then tripped `AlreadyMigrating` against a
+    /// migration the orchestrator believed was already aborted.
     pub fn abort_migration_with_reason(
         &self,
         daemon_origin: u32,
@@ -1315,6 +1439,14 @@ impl MigrationOrchestrator {
         self.migrations
             .remove(&daemon_origin)
             .ok_or(MigrationError::DaemonNotFound(daemon_origin))?;
+
+        // Clear the source-side mirror entry. `abort` is a no-op if
+        // the daemon was never tracked there (e.g. remote-source
+        // migration where this node is only the orchestrator), so
+        // calling it unconditionally is safe.
+        if let Some(source) = &self.source_handler {
+            let _ = source.abort(daemon_origin);
+        }
 
         Ok(MigrationMessage::MigrationFailed {
             daemon_origin,
@@ -1523,12 +1655,13 @@ mod tests {
         let (reg, origin) = setup_registry();
         let orch = MigrationOrchestrator::new(reg, 0x1111);
 
-        let msg = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
-        match msg {
+        let msgs = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+        assert!(!msgs.is_empty(), "must emit at least one chunk");
+        match &msgs[0] {
             MigrationMessage::SnapshotReady { daemon_origin, .. } => {
-                assert_eq!(daemon_origin, origin);
+                assert_eq!(*daemon_origin, origin);
             }
-            _ => panic!("expected SnapshotReady"),
+            other => panic!("expected SnapshotReady, got {:?}", other),
         }
 
         assert!(orch.is_migrating(origin));
@@ -1681,16 +1814,21 @@ mod tests {
         let (reg, origin) = setup_registry();
         let orch = MigrationOrchestrator::new(reg, 0x3333);
 
-        let msg = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
-        match msg {
+        let msgs = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+        assert_eq!(
+            msgs.len(),
+            1,
+            "remote-source path emits exactly one TakeSnapshot"
+        );
+        match &msgs[0] {
             MigrationMessage::TakeSnapshot {
                 daemon_origin,
                 target_node,
             } => {
-                assert_eq!(daemon_origin, origin);
-                assert_eq!(target_node, 0x2222);
+                assert_eq!(*daemon_origin, origin);
+                assert_eq!(*target_node, 0x2222);
             }
-            _ => panic!("expected TakeSnapshot"),
+            other => panic!("expected TakeSnapshot, got {:?}", other),
         }
 
         assert_eq!(orch.status(origin), Some(MigrationPhase::Snapshot));
@@ -1704,6 +1842,42 @@ mod tests {
         orch.start_migration(origin, 0x1111, 0x2222).unwrap();
         let err = orch.start_migration(origin, 0x1111, 0x3333).unwrap_err();
         assert_eq!(err, MigrationError::AlreadyMigrating(origin));
+    }
+
+    /// Regression: `start_migration_auto` returns
+    /// `MigrationError::NoTargetAvailable` (not
+    /// `TargetUnavailable(0)`) when the scheduler finds no
+    /// candidate satisfying the daemon's capability filter.
+    /// Pre-fix the auto path constructed
+    /// `TargetUnavailable(0)`, surfacing "target node 0x0
+    /// unavailable" to operators — confusing because no
+    /// specific node id was ever attempted; the auto-placement
+    /// found nobody to attempt against.
+    #[test]
+    fn start_migration_auto_returns_no_target_available_when_scheduler_finds_nothing() {
+        use crate::adapter::net::behavior::capability::{CapabilityIndex, CapabilitySet};
+
+        let (reg, origin) = setup_registry();
+        let orch = MigrationOrchestrator::new(reg, 0x1111);
+
+        // Empty index — no candidate nodes anywhere.
+        let index = Arc::new(CapabilityIndex::new());
+        let scheduler = super::super::Scheduler::new(index, 0x1111, CapabilitySet::default());
+
+        // A filter that nothing in the empty index can satisfy.
+        let filter = CapabilityFilter::default();
+
+        let err = orch
+            .start_migration_auto(origin, 0x1111, &scheduler, &filter)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            MigrationError::NoTargetAvailable,
+            "auto-placement with no candidates must surface as \
+             NoTargetAvailable, not TargetUnavailable(0). The 0 \
+             was a fake node id that pre-fix appeared in operator \
+             error logs as `target node 0x0 unavailable`."
+        );
     }
 
     #[test]
@@ -1731,6 +1905,55 @@ mod tests {
         assert!(!orch.is_migrating(origin));
     }
 
+    /// Regression: pre-fix `abort_migration_with_reason` only
+    /// removed the orchestrator's record. The matching
+    /// `MigrationSourceHandler` entry stayed put, so
+    /// `is_migrating()` on the source remained `true`,
+    /// `buffer_event` kept appending to a never-drained vector,
+    /// and a retry trip-tested `AlreadyMigrating` against a
+    /// migration the orchestrator believed was aborted. The fix
+    /// calls `source.abort` from the orchestrator's abort path.
+    #[test]
+    fn abort_migration_propagates_to_source_handler() {
+        use crate::adapter::net::compute::migration_source::MigrationSourceHandler;
+        let (reg, origin) = setup_registry();
+        let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        let orch = MigrationOrchestrator::new(reg, 0x1111).with_source_handler(source.clone());
+
+        // Stand up the migration end-to-end via the orchestrator's
+        // `start_migration`, which records on BOTH sides (the
+        // orchestrator's record AND the source handler's mirror).
+        // Pre-fix the orchestrator's `abort_migration_with_reason`
+        // only cleared its own record, leaving the source mirror
+        // intact.
+        orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+        assert!(
+            orch.is_migrating(origin),
+            "orchestrator records the migration"
+        );
+        assert!(
+            source.is_migrating(origin),
+            "source handler also records the migration via the orchestrator",
+        );
+
+        // Abort. Both sides must clear.
+        orch.abort_migration(origin, "test abort".into()).unwrap();
+        assert!(
+            !orch.is_migrating(origin),
+            "orchestrator must clear its record"
+        );
+        assert!(
+            !source.is_migrating(origin),
+            "source handler must also clear its mirror entry on abort",
+        );
+
+        // The decisive sealed property: a fresh
+        // `start_migration` for the same daemon now succeeds.
+        // Pre-fix this would `AlreadyMigrating` because the source
+        // handler still tracked the daemon.
+        orch.start_migration(origin, 0x1111, 0x3333).unwrap();
+    }
+
     #[test]
     fn test_event_buffering() {
         let (reg, origin) = setup_registry();
@@ -1744,15 +1967,74 @@ mod tests {
             received_at: 0,
         };
 
-        assert!(orch.buffer_event(origin, event));
-        assert!(!orch.buffer_event(
-            0xDEAD,
-            CausalEvent {
-                link: CausalLink::genesis(0xDEAD, 0),
-                payload: Bytes::from_static(b"nope"),
-                received_at: 0,
-            }
-        ));
+        assert_eq!(orch.buffer_event(origin, event), BufferOutcome::Buffered);
+        assert_eq!(
+            orch.buffer_event(
+                0xDEAD,
+                CausalEvent {
+                    link: CausalLink::genesis(0xDEAD, 0),
+                    payload: Bytes::from_static(b"nope"),
+                    received_at: 0,
+                }
+            ),
+            BufferOutcome::NoMigration,
+        );
+    }
+
+    /// Regression: `buffer_event` must distinguish "no
+    /// migration" from "migration past cutover" via the
+    /// `BufferOutcome` enum. Pre-fix both cases collapsed to
+    /// `false`, so a caller running
+    /// `if !orch.buffer_event(...) { route_to_source(...) }`
+    /// would, post-cutover, route the event to the source —
+    /// which has stopped accepting writes for this daemon, so
+    /// the event was silently lost.
+    #[test]
+    fn buffer_event_distinguishes_post_cutover_from_no_migration() {
+        let (reg, origin) = setup_registry();
+        let orch = MigrationOrchestrator::new(reg, 0x3333);
+
+        let event = || CausalEvent {
+            link: CausalLink::genesis(origin, 0),
+            payload: Bytes::from_static(b"test"),
+            received_at: 0,
+        };
+
+        // Case A: no migration record at all.
+        assert_eq!(
+            orch.buffer_event(origin, event()),
+            BufferOutcome::NoMigration,
+            "buffer_event with no migration must surface as NoMigration"
+        );
+
+        // Case B: migration in Snapshot phase — event buffered.
+        orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+        assert_eq!(
+            orch.buffer_event(origin, event()),
+            BufferOutcome::Buffered,
+            "buffer_event during Snapshot must surface as Buffered"
+        );
+
+        // Force the migration into Cutover via the test-only
+        // phase setter. We can't drive a real cutover here
+        // without going through the full handler protocol, but
+        // BufferOutcome only inspects `state.phase()`.
+        {
+            let entry = orch.migrations.get(&origin).unwrap();
+            let mut record = entry.lock();
+            record.state.force_phase(MigrationPhase::Cutover);
+        }
+
+        // Case C: migration past cutover — must NOT collapse
+        // to NoMigration. Caller needs to route to target.
+        assert_eq!(
+            orch.buffer_event(origin, event()),
+            BufferOutcome::PostCutover,
+            "buffer_event in Cutover phase must surface as PostCutover, \
+             not NoMigration. Pre-fix the bool conflated these and \
+             callers routed post-cutover events to the source, where \
+             they were silently lost."
+        );
     }
 
     #[test]
@@ -2030,6 +2312,55 @@ mod tests {
             stale
         );
         assert_eq!(reassembler.pending_count(), 1);
+    }
+
+    /// Regression: a peer-driven reassembly that declares a large
+    /// `total_chunks` and ships chunks just up to the per-entry
+    /// byte cap is refused, rather than silently parking memory
+    /// indefinitely. Pre-fix `MAX_TOTAL_CHUNKS × MAX_SNAPSHOT_CHUNK_SIZE`
+    /// could buffer ~4.3 GiB per `(origin, seq)` key forever
+    /// because the eviction at `seq_through > latest` doesn't fire
+    /// when an attacker re-uses the same `seq_through`.
+    #[test]
+    fn reassembler_refuses_chunk_that_overflows_pending_byte_cap() {
+        let mut reassembler = SnapshotReassembler::new();
+
+        // Pre-fill to just under the cap. Each chunk is the max
+        // legal chunk size; we send unique indices so no chunk is
+        // displaced.
+        let chunk_full = vec![0xCCu8; MAX_SNAPSHOT_CHUNK_SIZE];
+        let chunks_to_fill = MAX_PENDING_REASSEMBLY_BYTES / MAX_SNAPSHOT_CHUNK_SIZE;
+        // Choose a `total_chunks` that fits the prefill + at least
+        // two more — so the entry is still incomplete after prefill
+        // and the next chunk lands in the same key.
+        let total_chunks = (chunks_to_fill as u32) + 2;
+        for i in 0..(chunks_to_fill as u32) {
+            reassembler
+                .feed(0xAAAA, chunk_full.clone(), 1, i, total_chunks)
+                .unwrap();
+        }
+
+        // The next chunk would push buffered past the cap. It must
+        // be refused with `TooManyPendingBytes`, not silently
+        // accepted.
+        let next_idx = chunks_to_fill as u32;
+        let result = reassembler.feed(0xAAAA, chunk_full.clone(), 1, next_idx, total_chunks);
+        assert!(
+            matches!(result, Err(ReassemblyError::TooManyPendingBytes { .. })),
+            "chunk that would overflow the per-entry cap must be refused, got {:?}",
+            result,
+        );
+
+        // Re-sending an index that is ALREADY buffered must succeed
+        // (the displaced chunk's bytes are subtracted before the cap
+        // re-check). Pin this so the cap doesn't break legitimate
+        // duplicate-chunk delivery.
+        let resend = reassembler.feed(0xAAAA, chunk_full.clone(), 1, 0, total_chunks);
+        assert!(
+            resend.is_ok(),
+            "re-sending an already-buffered chunk index must succeed, got {:?}",
+            resend
+        );
     }
 
     #[test]
