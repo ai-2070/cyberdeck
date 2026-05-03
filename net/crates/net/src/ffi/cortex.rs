@@ -120,11 +120,16 @@ unsafe fn c_str_to_owned(p: *const c_char) -> Option<String> {
 
 /// Serialize `value` as JSON into a C-owned string + length. On
 /// success writes the pointer to `*out_ptr` and the length to
-/// `*out_len` (excluding the null terminator) and returns `0`. The
-/// caller must free the string with `net_free_string`.
-/// Null-checks `out_ptr` and `out_len` before writing through them.
-/// Returns `NetError::NullPointer` so the FFI caller can distinguish
-/// "I forgot output pointers" from "the operation failed."
+/// `*out_len` (excluding the null terminator) and returns `0`.
+/// On non-success the out params are zeroed (`null`, `0`) so a
+/// caller that reads them before checking the return code sees
+/// "no output" rather than stale stack data. The caller must
+/// free the string with `net_free_string` on success.
+///
+/// Null-checks `out_ptr` and `out_len` before writing through
+/// them. Returns `NetError::NullPointer` so the FFI caller can
+/// distinguish "I forgot output pointers" from "the operation
+/// failed."
 fn write_json_out<T: Serialize>(
     value: &T,
     out_ptr: *mut *mut c_char,
@@ -134,10 +139,21 @@ fn write_json_out<T: Serialize>(
         return NetError::NullPointer.into();
     }
     let Ok(s) = serde_json::to_string(value) else {
+        // Pre-zero so the caller can rely on the contract
+        // "non-zero return ⇒ out_ptr is null and out_len is 0"
+        // rather than reading stale data from before the call.
+        unsafe {
+            *out_ptr = ptr::null_mut();
+            *out_len = 0;
+        }
         return NetError::Unknown.into();
     };
     let len = s.len();
     let Ok(cs) = CString::new(s) else {
+        unsafe {
+            *out_ptr = ptr::null_mut();
+            *out_len = 0;
+        }
         return NetError::Unknown.into();
     };
     unsafe {
@@ -145,6 +161,30 @@ fn write_json_out<T: Serialize>(
         *out_len = len;
     }
     0
+}
+
+/// Helper: pre-zero `*out_ptr` and `*out_len` after a null-check.
+/// Call at the top of every FFI function that takes
+/// `(out_json, out_len)` so subsequent error returns leave the
+/// out params as `(null, 0)` rather than stale stack data. The
+/// audit (#136) calls this contract "pre-zero" — every error
+/// return must satisfy "out_json is null AND out_len is 0,"
+/// distinct from the success contract "out_json is heap-allocated
+/// and out_len is its length." Pre-fix several functions
+/// returned errors without touching the out params, so callers
+/// that didn't strictly check the return code dereferenced
+/// stale data.
+fn zero_out_json(out_ptr: *mut *mut c_char, out_len: *mut usize) {
+    if !out_ptr.is_null() {
+        unsafe {
+            *out_ptr = ptr::null_mut();
+        }
+    }
+    if !out_len.is_null() {
+        unsafe {
+            *out_len = 0;
+        }
+    }
 }
 
 // =========================================================================
@@ -471,6 +511,13 @@ pub extern "C" fn net_redex_tail_next(
     if cursor.is_null() || out_json.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }
+    // Pre-zero out params so timeout / stream-end / error
+    // returns leave the caller with `(null, 0)` rather than
+    // stale stack data. The doc-comment establishes this
+    // contract ("non-zero return ⇒ no JSON written"), but pre-
+    // fix the function returned NET_ERR_TIMEOUT and
+    // NET_ERR_STREAM_ENDED without touching the out params.
+    zero_out_json(out_json, out_len);
     let cursor = unsafe { &*cursor };
     block_on(async move {
         let mut guard = cursor.stream.lock().await;
@@ -887,6 +934,10 @@ pub extern "C" fn net_tasks_list(
     if handle.is_null() || out_json.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }
+    // Pre-zero so a filter-build error return leaves the out
+    // params at (null, 0) rather than stale stack data — matches
+    // the contract documented on `write_json_out`.
+    zero_out_json(out_json, out_len);
     let tasks = unsafe { &*handle };
     let filter = match build_tasks_list_filter(filter_json) {
         Ok(f) => f,
