@@ -1230,6 +1230,30 @@ pub extern "C" fn net_free_string(s: *mut c_char) {
     }
 }
 
+// `net.h` declares both `net_generate_keypair` and
+// `net_free_string` unconditionally — a consumer linking against
+// a cdylib built without the `net` feature would otherwise hit
+// a load-time missing-symbol error despite the header advertising
+// the symbol. Provide always-empty stubs so the symbol is
+// resolvable on every build configuration. Mirrors the
+// `nat-traversal` cfg pattern in `mesh.rs`.
+
+#[cfg(not(feature = "net"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_generate_keypair() -> *mut c_char {
+    ptr::null_mut()
+}
+
+#[cfg(not(feature = "net"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_free_string(s: *mut c_char) {
+    if !s.is_null() {
+        unsafe {
+            drop(std::ffi::CString::from_raw(s));
+        }
+    }
+}
+
 // =========================================================================
 // Structured (non-JSON) API — _ex variants
 // =========================================================================
