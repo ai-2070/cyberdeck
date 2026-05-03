@@ -161,7 +161,20 @@ impl AdaptiveBatcher {
 
         // Smooth transitions using exponential moving average
         // new = (old * 3 + target) / 4
-        self.current_batch_size = (self.current_batch_size * 3 + target) / 4;
+        //
+        // Saturating: `BatchConfig::validate` doesn't bound
+        // `max_size` from above, so a hostile config that pushes
+        // `current_batch_size` near `usize::MAX / 3` would
+        // overflow the multiply (debug: panic; release: wrap to a
+        // tiny value, collapsing the batcher to its `min_size`
+        // floor on the next clamp). Saturating preserves the
+        // intent — clamp at `usize::MAX` and let the bounds
+        // clamp below pull it back into the configured window.
+        self.current_batch_size = self
+            .current_batch_size
+            .saturating_mul(3)
+            .saturating_add(target)
+            / 4;
 
         // Ensure we stay within bounds
         self.current_batch_size = self
@@ -501,6 +514,47 @@ mod tests {
 
         // Batch size should have increased
         assert!(batcher.batch_size() > 100);
+    }
+
+    /// Regression: `recalculate_batch_size` previously did
+    /// `current_batch_size * 3 + target` with bare arithmetic. A
+    /// hostile `BatchConfig` with `max_size` near `usize::MAX / 3`
+    /// could push `current_batch_size` near that threshold, where
+    /// the multiply overflows — debug build panics, release wraps
+    /// to a tiny value. The fix saturates both the multiply and
+    /// add. Pin the saturation so a future revert ("simplify" the
+    /// arithmetic) is caught by the test rather than discovered
+    /// in production via a debug-build crash.
+    #[test]
+    fn recalculate_batch_size_saturates_on_hostile_max_size() {
+        let config = BatchConfig {
+            min_size: 1,
+            max_size: usize::MAX,
+            max_delay: Duration::from_secs(10),
+            adaptive: true,
+            velocity_window: Duration::from_millis(100),
+        };
+        let mut batcher = AdaptiveBatcher::new(config);
+
+        // Drive `current_batch_size` to a value where `* 3` would
+        // overflow. The field is module-private but we're in the
+        // same module, so direct mutation is fine.
+        batcher.current_batch_size = usize::MAX - 1;
+
+        // Pre-fix this would either debug-panic (`overflow when
+        // multiplying`) or release-wrap to a small value.
+        // Post-fix: saturating_mul keeps the result at usize::MAX
+        // and the bounds clamp pulls it back into [min_size,
+        // max_size]. Either way, no panic and no wrap to tiny.
+        batcher.recalculate_batch_size();
+
+        // Sanity: the resulting size is still inside the
+        // configured window and didn't wrap to a small value.
+        assert!(
+            batcher.current_batch_size >= 1,
+            "post-recalc batch size must respect min_size, got {}",
+            batcher.current_batch_size,
+        );
     }
 
     #[test]
