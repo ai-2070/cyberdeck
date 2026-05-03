@@ -378,11 +378,26 @@ impl MigrationTargetHandler {
     }
 
     /// Abort migration — unregister daemon and clean up.
+    ///
+    /// Also clears any idempotency record in `completed`. Pre-fix
+    /// only the active-migration entry was removed; a daemon that
+    /// had been `complete`-d (and thus already had a `completed`
+    /// idempotency record) and was THEN aborted would leak the
+    /// completed entry indefinitely. The leak was minor (one
+    /// 32-bit key + a `CompletedTargetState` per affected
+    /// daemon) but unbounded — every aborted post-completion
+    /// migration accumulated forever, since the only other
+    /// clearance path (`forget_completed`) is keyed off a
+    /// successful source-side cleanup that never arrives in the
+    /// abort path. Clearing both indices makes `abort`
+    /// idempotent in the strong sense: post-abort state
+    /// matches pre-`start_restore` state.
     pub fn abort(&self, daemon_origin: u32) -> Result<(), MigrationError> {
         if self.migrations.remove(&daemon_origin).is_some() {
             // Unregister daemon (it's not authoritative, source still has it)
             let _ = self.daemon_registry.unregister(daemon_origin);
         }
+        self.completed.remove(&daemon_origin);
         Ok(())
     }
 
@@ -822,6 +837,60 @@ mod tests {
         handler.abort(origin).unwrap();
         assert!(!handler.is_migrating(origin));
         assert!(!reg.contains(origin)); // daemon unregistered on abort
+    }
+
+    /// Regression: `abort` must clear the `completed`
+    /// idempotency record in addition to removing the active
+    /// migration entry. Pre-fix only `migrations.remove` ran;
+    /// a daemon that had been completed and was THEN aborted
+    /// (e.g. an explicit operator abort after a successful
+    /// migration before `forget_completed` clearance arrived)
+    /// left the `completed` entry in place forever, since the
+    /// only other clearance path keys off a successful source
+    /// cleanup that never reaches an aborted migration. Per
+    /// the audit (#141) this was a minor unbounded leak — one
+    /// `CompletedTargetState` per affected daemon, accumulating
+    /// indefinitely.
+    #[test]
+    fn abort_clears_completed_idempotency_record() {
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+
+        let snapshot = make_snapshot(&kp, 0, 0);
+
+        // Restore + complete → entry lives in `completed`.
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+        handler.complete(origin).unwrap();
+
+        // Sanity: the completed record exists before abort.
+        assert!(
+            handler.completed.contains_key(&origin),
+            "precondition: completed record must exist after complete()"
+        );
+
+        // Abort must clear it.
+        handler.abort(origin).unwrap();
+        assert!(
+            !handler.completed.contains_key(&origin),
+            "regression: abort must clear the completed idempotency \
+             record. Pre-fix the entry leaked indefinitely — the only \
+             other clearance path (forget_completed) keys off a source \
+             cleanup that never arrives for aborted migrations."
+        );
     }
 
     #[test]
