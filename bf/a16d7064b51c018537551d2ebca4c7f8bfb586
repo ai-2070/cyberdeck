@@ -1,0 +1,25 @@
+net/crates/net/src/ffi/mesh.rs
+  726f3eb25aff9828 2321,2323-2338,2602-2613,2720-2744,3162-3204
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  726f3eb25aff9828 9,350
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "bfa16d7064b51c018537551d2ebca4c7f8bfb586",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 99,
+      "total_deletions": 13,
+      "accepted_lines": 3986,
+      "overriden_lines": 2
+    }
+  }
+}
