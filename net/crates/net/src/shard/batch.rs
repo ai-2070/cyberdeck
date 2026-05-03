@@ -153,8 +153,20 @@ impl AdaptiveBatcher {
         // Scale batch size with velocity
         // At 1M events/sec → batch size ~5,000
         // At 10M events/sec → batch size ~50,000 (capped at max)
+        //
+        // Explicit `clamp(0.0, usize::MAX as f64)` before the `as
+        // usize` cast: Rust's `as` cast on f64 → usize is
+        // saturating in current versions, but the explicit clamp
+        // documents intent and survives any future edition that
+        // tightens the cast (e.g. requires `try_from` on
+        // overflow). The `velocity > 0.0` guard above already
+        // rules out NaN and negative; the upper bound here only
+        // matters for the unreachable `velocity > usize::MAX *
+        // 200.0` case (~3.7e21 events/sec), but the saturation
+        // is cheaper than reasoning about future cast semantics.
         let target = if velocity > 0.0 {
-            ((velocity / 200.0) as usize).clamp(self.config.min_size, self.config.max_size)
+            let scaled = (velocity / 200.0).clamp(0.0, usize::MAX as f64);
+            (scaled as usize).clamp(self.config.min_size, self.config.max_size)
         } else {
             self.config.min_size
         };

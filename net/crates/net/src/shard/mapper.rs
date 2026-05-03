@@ -698,8 +698,19 @@ impl ShardMapper {
         if last_needed == u16::MAX {
             return Err(ScalingError::AtMaxShards);
         }
+        // `first_id + count == last_needed + 1`. We already
+        // refused `last_needed == u16::MAX` above, so the sum is
+        // provably <= u16::MAX. Use `checked_add` anyway as a
+        // belt-and-suspenders guard: a future change that
+        // weakens the sentinel check would otherwise reach an
+        // unchecked u16 wrap here, silently rolling
+        // `next_shard_id` back to 0 and then re-issuing already-
+        // allocated ids.
+        let next_id_after = first_id
+            .checked_add(count)
+            .ok_or(ScalingError::AtMaxShards)?;
         self.next_shard_id
-            .store(first_id + count, AtomicOrdering::Relaxed);
+            .store(next_id_after, AtomicOrdering::Relaxed);
 
         let mut new_ids = Vec::with_capacity(count as usize);
         for i in 0..count {
