@@ -189,6 +189,13 @@ impl JetStreamAdapter {
                             num_replicas: self.config.replicas,
                             discard: jetstream::stream::DiscardPolicy::Old,
                             allow_direct: true, // Required for direct_get API
+                            // Wider than the 2-minute NATS default so a
+                            // bus-side retry of `(process_nonce, shard,
+                            // seq)`-keyed publishes after a long backoff
+                            // still hits the dedup table. See the
+                            // `JetStreamAdapterConfig::dedup_window`
+                            // field doc for the rationale.
+                            duplicate_window: self.config.dedup_window,
                             ..Default::default()
                         };
 

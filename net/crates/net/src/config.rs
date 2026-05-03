@@ -539,6 +539,23 @@ pub struct JetStreamAdapterConfig {
     /// Number of stream replicas for fault tolerance.
     /// Default: 1 (no replication).
     pub replicas: usize,
+
+    /// Server-side dedup window for `Nats-Msg-Id` header matching.
+    /// JetStream discards a publish whose msg-id matches one
+    /// observed within this window — the bus's `on_batch` retry
+    /// path relies on this to make mid-batch failures idempotent.
+    /// Default: 1 hour.
+    ///
+    /// The NATS / async-nats default is 2 minutes. Under the bus's
+    /// retry policy a slow caller (network flap, long backoff,
+    /// queued-up backpressure) can land the same `(nonce, shard,
+    /// seq)` msg-id past the 2 min mark, where dedup no longer
+    /// fires and the same event publishes at two distinct
+    /// JetStream sequences. 1 hour is wider than any realistic
+    /// retry envelope while bounding server-side dedup-table
+    /// memory growth (one entry per unique msg-id observed within
+    /// the window).
+    pub dedup_window: Duration,
 }
 
 #[cfg(feature = "jetstream")]
@@ -554,7 +571,15 @@ impl JetStreamAdapterConfig {
             max_bytes: None,
             max_age: None,
             replicas: 1,
+            dedup_window: Duration::from_secs(3600),
         }
+    }
+
+    /// Set the JetStream dedup window. See the field doc on
+    /// [`Self::dedup_window`] for the trade-off vs the NATS default.
+    pub fn with_dedup_window(mut self, window: Duration) -> Self {
+        self.dedup_window = window;
+        self
     }
 
     /// Set the stream name prefix.
