@@ -171,7 +171,19 @@ impl RedisAdapter {
     }
 
     /// Get a connection (with error handling).
+    ///
+    /// Pre-fix this returned the cached `ConnectionManager` whenever
+    /// `self.conn` was `Some(_)`, even after `shutdown()` had run.
+    /// `shutdown` only flips `initialized = false`; the
+    /// `ConnectionManager` field itself stays set (we can't clear
+    /// it from `&self` without interior mutability), so a
+    /// post-shutdown `on_batch` / `poll_shard` would happily write
+    /// to Redis after the operator believes the adapter is gone.
+    /// Consult `initialized` first to refuse cleanly.
     async fn get_conn(&self) -> Result<ConnectionManager, AdapterError> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return Err(AdapterError::Fatal("adapter not initialized".into()));
+        }
         self.conn
             .clone()
             .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))
