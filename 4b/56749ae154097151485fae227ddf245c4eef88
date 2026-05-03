@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/crypto.rs
+  726f3eb25aff9828 404-415,978-981,983,987,992-1038
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "4b56749ae154097151485fae227ddf245c4eef88",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1309,
+      "total_deletions": 4,
+      "accepted_lines": 68,
+      "overriden_lines": 0
+    }
+  }
+}
