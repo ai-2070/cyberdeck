@@ -2138,6 +2138,107 @@ mod tests {
         // `RxCreditState` rustdoc + `mesh.rs:3110-3135`.
     }
 
+    /// Regression: `outstanding()` must never observe a transient
+    /// `consumed > granted` inversion under contention.
+    ///
+    /// Pre-fix `on_bytes_consumed` bumped `consumed` before
+    /// `granted`, while `outstanding()` loaded `granted` then
+    /// `consumed`. A reader catching the in-flight window saw
+    /// `granted` from before a writer's bump but `consumed` from
+    /// after — `consumed > granted`, masked by `saturating_sub` to
+    /// zero. With the writer-side priming `granted = window_bytes`,
+    /// the post-fix invariant is `outstanding() >= window_bytes` at
+    /// every instant: the publication order (granted first, then
+    /// consumed) plus the matching reader order (consumed first,
+    /// then granted) guarantees any observed `consumed` increment is
+    /// paired with its `granted` increment by the time the reader
+    /// loads `granted`.
+    ///
+    /// Setup: `window_bytes = K`, every writer call mints `K`
+    /// matched bytes. Pre-fix the reader sees outstanding=0 mid-flight;
+    /// post-fix the reader always sees outstanding >= K.
+    #[test]
+    fn rx_credit_outstanding_never_inverts_under_contention() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::Arc;
+        use std::thread;
+
+        const WINDOW: u32 = 64;
+        const WRITERS: usize = 6;
+        const ITERATIONS: usize = 50_000;
+
+        let state = Arc::new(StreamState::new_full(false, 1, WINDOW));
+        let stop = Arc::new(AtomicBool::new(false));
+        let min_seen = Arc::new(AtomicU64::new(u64::MAX));
+        let reader_loops = Arc::new(AtomicU64::new(0));
+
+        // Reader: spin on `outstanding()` and record the minimum
+        // value observed. Stops as soon as the writers signal done.
+        let reader = {
+            let state = Arc::clone(&state);
+            let stop = Arc::clone(&stop);
+            let min_seen = Arc::clone(&min_seen);
+            let reader_loops = Arc::clone(&reader_loops);
+            thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let v = state.rx_credit().outstanding();
+                    let mut current = min_seen.load(std::sync::atomic::Ordering::Relaxed);
+                    while v < current {
+                        match min_seen.compare_exchange_weak(
+                            current,
+                            v,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(seen) => current = seen,
+                        }
+                    }
+                    reader_loops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+
+        // Writers: pound `on_bytes_consumed(WINDOW)` so each call
+        // moves both counters by exactly the priming window. With
+        // K == WINDOW, any inversion of the publication order
+        // surfaces as `consumed > granted` and saturates to zero.
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                thread::spawn(move || {
+                    for _ in 0..ITERATIONS {
+                        let _ = state.on_bytes_consumed(WINDOW as u64);
+                    }
+                })
+            })
+            .collect();
+
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+
+        // Sanity: the reader actually got CPU time. Without this,
+        // the assertion below would silently pass on a single-core
+        // / over-subscribed runner.
+        assert!(
+            reader_loops.load(std::sync::atomic::Ordering::Relaxed) > 1_000,
+            "reader did not get enough CPU time to exercise the race",
+        );
+
+        // The strong invariant: outstanding never drops below the
+        // priming window. Pre-fix this falls to 0 under contention.
+        let observed_min = min_seen.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            observed_min >= WINDOW as u64,
+            "outstanding() inverted under contention: min observed = {} (must be >= {})",
+            observed_min,
+            WINDOW,
+        );
+    }
+
     #[test]
     fn test_rx_credit_window_zero_disables_grants() {
         let state = StreamState::new_full(false, 1, 0);
