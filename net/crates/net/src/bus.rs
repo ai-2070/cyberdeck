@@ -1239,7 +1239,11 @@ impl EventBus {
                             .into(),
                     ));
                 }
-                tokio::task::yield_now().await;
+                // `yield_now` re-queues immediately and keeps the
+                // task hot, starving the workers we're waiting on
+                // under contention. A short `sleep` parks the task
+                // and lets the runtime schedule the workers.
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
             return Ok(());
         }
@@ -1301,7 +1305,10 @@ impl EventBus {
                     .store(true, AtomicOrdering::Release);
                 break;
             }
-            tokio::task::yield_now().await;
+            // Park instead of `yield_now`. The producers we're
+            // waiting on contend for the same runtime threads;
+            // re-queuing immediately starves their progress.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
 
         // 1b. Release the drain-finalize gate.
@@ -2080,7 +2087,10 @@ fn spawn_drain_worker_for_shard(
                         );
                         break;
                     }
-                    tokio::task::yield_now().await;
+                    // Park instead of `yield_now` so we don't
+                    // starve the workers / producers we're waiting
+                    // on under contention.
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
 
                 // Final drain: loop until the ring buffer is empty.
