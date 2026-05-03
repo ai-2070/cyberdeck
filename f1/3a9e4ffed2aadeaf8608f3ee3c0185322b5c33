@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/dedup_state.rs
+  726f3eb25aff9828 160-187,193-198,200,202-203,397-443
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  726f3eb25aff9828 9,352
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "f13a9e4ffed2aadeaf8608f3ee3c0185322b5c33",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 681,
+      "total_deletions": 3,
+      "accepted_lines": 455,
+      "overriden_lines": 2
+    }
+  }
+}
