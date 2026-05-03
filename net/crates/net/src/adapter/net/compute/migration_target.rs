@@ -241,6 +241,16 @@ impl MigrationTargetHandler {
     ///
     /// Events that arrive out-of-order are buffered in the BTreeMap and
     /// will be replayed in sequence order.
+    ///
+    /// Phase guard: once `activate()` has flipped the state to
+    /// `Cutover`, the normal delivery path is authoritative for this
+    /// daemon — a stale migration-path event arriving here would be
+    /// inserted into `pending_events` and `drain_pending` would
+    /// re-deliver it through the registry, producing duplicate
+    /// execution alongside the post-cutover normal-path delivery of
+    /// the same sequence. Reject `Cutover`/`Complete` events with
+    /// `Ok(false)` (same surface as a not-found origin) so the caller
+    /// treats the event as already-handled rather than retrying.
     pub fn buffer_event(
         &self,
         daemon_origin: u32,
@@ -252,6 +262,12 @@ impl MigrationTargetHandler {
         };
 
         let mut state = entry.lock();
+        if matches!(
+            state.phase,
+            MigrationPhase::Cutover | MigrationPhase::Complete
+        ) {
+            return Ok(false);
+        }
         state.pending_events.insert(event.link.sequence, event);
 
         // Try to drain any contiguous events
@@ -633,6 +649,62 @@ mod tests {
 
         // After buffering 1, 2, 3 should all be replayed in order
         assert_eq!(handler.replayed_through(origin), Some(3));
+    }
+
+    /// `buffer_event` must reject events once `activate()` has
+    /// flipped the migration to `Cutover`. Pre-fix the call would
+    /// insert the late event into `pending_events` and `drain_pending`
+    /// would re-deliver it through the daemon registry — duplicate
+    /// execution alongside the post-cutover normal-path delivery of
+    /// the same sequence. The fix returns `Ok(false)` (the same
+    /// surface as a missing migration entry), telling the caller to
+    /// treat the event as already-handled.
+    #[test]
+    fn buffer_event_rejects_post_cutover_events() {
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+
+        let snapshot = make_snapshot(&kp, 5, 5);
+
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        // Activate flips phase to Cutover; the daemon is now driven
+        // by the normal delivery path, not migration buffering.
+        handler.activate(origin).unwrap();
+        assert_eq!(handler.phase(origin), Some(MigrationPhase::Cutover));
+        let replayed_at_cutover = handler.replayed_through(origin).unwrap();
+
+        // A late migration-path event arriving after cutover MUST
+        // NOT be buffered — that would double-deliver against the
+        // normal-path delivery for the same sequence.
+        let accepted = handler
+            .buffer_event(origin, make_event(0xBBBB, replayed_at_cutover + 1))
+            .unwrap();
+        assert!(
+            !accepted,
+            "buffer_event must reject post-cutover events to avoid duplicate delivery",
+        );
+        // Replayed cursor must not have advanced — the event was
+        // dropped, not consumed.
+        assert_eq!(
+            handler.replayed_through(origin),
+            Some(replayed_at_cutover),
+            "replayed_through must not advance from a rejected post-cutover event",
+        );
     }
 
     #[test]
