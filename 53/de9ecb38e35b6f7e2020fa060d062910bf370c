@@ -1,0 +1,25 @@
+net/crates/net/src/bus.rs
+  726f3eb25aff9828 534-544,562,580,591-614
+net/crates/net/src/ffi/mod.rs
+  726f3eb25aff9828 1241-1245,1252-1255
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "53de9ecb38e35b6f7e2020fa060d062910bf370c",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3455,
+      "total_deletions": 2,
+      "accepted_lines": 46,
+      "overriden_lines": 0
+    }
+  }
+}
