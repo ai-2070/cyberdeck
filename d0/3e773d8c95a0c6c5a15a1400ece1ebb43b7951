@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/continuity/observation.rs
+  726f3eb25aff9828 14-20,57-78,90,103,146-153,293-369
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d03e773d8c95a0c6c5a15a1400ece1ebb43b7951",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 418,
+      "total_deletions": 1,
+      "accepted_lines": 486,
+      "overriden_lines": 0
+    }
+  }
+}
