@@ -801,6 +801,25 @@ pub extern "C" fn net_poll(
         }
     };
 
+    // Reject buffers too small to even hold an empty-response
+    // JSON envelope. This catches the degenerate "tiny buffer"
+    // case before we hit the adapter — `BufferTooSmall` returned
+    // here means "no work was done, caller's cursor is unchanged."
+    // 256 bytes comfortably fits the empty-response JSON below
+    // even with a long echoed `next_id` cursor.
+    const MIN_RESPONSE_BUFFER: usize = 256;
+    if buffer_len < MIN_RESPONSE_BUFFER {
+        return NetError::BufferTooSmall.into();
+    }
+
+    // Stash the cursor before moving `request` into `poll()` so
+    // the post-poll fallback can echo it back to the caller. On
+    // overflow we write a minimal "no events delivered, cursor
+    // unchanged" response so the caller's next poll re-fetches
+    // the same range — events are not lost on idempotent
+    // adapters (Redis XRANGE, JetStream direct_get).
+    let cursor_snapshot = request.from_id.clone();
+
     // Poll
     let response = match handle.runtime.block_on(handle.bus.poll(request)) {
         Ok(r) => r,
@@ -835,8 +854,35 @@ pub extern "C" fn net_poll(
         Err(_) => return NetError::Unknown.into(),
     };
 
-    // Check buffer size
+    // Buffer overflow: emit a minimal fallback response that echoes
+    // the caller's original cursor as `next_id`. The caller's next
+    // poll runs against the same range and re-delivers the events
+    // (idempotent on Redis XRANGE / JetStream direct_get). Without
+    // this, a caller that trusts `next_id` blindly would advance
+    // past the unread batch.
     if response_json.len() + 1 > buffer_len {
+        let fallback = serde_json::to_string(&serde_json::json!({
+            "events": [],
+            "next_id": cursor_snapshot,
+            "has_more": true,
+            "count": 0,
+            "parse_errors": 0,
+            "buffer_too_small": true,
+            "events_dropped": total_events,
+        }))
+        .unwrap_or_else(|_| String::from(
+            r#"{"events":[],"next_id":null,"has_more":true,"count":0,"parse_errors":0,"buffer_too_small":true}"#
+        ));
+        if fallback.len() + 1 <= buffer_len {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    fallback.as_ptr() as *const c_char,
+                    out_buffer,
+                    fallback.len(),
+                );
+                *out_buffer.add(fallback.len()) = 0;
+            }
+        }
         return NetError::BufferTooSmall.into();
     }
 
