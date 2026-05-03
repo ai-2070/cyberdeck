@@ -1427,6 +1427,27 @@ pub struct NetReceipt {
     pub timestamp: u64,
 }
 
+// Pin layout invariants for `NetReceipt`. `#[repr(C)]` already
+// gives C ABI compatibility per platform, but doesn't catch a
+// future field-reorder or field-add — both would silently break
+// any C/Go/Python binding that hard-codes the struct layout.
+// Static asserts on 64-bit targets (the production deployment
+// shape) trip CI before such a change reaches a binary release.
+//
+// 64-bit: `u16 (2) + 6 pad + u64 (8)` = 16 bytes, alignment 8.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<NetReceipt>() == 16,
+    "NetReceipt size changed on 64-bit; bindings hard-code 16. \
+     If the change is intentional, bump the binding versions and \
+     update this assertion."
+);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::align_of::<NetReceipt>() == 8,
+    "NetReceipt alignment changed on 64-bit; bindings expect 8."
+);
+
 /// A single stored event for C consumers.
 ///
 /// # Safety contract for callers
@@ -1462,6 +1483,25 @@ pub struct NetEvent {
     /// Shard ID.
     pub shard_id: u16,
 }
+
+// Pin layout invariants for `NetEvent`. See `NetReceipt`'s
+// asserts for rationale. Bindings (C, Go, Python, Node) hard-
+// code 48 bytes on 64-bit; an accidental reorder or new field
+// would silently shift every offset.
+//
+// 64-bit: `4 × 8 (ptrs/usize) + u64 (8) + u16 (2) + 6 trail` = 48.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<NetEvent>() == 48,
+    "NetEvent size changed on 64-bit; bindings hard-code 48. \
+     If the change is intentional, bump the binding versions and \
+     update this assertion."
+);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::align_of::<NetEvent>() == 8,
+    "NetEvent alignment changed on 64-bit; bindings expect 8."
+);
 
 /// Poll result for C consumers.
 #[repr(C)]
