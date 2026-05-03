@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/linux.rs
+  726f3eb25aff9828 111,115,132-177,183
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "624fd7ec837ea24ad01890825951b66ebf12d047",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 627,
+      "total_deletions": 9,
+      "accepted_lines": 419,
+      "overriden_lines": 0
+    }
+  }
+}
