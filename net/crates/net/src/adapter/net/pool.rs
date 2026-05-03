@@ -194,7 +194,19 @@ impl PacketBuilder {
         header_bytes[12..16].copy_from_slice(&session_prefix_from_id(self.session_id));
         header_bytes[16..24].copy_from_slice(&counter.to_le_bytes());
 
-        // Patch payload_len to exclude the 16-byte auth tag (bytes 60..62)
+        // Patch payload_len to exclude the 16-byte auth tag (bytes 60..62).
+        // The `as u16` cast is safe under current MAX_PAYLOAD_SIZE
+        // (8112 << u16::MAX), but a future config that raised the cap
+        // past `u16::MAX + 16` would silently truncate the wire
+        // length and the receiver would mis-frame. The
+        // debug_assert is a tripwire so the truncation surfaces in
+        // CI before it reaches production.
+        debug_assert!(
+            self.payload.len() - 16 <= u16::MAX as usize,
+            "payload length {} would truncate the u16 wire field; \
+             revisit MAX_PAYLOAD_SIZE before raising the cap past u16::MAX + 16",
+            self.payload.len() - 16,
+        );
         let payload_len = (self.payload.len() - 16) as u16;
         header_bytes[60..62].copy_from_slice(&payload_len.to_le_bytes());
 
@@ -262,6 +274,15 @@ impl PacketBuilder {
 
         header_bytes[12..16].copy_from_slice(&session_prefix_from_id(self.session_id));
         header_bytes[16..24].copy_from_slice(&counter.to_le_bytes());
+        // See `build()` for why this debug_assert exists. Same
+        // safety argument: `as u16` truncates if MAX_PAYLOAD_SIZE
+        // is ever raised past u16::MAX + 16.
+        debug_assert!(
+            self.payload.len() - 16 <= u16::MAX as usize,
+            "payload length {} would truncate the u16 wire field; \
+             revisit MAX_PAYLOAD_SIZE before raising the cap past u16::MAX + 16",
+            self.payload.len() - 16,
+        );
         let payload_len = (self.payload.len() - 16) as u16;
         header_bytes[60..62].copy_from_slice(&payload_len.to_le_bytes());
 
