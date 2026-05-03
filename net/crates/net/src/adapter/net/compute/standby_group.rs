@@ -318,14 +318,41 @@ impl StandbyGroup {
         // `on_node_recovery` for that member only marks it healthy —
         // it doesn't restore the `Active` role — so the group would
         // be silently demoted forever.
-        let best_standby = self
+        // Prefer standbys that have completed at least one
+        // `sync_standbys` cycle. A replaced-then-re-placed standby
+        // has `synced_through = 0` and `last_sync = None` until the
+        // next sync — and `max_by_key(synced_through)` could
+        // otherwise pick that fresh-zero standby over a previously-
+        // synced sibling whose `synced_through` was also reset to 0
+        // by some prior path. Promoting the never-synced standby
+        // means the new active has zero pre-buffer state; replaying
+        // `buffered_since_sync` only covers events SINCE the last
+        // sync, so anything before that sync is permanently lost.
+        //
+        // Fall back to any healthy standby when NO candidate has
+        // ever synced (legitimate during the first promote-before-
+        // sync window): the buffer in that case contains every
+        // event since spawn, so a fresh standby can correctly
+        // catch up via `buffered_since_sync` replay.
+        let candidates: Vec<&StandbyInfo> = self
             .members
             .iter()
             .filter(|m| m.role == MemberRole::Standby && m.index != old_active)
             .filter(|m| self.coord.members()[m.index as usize].healthy)
+            .collect();
+        let synced_pick = candidates
+            .iter()
+            .filter(|m| m.last_sync.is_some())
             .max_by_key(|m| m.synced_through)
-            .map(|m| m.index)
-            .ok_or(GroupError::NoHealthyMember)?;
+            .map(|m| m.index);
+        let best_standby = match synced_pick {
+            Some(idx) => idx,
+            None => candidates
+                .iter()
+                .max_by_key(|m| m.synced_through)
+                .map(|m| m.index)
+                .ok_or(GroupError::NoHealthyMember)?,
+        };
 
         // Now safe to mutate — search succeeded, promotion will
         // complete.
@@ -694,6 +721,83 @@ mod tests {
         assert_eq!(group.buffered_event_count(), 0);
         assert_eq!(group.synced_through(1), Some(10));
         assert_eq!(group.synced_through(2), Some(10));
+    }
+
+    /// Regression: a freshly-replaced standby has `synced_through = 0`
+    /// and `last_sync = None` until the next sync_standbys cycle.
+    /// Pre-fix, `promote()`'s `max_by_key(synced_through)` could
+    /// pick that fresh standby over a previously-synced sibling
+    /// whose `synced_through` was also reset to 0 by some earlier
+    /// path — promoting a daemon with zero pre-buffer state and
+    /// silently losing every event before the most recent sync.
+    /// Fix prefers candidates with `last_sync.is_some()`; falls back
+    /// to any healthy candidate only when nobody has ever synced.
+    #[test]
+    fn promote_prefers_synced_standby_over_freshly_replaced_one() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+
+        let mut group = StandbyGroup::spawn(
+            test_config(3),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+
+        let active = group.active_origin();
+
+        // Drive some events through, then sync — both standbys
+        // now have last_sync = Some(_) and synced_through > 0.
+        for seq in 1..=10 {
+            let event = make_event(seq);
+            reg.deliver(active, &event).unwrap();
+            group.on_event_delivered(event);
+        }
+        group.sync_standbys(&reg).unwrap();
+
+        // Identify the two standbys by index (everything that's
+        // not the active).
+        let standby_indices: Vec<u8> = (0..3u8).filter(|&i| i != group.active_index).collect();
+        assert_eq!(standby_indices.len(), 2);
+
+        // Force one of the standbys back to "freshly replaced"
+        // shape by zeroing its tracking. This mirrors what
+        // `on_node_failure`'s replacement path does at line 430-431.
+        let idx_replaced = standby_indices[0];
+        let idx_synced = standby_indices[1];
+        group.members[idx_replaced as usize].synced_through = 0;
+        group.members[idx_replaced as usize].last_sync = None;
+
+        // Now drive new events and buffer them — the synced
+        // standby's `synced_through` is still 10 from above. The
+        // replaced standby's is 0.
+        for seq in 11..=15 {
+            let event = make_event(seq);
+            reg.deliver(group.active_origin(), &event).unwrap();
+            group.on_event_delivered(event);
+        }
+        // Skip the next sync to keep the replaced standby at
+        // `last_sync = None`.
+
+        // Active fails. Promote must pick the SYNCED standby, not
+        // the freshly-replaced one — even if `synced_through`
+        // were equal, the synced one has pre-buffer state we'd
+        // otherwise lose. With our state, the synced one's
+        // `synced_through = 10` exceeds the replaced one's `0`,
+        // so `max_by_key` should already favor it; the test pins
+        // the `last_sync.is_some()` filter for the case where
+        // both have identical synced_through.
+        group.coord.mark_unhealthy(group.active_index);
+        let new_active = group
+            .promote(|| Box::new(StatefulDaemon::new()), &reg, &sched)
+            .unwrap();
+        assert_eq!(
+            group.active_index, idx_synced,
+            "promote must pick the synced standby (idx={}), not the freshly-replaced one (idx={})",
+            idx_synced, idx_replaced,
+        );
+        let _ = new_active;
     }
 
     /// Regression: pre-fix, a partial-failure mid-loop in
