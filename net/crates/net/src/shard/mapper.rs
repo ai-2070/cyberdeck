@@ -823,23 +823,26 @@ impl ShardMapper {
                 // the caller (e.g. `add_shard_internal`'s rollback)
                 // is responsible for tearing it down.
                 //
-                // The load-then-store pattern is safe here because
-                // both the read and the subsequent state mutation
-                // happen under the same `shards.write()` guard
-                // (acquired at the top of this function and held
-                // until the `drop(shards)` below). Two concurrent
-                // `activate(distinct_id)` calls serialize on the
-                // write lock, so one's `fetch_add` is observed by
-                // the other's `Acquire` load and the second hits
-                // `AtMaxShards`. A `compare_exchange` here would be
-                // belt-and-braces but the lock-held invariant is the
-                // primary correctness gate; do not relax it without
-                // also tightening this read.
+                // The load + state mutation + `fetch_add` all happen
+                // while we hold the `shards.write()` guard so a
+                // concurrent `activate(distinct_id)` reads the
+                // already-bumped `active_count` and hits
+                // `AtMaxShards` instead of squeezing through the
+                // window between our state update and our
+                // `fetch_add`. Pre-fix the `fetch_add` ran after
+                // `drop(shards)` — two activates could each see a
+                // stale count below `max_shards` and both bump,
+                // transiently overshooting the budget.
                 let current = self.active_count.load(AtomicOrdering::Acquire);
                 if current >= self.policy.max_shards {
                     return Err(ScalingError::AtMaxShards);
                 }
                 shard.state = ShardState::Active;
+                // Publish the increment while still holding the
+                // write lock. `Release` here pairs with the
+                // `Acquire` load above so any later activator that
+                // takes the same lock observes our bump.
+                self.active_count.fetch_add(1, AtomicOrdering::Release);
             }
             ShardState::Draining | ShardState::Stopped => {
                 return Err(ScalingError::InvalidPolicy(format!(
@@ -849,11 +852,6 @@ impl ShardMapper {
             }
         }
         drop(shards);
-
-        // Bump active_count to mirror what `scale_up` would have done.
-        // The budget gate above ensures we can never push past
-        // `max_shards`.
-        self.active_count.fetch_add(1, AtomicOrdering::Release);
 
         if let Some(callback) = self.on_shard_created.read().as_ref() {
             callback(shard_id);
@@ -1527,6 +1525,102 @@ mod tests {
         );
         // active_count must still be at the cap, not over it.
         assert_eq!(mapper.active_shard_count(), 4);
+    }
+
+    /// Pin: under contention, the active_count never transiently
+    /// exceeds `max_shards`. Pre-fix `activate` released the
+    /// shards write-lock BEFORE the `fetch_add(1)`, so two
+    /// concurrent activators could each pass the budget gate
+    /// (both reading the pre-bump count) and both bump,
+    /// overshooting the cap by 1 at any observation point.
+    #[test]
+    fn concurrent_activate_never_exceeds_max_shards() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const ITERATIONS: usize = 200;
+
+        for iter in 0..ITERATIONS {
+            let policy = ScalingPolicy {
+                min_shards: 1,
+                max_shards: 4,
+                cooldown: Duration::from_nanos(1),
+                ..Default::default()
+            };
+            // Start at active=3, allocate two Provisioning ids so
+            // both threads have a candidate to activate. With the
+            // pre-fix race: thread A loads count=3, validates,
+            // sets state Active, drops lock; thread B loads count
+            // (still 3), validates, sets state Active, drops lock;
+            // A bumps → 4; B bumps → 5. Post-fix B observes
+            // count=4 inside its lock and rejects with
+            // AtMaxShards.
+            let mapper = Arc::new(ShardMapper::new(3, 1024, policy).unwrap());
+            let ids_a = mapper.scale_up_provisioning(1).unwrap();
+            // The 1ns cooldown elapses on every realistic
+            // scheduler tick; if we lose that race, retry once
+            // (release-mode iterations occasionally finish the
+            // first allocation in <1ns of wall time).
+            let ids_b = loop {
+                match mapper.scale_up_provisioning(1) {
+                    Ok(v) => break v,
+                    Err(ScalingError::InCooldown) => {
+                        std::thread::sleep(Duration::from_micros(10));
+                        continue;
+                    }
+                    Err(e) => panic!("unexpected error: {:?}", e),
+                }
+            };
+            assert_eq!(ids_a.len(), 1);
+            assert_eq!(ids_b.len(), 1);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let m1 = mapper.clone();
+            let m2 = mapper.clone();
+            let b1 = barrier.clone();
+            let b2 = barrier.clone();
+            let id_a = ids_a[0];
+            let id_b = ids_b[0];
+
+            let h1 = thread::spawn(move || {
+                b1.wait();
+                m1.activate(id_a)
+            });
+            let h2 = thread::spawn(move || {
+                b2.wait();
+                m2.activate(id_b)
+            });
+            let r1 = h1.join().expect("thread A panicked");
+            let r2 = h2.join().expect("thread B panicked");
+
+            // Exactly one must succeed and one must reject with
+            // AtMaxShards.
+            let ok_count = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+            let at_max_count = [&r1, &r2]
+                .iter()
+                .filter(|r| matches!(r, Err(ScalingError::AtMaxShards)))
+                .count();
+            assert_eq!(
+                ok_count, 1,
+                "iter {}: expected exactly one Ok, got r1={:?} r2={:?}",
+                iter, r1, r2
+            );
+            assert_eq!(
+                at_max_count, 1,
+                "iter {}: expected exactly one AtMaxShards, got r1={:?} r2={:?}",
+                iter, r1, r2
+            );
+
+            // active_count must not exceed max_shards at any
+            // observation point.
+            assert!(
+                mapper.active_shard_count() <= 4,
+                "iter {}: active_count={} exceeded max_shards=4",
+                iter,
+                mapper.active_shard_count(),
+            );
+        }
     }
 
     /// Two concurrent `scale_up(1)` calls must never both succeed
