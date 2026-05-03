@@ -4823,9 +4823,13 @@ impl MeshNode {
             Visibility::Global => true,
             Visibility::SubnetLocal => source.is_same_subnet(dest),
             Visibility::ParentVisible => {
-                source.is_same_subnet(dest)
-                    || source.is_ancestor_of(dest)
-                    || dest.is_ancestor_of(source)
+                // "Visible to the parent subnet but not siblings" —
+                // strictly upward. A child's broadcast reaches its
+                // own subnet (covered by `is_ancestor_of` since a
+                // subnet is its own ancestor) and any ancestor; a
+                // parent broadcasting down to descendants would leak
+                // region-scoped traffic and is rejected.
+                dest.is_ancestor_of(source)
             }
             Visibility::Exported => false,
         }
