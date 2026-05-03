@@ -128,7 +128,27 @@ impl JetStreamAdapter {
         }
 
         let parsed: StoredFormat = serde_json::from_slice(data)?;
-        let raw_bytes = Bytes::copy_from_slice(parsed.r.get().as_bytes());
+        // Reject `r: null` (or a missing `r` that round-trips
+        // through `RawValue` as the literal `null`) with a
+        // typed Fatal error rather than handing `b"null"` back
+        // as the event's raw bytes. Pre-fix downstream consumers
+        // that expected an object/array for `raw` got a 4-byte
+        // `null` literal — valid JSON, but not what an event
+        // payload should ever look like, and easy to mis-route
+        // through code that does `if raw.is_empty()` checks.
+        // The audit (#135) calls this out as "may surprise
+        // downstream consumers" — convert the surprise into a
+        // typed error at the boundary.
+        let raw_str = parsed.r.get();
+        if raw_str == "null" {
+            return Err(AdapterError::Fatal(format!(
+                "JetStream stored event seq={seq} has `r: null` — \
+                 the producer wrote either a literal JSON null or \
+                 omitted the field; downstream consumers expect a \
+                 non-null payload",
+            )));
+        }
+        let raw_bytes = Bytes::copy_from_slice(raw_str.as_bytes());
 
         // Pre-fix this was `... as u16`, which silently
         // wrapped on a stored shard_id > 65 535 (e.g. 100 000 →
