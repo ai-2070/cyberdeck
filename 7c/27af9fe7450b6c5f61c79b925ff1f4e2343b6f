@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/mesh.rs
+  726f3eb25aff9828 2748-2759,2761-2776
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "7c27af9fe7450b6c5f61c79b925ff1f4e2343b6f",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 8065,
+      "total_deletions": 0,
+      "accepted_lines": 398,
+      "overriden_lines": 0
+    }
+  }
+}
