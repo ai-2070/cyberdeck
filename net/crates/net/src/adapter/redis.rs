@@ -51,12 +51,19 @@
 //! - If the id is in the seen-set, skip the entry.
 //! - Otherwise, process the event and add the id to the set.
 //!
-//! The seen-set is a small LRU sized to the worst-case
-//! out-of-window dedup horizon the caller cares about (default
-//! configurations: a few thousand ids, ~minutes of in-flight at
-//! moderate throughput). The reference helper
-//! [`net_sdk::RedisStreamDedup`] (Rust SDK) provides exactly this;
-//! cross-language wrappers (NAPI / PyO3) ship in the bindings.
+//! The seen-set is an LRU sized to the worst-case
+//! out-of-window dedup horizon the caller cares about. The
+//! reference helper [`net_sdk::RedisStreamDedup`] (Rust SDK)
+//! ships with a 4 096-entry default tuned for low-throughput
+//! / short-window deployments; production callers must size
+//! explicitly via `RedisStreamDedup::with_capacity`. As a
+//! rough guideline, capacity must cover at least
+//! `peak_events_per_sec × out_of_order_tolerance_seconds`:
+//! 10 K events/sec with ~1 minute of tolerance needs ~600 K,
+//! and the default 4 096 covers ~0.4 s at that throughput —
+//! two orders of magnitude below the "minutes" horizon the
+//! older documentation implied. Cross-language wrappers
+//! (NAPI / PyO3) ship in the bindings.
 
 use async_trait::async_trait;
 use bytes::Bytes;
