@@ -334,7 +334,25 @@ impl Adapter for JetStreamAdapter {
         // producer when the persistent path is configured.
         // Use the batch's process_nonce field — bus-loaded once
         // and consistent across every batch from this bus instance.
-        let mut acks = Vec::with_capacity(serialized.len());
+        // Pipeline both phases of the publish:
+        //
+        // 1. Enqueue every event into JetStream in parallel —
+        //    `publish_with_headers` is async (it awaits the
+        //    `max_ack_pending` semaphore + the wire write) and
+        //    returns a `PublishAckFuture` once enqueued. Pre-fix
+        //    the loop awaited each `publish_with_headers` inline,
+        //    serializing the wire-side enqueue per event. On a
+        //    1ms-RTT link a 1k-event batch then cost ~1s wall
+        //    time despite the comment claiming "~1 RTT per
+        //    batch."
+        //
+        // 2. Await every `PublishAckFuture` in parallel — these
+        //    are the server acks; the existing code already
+        //    parallelized them via `try_join_all`.
+        //
+        // Both phases use `try_join_all` to short-circuit on the
+        // first error; the JetStream dedup window discards
+        // duplicates from a retry of the same batch.
         let mut msg_id_buf = String::new();
         let _ = write!(
             msg_id_buf,
@@ -343,41 +361,45 @@ impl Adapter for JetStreamAdapter {
         );
         let prefix_len = msg_id_buf.len();
 
+        let mut publishes = Vec::with_capacity(serialized.len());
         for (i, data) in serialized.into_iter().enumerate() {
             // Reset to the cached prefix and append `:{i}`.
             msg_id_buf.truncate(prefix_len);
             let _ = write!(msg_id_buf, ":{i}");
 
             let mut headers = async_nats::HeaderMap::new();
-            // `From<&str> for HeaderValue` copies the bytes into the
-            // header, so reusing `msg_id_buf` on the next iteration is
-            // safe — the header now owns its own copy.
+            // `From<&str> for HeaderValue` copies the bytes, so
+            // reusing `msg_id_buf` on the next iteration is safe.
             headers.insert("Nats-Msg-Id", msg_id_buf.as_str());
 
-            let ack = js
-                .publish_with_headers(subject.clone(), headers, data.into())
-                .await
-                .map_err(|e| {
-                    if is_transient_error(&e) {
-                        AdapterError::Transient(e.to_string())
-                    } else {
-                        AdapterError::Fatal(e.to_string())
-                    }
-                })?;
-            // `PublishAckFuture` implements `IntoFuture`, not `Future`,
-            // so it can't go straight into `try_join_all`. Wrap each
-            // in an async block that handles the await + error
-            // mapping in one place.
-            acks.push(async move {
-                ack.await
-                    .map_err(|e| AdapterError::Transient(e.to_string()))
-            });
+            // Push the un-awaited future. `js.publish_with_headers`
+            // borrows `js`, which lives for the rest of this
+            // function — fine for `try_join_all` here.
+            publishes.push(js.publish_with_headers(
+                subject.clone(),
+                headers,
+                data.into(),
+            ));
         }
 
-        // Await all server acks in parallel. `try_join_all` short-
-        // circuits on the first error, which is the desired retry
-        // semantic — the JetStream stream's dedup window will discard
-        // duplicates on the retry.
+        // Phase 1: enqueue all events in parallel.
+        let ack_futures = futures::future::try_join_all(publishes)
+            .await
+            .map_err(|e| {
+                if is_transient_error(&e) {
+                    AdapterError::Transient(e.to_string())
+                } else {
+                    AdapterError::Fatal(e.to_string())
+                }
+            })?;
+
+        // Phase 2: await all server acks in parallel.
+        // `PublishAckFuture` implements `IntoFuture` (not `Future`),
+        // so wrap each in an async block to call `.await`.
+        let acks = ack_futures.into_iter().map(|ack| async move {
+            ack.await
+                .map_err(|e| AdapterError::Transient(e.to_string()))
+        });
         futures::future::try_join_all(acks).await?;
 
         tracing::trace!(
