@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/crypto.rs
+  726f3eb25aff9828 427-443,470-480,1070-1147,1246-1254,1261-1269,1271-1273,1276-1278,1391-1396,1400-1404,1407-1408,1411-1424
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  726f3eb25aff9828 9,310,340
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "091896a11f30c52f7390201072f399de84940a04",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 164,
+      "total_deletions": 31,
+      "accepted_lines": 528,
+      "overriden_lines": 3
+    }
+  }
+}
