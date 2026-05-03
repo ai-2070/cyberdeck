@@ -359,9 +359,12 @@ fn test_start_migration_auto_no_targets() {
     let err = orch
         .start_migration_auto(origin, 0x1111, &scheduler, &CapabilityFilter::default())
         .unwrap_err();
+    // start_migration_auto surfaces the typed NoTargetAvailable
+    // when the scheduler finds no candidate; TargetUnavailable(_)
+    // is reserved for paths that already had a specific target id.
     match err {
-        net::adapter::net::MigrationError::TargetUnavailable(_) => {}
-        _ => panic!("expected TargetUnavailable, got {:?}", err),
+        net::adapter::net::MigrationError::NoTargetAvailable => {}
+        _ => panic!("expected NoTargetAvailable, got {:?}", err),
     }
 }
 
