@@ -287,6 +287,15 @@ pub enum NetError {
     /// pair without verifying they were created from the same node,
     /// allowing silent cross-session traffic.
     MismatchedHandles = -10,
+    /// `CString::new` failure: the input bytes are valid UTF-8 by
+    /// Rust's `String` invariant but contain an interior NUL byte
+    /// — and the C ABI cannot represent that, since C strings are
+    /// NUL-terminated. Pre-fix this was reported as
+    /// `InvalidUtf8`, which was wrong: the input is UTF-8-valid;
+    /// it just has a NUL where C expects it not to. A binding
+    /// reading the typed error and seeing "invalid UTF-8" would
+    /// chase the wrong cause.
+    InteriorNul = -11,
     /// Unknown error.
     Unknown = -99,
 }
@@ -1641,9 +1650,16 @@ pub extern "C" fn net_poll_ex(
         Some(ref s) => match std::ffi::CString::new(s.as_str()) {
             Ok(c) => c.into_raw(),
             Err(_) => {
-                // Free already-allocated events before returning error
+                // Free already-allocated events before returning
+                // error. `s.as_str()` is valid UTF-8 by `String`
+                // invariant, so this is the interior-NUL path —
+                // an upstream cursor id that contains `\0` cannot
+                // round-trip through a C string. Pre-fix this
+                // returned `InvalidUtf8`, which mis-described
+                // the cause; bindings now see the more accurate
+                // `InteriorNul`.
                 free_events_array(events_ptr, count);
-                return NetError::InvalidUtf8.into();
+                return NetError::InteriorNul.into();
             }
         },
         None => ptr::null_mut(),
@@ -1983,7 +1999,7 @@ mod tests {
         // Rust source, this list — AND both headers — must be
         // updated together. The asserts that follow then catch a
         // missing header update at the next CI run.
-        let rust_values: &[i32] = &[0, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -99];
+        let rust_values: &[i32] = &[0, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -99];
 
         // Pull every numeric literal that looks like an enum-value
         // assignment (`= <number>` followed by `,` or whitespace).
