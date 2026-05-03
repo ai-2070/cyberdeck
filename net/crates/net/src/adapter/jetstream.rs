@@ -572,15 +572,16 @@ impl Adapter for JetStreamAdapter {
 
             match stream.direct_get(current_seq).await {
                 Ok(msg) => {
-                    last_seen_seq = Some(current_seq);
                     consecutive_not_found = 0;
                     match Self::deserialize_event(current_seq, &msg.payload) {
-                        Ok(event) => events.push(event),
+                        Ok(event) => {
+                            events.push(event);
+                            last_seen_seq = Some(current_seq);
+                        }
                         // Per-record JSON corruption is treated as a
                         // skippable hole in the stream — the cursor
-                        // still advances (`last_seen_seq` is set
-                        // above) so the consumer doesn't re-fetch the
-                        // bad record forever.
+                        // still advances so the consumer doesn't
+                        // re-fetch the bad record forever.
                         Err(e @ AdapterError::Serialization(_)) => {
                             tracing::warn!(
                                 stream = %self.stream_name(shard_id),
@@ -588,34 +589,52 @@ impl Adapter for JetStreamAdapter {
                                 error = %e,
                                 "Failed to deserialize event, skipping"
                             );
+                            last_seen_seq = Some(current_seq);
                         }
                         // `deserialize_event` returns
                         // `AdapterError::Fatal` when the stored
                         // record is structurally corrupt (e.g.
                         // `shard_id` outside the u16 range, where
                         // silent truncation would mis-route the
-                        // event). Propagating these surfaces the
-                        // corruption at parse time as the original
-                        // fix intended; logging-and-skipping would
-                        // re-bury it under the existing "wrong
-                        // shard" symptom downstream.
+                        // event). Return the good prefix
+                        // accumulated so far with the cursor
+                        // pointing at the LAST GOOD seq (i.e. the
+                        // last one the consumer actually saw), so
+                        // a retry of `poll_shard` re-walks just
+                        // the corrupt record and surfaces the
+                        // Fatal error at that exact seq — without
+                        // also re-emitting the good prefix as
+                        // duplicates.
                         //
-                        // Caveat: any events the loop has
-                        // *already* accumulated in `events` are
-                        // dropped here — the caller sees the
-                        // `Fatal` error and never the partial
-                        // batch. The cursor was not yet returned,
-                        // so a retry of `poll_shard` would
-                        // re-walk those sequences from the start.
-                        // Acceptable because `Fatal` is non-
-                        // retryable (`is_retryable` returns
-                        // false): the caller is expected to
-                        // surface the corruption to operators
-                        // rather than retry, so the dropped
-                        // prefix is a diagnostic price for
-                        // making the corruption observable, not
-                        // a silent data loss.
-                        Err(e) => return Err(e),
+                        // Pre-fix this returned `Err(e)` directly,
+                        // dropping the accumulated `events`. A
+                        // consumer that retried after operator
+                        // recovery (or that the bus retry loop
+                        // didn't gate via `is_retryable`) would
+                        // re-poll from the previous cursor and
+                        // re-emit the entire good prefix —
+                        // duplicate delivery on every Fatal.
+                        Err(e) => {
+                            tracing::error!(
+                                stream = %self.stream_name(shard_id),
+                                seq = current_seq,
+                                accumulated = events.len(),
+                                error = %e,
+                                "JetStream: structurally-corrupt event; \
+                                 returning good prefix with cursor at last \
+                                 good seq so retry surfaces Fatal at the \
+                                 exact corrupt seq"
+                            );
+                            // Cursor stays at `last_seen_seq` —
+                            // not advanced past `current_seq`.
+                            // Build the SubmitOutcome and return.
+                            let next_id = last_seen_seq.map(|s| s.to_string());
+                            return Ok(ShardPollResult {
+                                events,
+                                next_id,
+                                has_more: true,
+                            });
+                        }
                     }
                     current_seq += 1;
                 }
