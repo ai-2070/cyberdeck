@@ -927,7 +927,7 @@ impl MigrationOrchestrator {
         daemon_origin: u32,
         source_node: u64,
         target_node: u64,
-    ) -> Result<MigrationMessage, MigrationError> {
+    ) -> Result<Vec<MigrationMessage>, MigrationError> {
         // Atomic check-and-insert via entry() to prevent TOCTOU races
         let entry = match self.migrations.entry(daemon_origin) {
             dashmap::mapref::entry::Entry::Occupied(_) => {
@@ -1018,13 +1018,20 @@ impl MigrationOrchestrator {
                 started_at: Instant::now(),
             }));
 
-            Ok(MigrationMessage::SnapshotReady {
-                daemon_origin,
-                snapshot_bytes,
-                seq_through,
-                chunk_index: 0,
-                total_chunks: 1,
-            })
+            // Pre-fix this returned a single `SnapshotReady`
+            // with `chunk_index: 0, total_chunks: 1` regardless
+            // of `snapshot_bytes.len()`. Any snapshot larger
+            // than `MAX_SNAPSHOT_CHUNK_SIZE` (7 KB) was
+            // rejected at the wire encoder
+            // (`migration_handler.rs:336`) and the receiver
+            // dropped it as `ChunkTooLarge`. Locally-initiated
+            // migration of any stateful daemon with a
+            // non-trivial state vector (cached models, large
+            // bindings, behaviour history) thus could not be
+            // sent at all. Route through `chunk_snapshot` so a
+            // multi-chunk snapshot returns multiple messages
+            // for the caller to dispatch in order.
+            chunk_snapshot(daemon_origin, snapshot_bytes, seq_through)
         } else {
             let source_head = CausalLink::genesis(daemon_origin, 0);
             let superposition = SuperpositionState::new(daemon_origin, source_head);
@@ -1035,10 +1042,10 @@ impl MigrationOrchestrator {
                 started_at: Instant::now(),
             }));
 
-            Ok(MigrationMessage::TakeSnapshot {
+            Ok(vec![MigrationMessage::TakeSnapshot {
                 daemon_origin,
                 target_node,
-            })
+            }])
         }
     }
 
@@ -1055,14 +1062,14 @@ impl MigrationOrchestrator {
         source_node: u64,
         scheduler: &super::Scheduler,
         daemon_filter: &crate::adapter::net::behavior::capability::CapabilityFilter,
-    ) -> Result<(u64, MigrationMessage), MigrationError> {
+    ) -> Result<(u64, Vec<MigrationMessage>), MigrationError> {
         let placement = scheduler
             .place_migration(daemon_filter, source_node)
             .map_err(|_| MigrationError::TargetUnavailable(0))?;
 
         let target_node = placement.node_id;
-        let msg = self.start_migration(daemon_origin, source_node, target_node)?;
-        Ok((target_node, msg))
+        let msgs = self.start_migration(daemon_origin, source_node, target_node)?;
+        Ok((target_node, msgs))
     }
 
     /// Handle snapshot taken on source (phase 1→2).
@@ -1523,12 +1530,13 @@ mod tests {
         let (reg, origin) = setup_registry();
         let orch = MigrationOrchestrator::new(reg, 0x1111);
 
-        let msg = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
-        match msg {
+        let msgs = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+        assert!(!msgs.is_empty(), "must emit at least one chunk");
+        match &msgs[0] {
             MigrationMessage::SnapshotReady { daemon_origin, .. } => {
-                assert_eq!(daemon_origin, origin);
+                assert_eq!(*daemon_origin, origin);
             }
-            _ => panic!("expected SnapshotReady"),
+            other => panic!("expected SnapshotReady, got {:?}", other),
         }
 
         assert!(orch.is_migrating(origin));
@@ -1681,16 +1689,17 @@ mod tests {
         let (reg, origin) = setup_registry();
         let orch = MigrationOrchestrator::new(reg, 0x3333);
 
-        let msg = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
-        match msg {
+        let msgs = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+        assert_eq!(msgs.len(), 1, "remote-source path emits exactly one TakeSnapshot");
+        match &msgs[0] {
             MigrationMessage::TakeSnapshot {
                 daemon_origin,
                 target_node,
             } => {
-                assert_eq!(daemon_origin, origin);
-                assert_eq!(target_node, 0x2222);
+                assert_eq!(*daemon_origin, origin);
+                assert_eq!(*target_node, 0x2222);
             }
-            _ => panic!("expected TakeSnapshot"),
+            other => panic!("expected TakeSnapshot, got {:?}", other),
         }
 
         assert_eq!(orch.status(origin), Some(MigrationPhase::Snapshot));
