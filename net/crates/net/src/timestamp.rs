@@ -160,13 +160,31 @@ impl TimestampGenerator {
         self.clock.raw()
     }
 
-    /// Convert a raw timestamp to approximate nanoseconds since epoch.
+    /// Convert a raw timestamp to nanoseconds since this
+    /// generator was constructed (i.e. since `baseline_raw`).
+    /// Output units match `next()`: the value returned by
+    /// `raw_to_nanos(self.now_raw())` is comparable to
+    /// recently-`next()`-returned timestamps from the same
+    /// generator (modulo the monotonicity floor `next()` enforces).
     ///
-    /// Note: This is approximate and should only be used for debugging
-    /// or logging, not for ordering guarantees.
+    /// Note: NOT "nanoseconds since UNIX epoch". The reference
+    /// point is the per-generator construction moment, so two
+    /// generators created at different times produce values with
+    /// different offsets. For wall-clock-anchored debugging,
+    /// combine with `SystemTime::now()` at generator-construction
+    /// time (recorded externally).
+    ///
+    /// Pre-fix this called `delta_as_nanos(0, raw)`, where the
+    /// `0` baseline was an unspecified quanta-internal reference
+    /// (typically system boot under Windows QPC or the clock's
+    /// first-call moment elsewhere). The returned ns values
+    /// were in the order of system uptime — not comparable to
+    /// `next()` output, despite the function's previous "ns
+    /// since epoch" doc-claim. Aligning both to `baseline_raw`
+    /// makes the surface consistent.
     #[inline]
     pub fn raw_to_nanos(&self, raw: u64) -> u64 {
-        self.clock.delta_as_nanos(0, raw)
+        self.clock.delta_as_nanos(self.baseline_raw, raw)
     }
 
     /// Get the last generated timestamp.
