@@ -248,9 +248,15 @@ impl MigrationTargetHandler {
     /// inserted into `pending_events` and `drain_pending` would
     /// re-deliver it through the registry, producing duplicate
     /// execution alongside the post-cutover normal-path delivery of
-    /// the same sequence. Reject `Cutover`/`Complete` events with
-    /// `Ok(false)` (same surface as a not-found origin) so the caller
-    /// treats the event as already-handled rather than retrying.
+    /// the same sequence. Reject `Cutover` events with `Ok(false)`
+    /// (same surface as a not-found origin) so the caller treats the
+    /// event as already-handled rather than retrying.
+    ///
+    /// `MigrationPhase::Complete` is not checked here because
+    /// `complete()` removes the entry from `self.migrations` rather
+    /// than advancing the phase: a `Complete`-phased entry never
+    /// exists in this map, and the `migrations.get` miss above
+    /// returns `Ok(false)` first.
     pub fn buffer_event(
         &self,
         daemon_origin: u32,
@@ -262,10 +268,7 @@ impl MigrationTargetHandler {
         };
 
         let mut state = entry.lock();
-        if matches!(
-            state.phase,
-            MigrationPhase::Cutover | MigrationPhase::Complete
-        ) {
+        if state.phase == MigrationPhase::Cutover {
             return Ok(false);
         }
         state.pending_events.insert(event.link.sequence, event);
@@ -704,6 +707,61 @@ mod tests {
             handler.replayed_through(origin),
             Some(replayed_at_cutover),
             "replayed_through must not advance from a rejected post-cutover event",
+        );
+    }
+
+    /// Companion to `buffer_event_rejects_post_cutover_events`: once
+    /// `complete()` has run, the migration entry is removed from
+    /// `self.migrations` (rather than transitioned to `Complete`),
+    /// so the `migrations.get` miss is the rejection path. Pin that
+    /// `buffer_event` returns `Ok(false)` and never resurrects the
+    /// removed entry. If a future refactor switches `complete()` to
+    /// keep the entry around with `MigrationPhase::Complete`, this
+    /// test surfaces the regression by failing — the caller then
+    /// owes a phase check matching the new shape.
+    #[test]
+    fn buffer_event_rejects_after_complete() {
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+
+        let snapshot = make_snapshot(&kp, 5, 5);
+
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        // Drive the migration to fully completed.
+        handler.activate(origin).unwrap();
+        handler.complete(origin).unwrap();
+        assert!(
+            !handler.is_migrating(origin),
+            "complete() must remove the migration entry from `migrations`",
+        );
+
+        // A post-complete `buffer_event` must not resurrect the
+        // entry or re-deliver through the registry.
+        let accepted = handler
+            .buffer_event(origin, make_event(0xBBBB, 99))
+            .unwrap();
+        assert!(
+            !accepted,
+            "buffer_event after complete() must return Ok(false)",
+        );
+        assert!(
+            !handler.is_migrating(origin),
+            "buffer_event must not resurrect the migration entry post-complete",
         );
     }
 
