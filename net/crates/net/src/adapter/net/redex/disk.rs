@@ -1192,8 +1192,27 @@ impl DiskSegment {
             if entry.is_inline() {
                 new_idx_bytes.extend_from_slice(&entry.to_bytes());
             } else {
+                // Heap entry offsets are absolute in the original
+                // dat. Rebase to the new dat by subtracting
+                // `dat_base`. By invariant, every surviving heap
+                // entry has `payload_offset >= dat_base` (dat_base
+                // is derived from the first surviving heap entry's
+                // offset), so a `< dat_base` value indicates the
+                // caller violated the invariant — surface as an
+                // error rather than silently writing 0 (which
+                // would point the entry at unrelated bytes in the
+                // new dat).
+                let abs = entry.payload_offset as u64;
+                let rebased = abs.checked_sub(dat_base).ok_or_else(|| {
+                    RedexError::Encode(format!(
+                        "compact_to: heap entry with payload_offset={} \
+                         below dat_base={} would corrupt the new dat \
+                         layout",
+                        abs, dat_base
+                    ))
+                })?;
                 let mut e = *entry;
-                e.payload_offset = (entry.payload_offset as u64).saturating_sub(dat_base) as u32;
+                e.payload_offset = rebased as u32;
                 new_idx_bytes.extend_from_slice(&e.to_bytes());
             }
         }
