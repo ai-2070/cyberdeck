@@ -1169,7 +1169,18 @@ impl EventBus {
         // worst-case shape (one partially-filled batch per worker,
         // each waiting its full `max_delay` to time out), capped at
         // 2 s — same upper bound as before.
-        let n_workers = self.batch_workers.lock().len();
+        //
+        // Read the worker count via the shard manager's atomic-
+        // backed `num_shards()` rather than `batch_workers.lock()
+        // .len()`. The previous spinlock-backed `.lock()` inside
+        // an `async fn` could stall the runtime worker thread
+        // under contention with concurrent `add_shard_internal` /
+        // `remove_shard_internal` callers; the atomic accessor is
+        // both faster and async-safe. Mismatch in the
+        // worker-count vs shard-count snapshot only changes the
+        // phase2 deadline by at most one `max_delay` step, which
+        // is bounded by the outer 2s cap regardless.
+        let n_workers = usize::from(self.shard_manager.num_shards());
         let phase2_budget = self
             .config
             .batch
