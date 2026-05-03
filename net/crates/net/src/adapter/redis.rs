@@ -467,14 +467,30 @@ impl Adapter for RedisAdapter {
 
         // XRANGE key start + COUNT limit
         // Returns array of [id, [field, value, field, value, ...]]
-        let results: Value = redis::cmd("XRANGE")
-            .arg(&*stream_key)
+        //
+        // Wrap the XRANGE in `command_timeout` so a slow or wedged
+        // Redis node doesn't block this poll indefinitely. Pre-fix
+        // `poll_shard` relied entirely on the `ConnectionManager`'s
+        // implicit timeout, while `on_batch` (line 408) and
+        // `is_healthy` (line 516) wrap their pipelines in
+        // `tokio::time::timeout(self.config.command_timeout, ...)`.
+        // The inconsistent timeout policy meant that a partially-
+        // healthy Redis (returns connections but stalls on commands)
+        // would let `on_batch` and `is_healthy` surface a Transient
+        // error within `command_timeout`, while `poll_shard` hung
+        // until Redis itself replied or the connection broke. Apply
+        // the same wrapper here so the timeout contract is uniform
+        // across the adapter.
+        let mut cmd = redis::cmd("XRANGE");
+        cmd.arg(&*stream_key)
             .arg(&start)
             .arg("+") // To end
             .arg("COUNT")
-            .arg(fetch_limit)
-            .query_async(&mut conn)
+            .arg(fetch_limit);
+        let fut = cmd.query_async::<Value>(&mut conn);
+        let results = tokio::time::timeout(self.config.command_timeout, fut)
             .await
+            .map_err(|_| AdapterError::Transient("Redis XRANGE timeout".into()))?
             .map_err(|e| AdapterError::Transient(e.to_string()))?;
 
         Ok(Self::parse_xrange_response(results, limit, &stream_key))
