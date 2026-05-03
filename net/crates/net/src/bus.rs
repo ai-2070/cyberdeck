@@ -1359,13 +1359,31 @@ impl EventBus {
         // time makes shutdown painful.
         let (drains, batch_handles): (Vec<_>, Vec<_>) = workers
             .into_iter()
-            .map(|(_shard_id, ShardWorkers { batch, drain, .. })| (drain, batch))
+            .map(|(shard_id, ShardWorkers { batch, drain, .. })| {
+                ((shard_id, drain), (shard_id, batch))
+            })
             .unzip();
-        // We don't care about individual results — `JoinError` from
-        // a panicking drain worker would already have surfaced
-        // through `tracing::error` inside the worker itself. Just
-        // wait for all of them to terminate.
-        let _ = futures::future::join_all(drains).await;
+
+        // Surface drain-worker JoinErrors explicitly. The default
+        // Tokio runtime does NOT log spawned-task panics, so a
+        // `let _ = join_all(...)` would silently swallow a panic
+        // and mask stranded events. tracing::error per failure
+        // makes the incident grep-able post-mortem.
+        let drain_handles: Vec<_> = drains.into_iter().map(|(_, h)| h).collect();
+        let drain_ids: Vec<u16> = batch_handles.iter().map(|(id, _)| *id).collect();
+        for (shard_id, result) in drain_ids
+            .iter()
+            .copied()
+            .zip(futures::future::join_all(drain_handles).await)
+        {
+            if let Err(e) = result {
+                tracing::error!(
+                    shard_id,
+                    error = %e,
+                    "drain worker JoinHandle errored on shutdown await"
+                );
+            }
+        }
 
         // 3. Drop the original senders so the channels close once
         //    drain-worker sender clones (already dropped above)
@@ -1376,8 +1394,21 @@ impl EventBus {
         // 4. Await batch workers. They drain their channel until
         //    `recv() = None`, flush, and exit.
         //
-        // Same parallelization as the drain phase.
-        let _ = futures::future::join_all(batch_handles).await;
+        // Same parallelization as the drain phase, with the same
+        // explicit JoinError surfacing.
+        let batch_only: Vec<_> = batch_handles.into_iter().map(|(_, h)| h).collect();
+        for (shard_id, result) in drain_ids
+            .into_iter()
+            .zip(futures::future::join_all(batch_only).await)
+        {
+            if let Err(e) = result {
+                tracing::error!(
+                    shard_id,
+                    error = %e,
+                    "BatchWorker JoinHandle errored on shutdown await"
+                );
+            }
+        }
 
         // Flush and shutdown adapter (with timeout to prevent hanging)
         let timeout = self.config.adapter_timeout;
