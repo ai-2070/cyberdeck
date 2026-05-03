@@ -1,0 +1,23 @@
+net/crates/net/src/ffi/mod.rs
+  726f3eb25aff9828 1968-2006
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "90249bc42fcd9d650fd1a1ab14155d651f5a5c3e",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3985,
+      "total_deletions": 0,
+      "accepted_lines": 409,
+      "overriden_lines": 0
+    }
+  }
+}
