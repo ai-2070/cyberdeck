@@ -782,14 +782,25 @@ impl RecoveryManager {
 
     /// Handle a node failure
     pub fn on_failure(&self, node_id: u64, alternates: Vec<u64>) -> RecoveryAction {
-        self.failed_nodes.insert(
-            node_id,
-            FailedNodeState {
+        // Repeat failures must NOT reset `failed_at` or
+        // `retry_count`. A flapping peer that fails, gets one or
+        // more retries, then fails again would otherwise have its
+        // retry budget restored from zero each time and never
+        // reach `max_retries` in `get_action`. Preserve the
+        // existing state on a repeat; refresh `alternates` so a
+        // newly-discovered reroute path takes effect.
+        self.failed_nodes
+            .entry(node_id)
+            .and_modify(|s| {
+                if !alternates.is_empty() {
+                    s.alternates = alternates.clone();
+                }
+            })
+            .or_insert_with(|| FailedNodeState {
                 failed_at: Instant::now(),
                 retry_count: 0,
                 alternates: alternates.clone(),
-            },
-        );
+            });
 
         if !alternates.is_empty() {
             self.reroutes.fetch_add(1, Ordering::Relaxed);
@@ -1268,6 +1279,89 @@ mod tests {
         let stats = mgr.stats();
         assert_eq!(stats.reroutes, 1);
         assert_eq!(stats.queued, 1);
+    }
+
+    /// Pin: a flapping peer (fail, retry, fail, retry, ...) must
+    /// reach `max_retries` and be dropped. Pre-fix `on_failure`
+    /// unconditionally re-`insert`-ed the node, resetting
+    /// `retry_count` to 0 every time, so `get_action` never saw
+    /// the count climb past 1 and the node was retried forever.
+    #[test]
+    fn on_failure_preserves_retry_count_on_repeat() {
+        let mgr = RecoveryManager::new();
+        let node = 0x42u64;
+        let max_retries = 3u32;
+
+        // Failure 1 → enters the failed list with retry_count=0,
+        // no alternates so action is Queue.
+        let action = mgr.on_failure(node, vec![]);
+        assert!(matches!(action, RecoveryAction::Queue));
+
+        // Drive `get_action` to bump retry_count up to the cap.
+        for expected_count in 1..=max_retries {
+            match mgr.get_action(node, max_retries) {
+                RecoveryAction::Retry { .. } => {}
+                other => panic!(
+                    "expected Retry on attempt {} (count would become {}), got {:?}",
+                    expected_count, expected_count, other
+                ),
+            }
+        }
+
+        // Now simulate a re-failure WITHOUT recovery in between
+        // (the flapping case). Pre-fix this re-`insert`-ed and
+        // wiped `retry_count` back to 0, restoring an unbounded
+        // retry budget.
+        let _ = mgr.on_failure(node, vec![]);
+
+        // The very next `get_action` must return Drop — the
+        // budget set by the prior Retries should still apply.
+        match mgr.get_action(node, max_retries) {
+            RecoveryAction::Drop { .. } => {}
+            other => panic!(
+                "expected Drop after exhausting retries across a flap; got {:?} \
+                 (pre-fix on_failure reset retry_count to 0 on repeat)",
+                other
+            ),
+        }
+    }
+
+    /// Pin: a repeat `on_failure` carrying newly-discovered
+    /// alternates must update the alternates list (so a node
+    /// that was unreachable can become reroutable when topology
+    /// changes), but must NOT reset `retry_count`.
+    #[test]
+    fn on_failure_repeat_updates_alternates_without_resetting_count() {
+        let mgr = RecoveryManager::new();
+        let node = 0x99u64;
+        let max_retries = 2u32;
+
+        // First failure with no alternates → Queue.
+        let _ = mgr.on_failure(node, vec![]);
+        // Bump the retry count once via get_action.
+        let _ = mgr.get_action(node, max_retries);
+
+        // Second failure now learns of an alternate — semantics
+        // should switch to Reroute, but the prior retry_count
+        // must be preserved.
+        let action = mgr.on_failure(node, vec![0xDEAD]);
+        match action {
+            RecoveryAction::Reroute { via } => assert_eq!(via, vec![0xDEAD]),
+            other => panic!("expected Reroute, got {:?}", other),
+        }
+
+        // One more get_action without alternates path: clear
+        // alternates and confirm retry budget is exhausted at
+        // max_retries (count was 1 after first get_action; one
+        // more retry brings it to 2; the next call must Drop).
+        if let Some(mut s) = mgr.failed_nodes.get_mut(&node) {
+            s.alternates.clear();
+        }
+        let _ = mgr.get_action(node, max_retries); // count → 2 (== max)
+        match mgr.get_action(node, max_retries) {
+            RecoveryAction::Drop { .. } => {}
+            other => panic!("expected Drop after exhausting retries; got {:?}", other),
+        }
     }
 
     /// Regression: BUG_REPORT.md #14 — `heartbeat` and `check_all`
