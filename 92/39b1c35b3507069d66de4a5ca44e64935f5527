@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/pool.rs
+  726f3eb25aff9828 566-577,583,613-619,680,699-707,765-773,1219-1279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "9239b1c35b3507069d66de4a5ca44e64935f5527",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1443,
+      "total_deletions": 3,
+      "accepted_lines": 100,
+      "overriden_lines": 0
+    }
+  }
+}
