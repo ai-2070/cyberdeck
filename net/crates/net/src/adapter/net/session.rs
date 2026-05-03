@@ -1127,9 +1127,15 @@ impl StreamState {
                 .is_ok()
             {
                 // Bump the committed-bytes counter only after the
-                // CAS wins, so a concurrent grant reconciling against
-                // `tx_bytes_sent` doesn't see inflated in-flight
-                // bytes.
+                // CAS wins. The reverse order (bump then CAS) lets
+                // a concurrent grant observe the bumped watermark,
+                // mint credit up to the window, and then the
+                // pending admission's CAS subtracts that credit —
+                // net loss of one unit per grant-vs-admission race.
+                // The narrow truncation window the audit highlighted
+                // (#97) is self-healing via the next grant; the
+                // window-invariant violation in the alternative
+                // ordering is not.
                 self.tx_bytes_sent
                     .fetch_add(bytes as u64, Ordering::Relaxed);
                 return true;
