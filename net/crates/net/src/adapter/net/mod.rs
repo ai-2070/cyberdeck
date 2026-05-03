@@ -437,6 +437,15 @@ impl NetAdapter {
         let mut attempt = 0;
         let max_attempts = self.config.handshake_retries;
 
+        // Cap per-attempt sleep so a misconfigured `handshake_retries`
+        // near `MAX_HANDSHAKE_RETRIES` (1024) cannot pin `init()` for
+        // hours. Pre-fix `100 * attempt` grew linearly and unbounded:
+        // attempt 1024 slept ~102s, with cumulative wait across all
+        // attempts approaching 14 hours. Capping at 5s gives bounded
+        // worst-case `max_attempts × 5s` (~85 minutes at the cap),
+        // which is still long but not unbounded.
+        const HANDSHAKE_RETRY_SLEEP_CAP_MS: u64 = 5_000;
+
         loop {
             attempt += 1;
             match self.try_handshake(socket).await {
@@ -448,8 +457,9 @@ impl NetAdapter {
                         error = %e,
                         "handshake failed, retrying"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
-                        .await;
+                    let backoff_ms =
+                        (100u64.saturating_mul(attempt as u64)).min(HANDSHAKE_RETRY_SLEEP_CAP_MS);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 }
                 Err(e) => return Err(e),
             }
