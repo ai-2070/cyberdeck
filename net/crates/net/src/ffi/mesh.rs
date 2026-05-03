@@ -2318,16 +2318,24 @@ fn gpu_vendor_to_string_cap(v: GpuVendor) -> &'static str {
     }
 }
 
-fn parse_modality_cap(s: &str) -> Modality {
+fn parse_modality_cap(s: &str) -> Option<Modality> {
     match s.to_ascii_lowercase().as_str() {
-        "text" => Modality::Text,
-        "image" => Modality::Image,
-        "audio" => Modality::Audio,
-        "video" => Modality::Video,
-        "code" => Modality::Code,
-        "embedding" => Modality::Embedding,
-        "tool-use" | "tool_use" | "tooluse" => Modality::ToolUse,
-        _ => Modality::Text,
+        "text" => Some(Modality::Text),
+        "image" => Some(Modality::Image),
+        "audio" => Some(Modality::Audio),
+        "video" => Some(Modality::Video),
+        "code" => Some(Modality::Code),
+        "embedding" => Some(Modality::Embedding),
+        "tool-use" | "tool_use" | "tooluse" => Some(Modality::ToolUse),
+        // Pre-fix unknown strings (typos) silently fell back to
+        // `Modality::Text`. For announce-capabilities that meant
+        // a node advertised "Text" support it didn't actually
+        // have; for find-nodes filters that meant a typo'd
+        // constraint (`require_modalities: ["audoi"]`) was
+        // re-interpreted as "require Text" and returned the
+        // wrong nodes. Now `None`; callers must handle the
+        // unknown case explicitly.
+        _ => None,
     }
 }
 
@@ -2591,7 +2599,18 @@ fn model_from_json(m: ModelJson) -> ModelCapability {
         mc = mc.with_quantization(q);
     }
     for modality in m.modalities {
-        mc = mc.add_modality(parse_modality_cap(&modality));
+        match parse_modality_cap(&modality) {
+            Some(parsed) => mc = mc.add_modality(parsed),
+            None => {
+                tracing::warn!(
+                    modality = %modality,
+                    "announce_capabilities: unknown modality string (typo?), \
+                     skipping rather than the pre-fix silent fallback to Text — \
+                     advertising a Text capability the node doesn't actually \
+                     have produced wrong scheduling decisions on the receiver",
+                );
+            }
+        }
     }
     if let Some(t) = m.tokens_per_sec {
         mc = mc.with_tokens_per_sec(t);
@@ -2698,7 +2717,31 @@ fn capability_filter_from_json(f: CapabilityFilterJson) -> CapabilityFilter {
         cf = cf.with_min_context(n);
     }
     for m in f.require_modalities {
-        cf = cf.require_modality(parse_modality_cap(&m));
+        match parse_modality_cap(&m) {
+            Some(parsed) => cf = cf.require_modality(parsed),
+            None => {
+                // For a filter, the lossy direction matters even
+                // more than for announce: pre-fix the typo'd
+                // string was re-interpreted as `require Text`,
+                // returning Text-capable nodes that did NOT
+                // satisfy the operator's intended constraint.
+                // Skipping the unknown is also imperfect (the
+                // resulting filter is too permissive — it
+                // returns more nodes than intended), but the
+                // failure mode is "scheduler matched too
+                // broadly" rather than "scheduler matched the
+                // wrong type." The loud warn surfaces the typo
+                // so operators can fix it.
+                tracing::warn!(
+                    modality = %m,
+                    "find_nodes: unknown modality string in require_modalities \
+                     filter (typo?), dropping the constraint; the resulting \
+                     filter is too permissive — pre-fix it was silently \
+                     re-interpreted as `require Text`, which returned the \
+                     wrong nodes",
+                );
+            }
+        }
     }
     cf
 }
@@ -3114,6 +3157,49 @@ mod tests {
         assert_eq!(saturating_u16_cap(u16::MAX as u32), u16::MAX);
         assert_eq!(saturating_u16_cap(u16::MAX as u32 + 1), u16::MAX);
         assert_eq!(saturating_u16_cap(u32::MAX), u16::MAX);
+    }
+
+    /// Regression: `parse_modality_cap` must surface unknown
+    /// modality strings as `None`, not silently fall back to
+    /// `Modality::Text`. Pre-fix a typo in announce-capabilities
+    /// like `"audoi"` advertised a Text capability the node
+    /// didn't have; in find-nodes filters, the same typo was
+    /// reinterpreted as `require Text` and returned the wrong
+    /// nodes. The strict shape lets callers handle the unknown
+    /// case explicitly (callers in this file warn-and-skip).
+    #[test]
+    fn parse_modality_cap_returns_none_on_unknown_strings() {
+        // Known values still parse.
+        for (s, expected) in [
+            ("text", Modality::Text),
+            ("Text", Modality::Text),
+            ("TEXT", Modality::Text),
+            ("image", Modality::Image),
+            ("audio", Modality::Audio),
+            ("video", Modality::Video),
+            ("code", Modality::Code),
+            ("embedding", Modality::Embedding),
+            ("tool-use", Modality::ToolUse),
+            ("tool_use", Modality::ToolUse),
+            ("tooluse", Modality::ToolUse),
+        ] {
+            assert_eq!(
+                parse_modality_cap(s),
+                Some(expected),
+                "known modality `{s}` must parse",
+            );
+        }
+
+        // Typos and unknowns return None, NOT Modality::Text.
+        for s in ["audoi", "imageX", "vidoe", "embeding", "garbage", ""] {
+            assert_eq!(
+                parse_modality_cap(s),
+                None,
+                "unknown modality `{s}` must return None — pre-fix this \
+                 fell back to Modality::Text, advertising a capability \
+                 the node didn't actually have",
+            );
+        }
     }
 
     /// Regression: `gpu_info_from_json` must saturate large
