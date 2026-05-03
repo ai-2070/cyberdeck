@@ -501,11 +501,29 @@ impl Serialize for StoredEvent {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("StoredEvent", 4)?;
         state.serialize_field("id", &self.id)?;
-        // Serialize raw bytes as a JSON value (parse then embed).
-        // Propagate errors rather than silently substituting null.
-        let value: JsonValue = serde_json::from_slice(&self.raw)
+        // Serialize raw bytes as a `RawValue` so the on-wire JSON
+        // is byte-for-byte the same as the input. Pre-fix the
+        // bytes were parsed into a `JsonValue` tree and re-
+        // serialized; the round-trip discarded original
+        // whitespace, normalized number formatting (`1.0` → `1`),
+        // and (without `preserve_order`) re-ordered map keys
+        // alphabetically. Any downstream that hashed or signed
+        // the serialized form and expected byte-equality with the
+        // input silently failed verification — a sneaky failure
+        // mode in audit / signing pipelines that look at the
+        // re-emitted JSON.
+        //
+        // `RawValue::from_string` validates the JSON (so the
+        // pre-existing "invalid raw JSON returns a serde error,
+        // not a silent null" guarantee is preserved), but emits
+        // the original bytes verbatim instead of round-tripping
+        // through a value tree.
+        let raw_str = std::str::from_utf8(&self.raw).map_err(|e| {
+            serde::ser::Error::custom(format!("invalid raw UTF-8: {}", e))
+        })?;
+        let raw_value = serde_json::value::RawValue::from_string(raw_str.to_string())
             .map_err(|e| serde::ser::Error::custom(format!("invalid raw JSON: {}", e)))?;
-        state.serialize_field("raw", &value)?;
+        state.serialize_field("raw", &*raw_value)?;
         state.serialize_field("insertion_ts", &self.insertion_ts)?;
         state.serialize_field("shard_id", &self.shard_id)?;
         state.end()
@@ -741,6 +759,49 @@ mod tests {
             result.is_err(),
             "serializing invalid raw bytes should error, not silently return null"
         );
+    }
+
+    /// Regression: `StoredEvent::Serialize` must preserve the
+    /// raw bytes byte-for-byte instead of round-tripping through
+    /// `serde_json::Value`. Pre-fix the round-trip discarded
+    /// original whitespace, normalized number formatting
+    /// (`1.0` → `1`), and re-ordered map keys alphabetically.
+    /// Any downstream that hashed or signed the serialized form
+    /// and expected byte-equality with the input silently failed
+    /// verification.
+    #[test]
+    fn stored_event_serialize_preserves_raw_byte_for_byte() {
+        // Pin three cases where the JsonValue round-trip
+        // demonstrably mutates the bytes:
+        // 1. Whitespace (round-trip strips internal whitespace).
+        // 2. Number formatting (`1.0` → `1`).
+        // 3. Key ordering (BTreeMap default re-orders alphabetically).
+        let cases: &[&[u8]] = &[
+            // Whitespace: extra spaces inside the object literal.
+            br#"{ "key" : "value" }"#,
+            // Number formatting: 1.0 (would become 1 via Value).
+            br#"{"x":1.0,"y":2.5}"#,
+            // Key ordering: "z" before "a" (BTreeMap would re-order).
+            br#"{"z":1,"a":2}"#,
+        ];
+
+        for raw_bytes in cases {
+            let raw = Bytes::copy_from_slice(raw_bytes);
+            let event = StoredEvent::new("id".into(), raw.clone(), 0, 0);
+            let json = serde_json::to_string(&event).unwrap();
+
+            // The serialized output must contain the input bytes
+            // verbatim (as-is, not re-formatted by serde_json).
+            let expected_raw = std::str::from_utf8(raw_bytes).unwrap();
+            assert!(
+                json.contains(expected_raw),
+                "regression: StoredEvent serialization must contain the raw \
+                 input verbatim (no whitespace stripping, no number \
+                 normalization, no key re-ordering).\n\
+                 input:  {expected_raw}\n\
+                 output: {json}"
+            );
+        }
     }
 
     /// Pin that `Batch::with_nonce` writes the passed value into the
