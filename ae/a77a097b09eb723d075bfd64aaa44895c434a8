@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/jetstream.rs
+  726f3eb25aff9828 192-198
+net/crates/net/src/config.rs
+  726f3eb25aff9828 542-558,574,578-582
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "aea77a097b09eb723d075bfd64aaa44895c434a8",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2251,
+      "total_deletions": 0,
+      "accepted_lines": 402,
+      "overriden_lines": 0
+    }
+  }
+}
