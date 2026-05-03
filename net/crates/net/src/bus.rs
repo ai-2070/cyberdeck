@@ -54,6 +54,18 @@ pub struct EventBus {
     adapter: Arc<dyn Adapter>,
     /// Poll merger for cross-shard consumption.
     poll_merger: arc_swap::ArcSwap<PollMerger>,
+    /// Serializes the `shard_manager.shard_ids() → poll_merger.store`
+    /// block in `add_shard_internal` / `remove_shard_internal`.
+    /// Without this lock, two callers (e.g. scaling-monitor
+    /// add_shard racing manual_scale_down's remove_shard) read the
+    /// shard ids snapshot at slightly different points and then
+    /// race on the `arc_swap.store`. The write that lands second
+    /// can clobber the more-current view: T1 reads `{0..5}`, T2
+    /// reads `{1..4}`, T2 stores `{1..4}`, T1 stores `{0..5}` —
+    /// the published merger then routes polls to the just-removed
+    /// shard 0 until the next topology change repairs the
+    /// snapshot.
+    poll_merger_swap_lock: parking_lot::Mutex<()>,
     /// Per-shard worker handles. Stored separately so shutdown can
     /// await drain workers *before* batch workers — the drain
     /// worker's final sweep races the batch worker's exit
@@ -336,6 +348,7 @@ impl EventBus {
             shard_manager,
             adapter,
             poll_merger,
+            poll_merger_swap_lock: parking_lot::Mutex::new(()),
             batch_workers: parking_lot::Mutex::new(batch_workers),
             batch_senders: parking_lot::RwLock::new(batch_senders),
             shutdown,
@@ -667,11 +680,18 @@ impl EventBus {
             return Err(AdapterError::Fatal(e.to_string()));
         }
 
-        // Update poll merger with the post-add id set.
-        self.poll_merger.store(Arc::new(PollMerger::new(
-            self.adapter.clone(),
-            self.shard_manager.shard_ids(),
-        )));
+        // Update poll merger with the post-add id set. Hold
+        // `poll_merger_swap_lock` across the snapshot-and-store so a
+        // concurrent remove_shard can't sneak between our `shard_ids()`
+        // read and our `arc_swap.store` and clobber the published view
+        // with a stale snapshot.
+        {
+            let _swap_guard = self.poll_merger_swap_lock.lock();
+            self.poll_merger.store(Arc::new(PollMerger::new(
+                self.adapter.clone(),
+                self.shard_manager.shard_ids(),
+            )));
+        }
 
         tracing::info!(shard_id = new_id, "Added new shard");
         Ok(new_id)
@@ -847,10 +867,16 @@ impl EventBus {
         // would still iterate `0..num_shards` and skip the live shard
         // whose id is now the largest, while polling a nonexistent /
         // recreated shard at the bottom of the range.
-        self.poll_merger.store(Arc::new(PollMerger::new(
-            self.adapter.clone(),
-            self.shard_manager.shard_ids(),
-        )));
+        //
+        // `poll_merger_swap_lock` serializes against
+        // `add_shard_internal`'s matching block — see the field doc.
+        {
+            let _swap_guard = self.poll_merger_swap_lock.lock();
+            self.poll_merger.store(Arc::new(PollMerger::new(
+                self.adapter.clone(),
+                self.shard_manager.shard_ids(),
+            )));
+        }
 
         tracing::info!(shard_id = shard_id, "Removed shard");
         Ok(())
