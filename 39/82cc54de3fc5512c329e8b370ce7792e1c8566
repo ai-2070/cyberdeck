@@ -1,0 +1,25 @@
+net/crates/net/tests/ffi_poll_buffer.rs
+  726f3eb25aff9828 28-30,70-115
+net/crates/net/src/ffi/mod.rs
+  726f3eb25aff9828 1460,1471-1481
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "3982cc54de3fc5512c329e8b370ce7792e1c8566",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1942,
+      "total_deletions": 2,
+      "accepted_lines": 61,
+      "overriden_lines": 0
+    }
+  }
+}
