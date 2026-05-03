@@ -1915,7 +1915,17 @@ impl MeshNode {
 
         let recv_handle = self.spawn_receive_loop();
         let heartbeat_handle = self.spawn_heartbeat_loop();
-        let router_handle = self.router.start();
+        let router_handle = match self.router.start() {
+            Some(h) => h,
+            None => {
+                tracing::warn!(
+                    "MeshNode::start called while the router dispatch loop \
+                     was already running; ignoring the duplicate start. \
+                     This usually indicates start() was invoked twice."
+                );
+                return;
+            }
+        };
         let capability_gc_handle = self.spawn_capability_gc_loop();
         let token_sweep_handle = self.spawn_token_sweep_loop();
         // Port-mapping task is opt-in — only spawned when the

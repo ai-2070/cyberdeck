@@ -555,15 +555,25 @@ impl NetRouter {
         self.socket.recv_from(buf).await
     }
 
-    /// Start the router (spawns send loop)
-    pub fn start(&self) -> tokio::task::JoinHandle<()> {
-        self.running.store(true, Ordering::Release);
+    /// Start the router (spawns send loop). Returns `None` if a
+    /// dispatch loop is already running for this router; calling
+    /// twice would otherwise spawn a second loop racing the first
+    /// one's `scheduler.dequeue()`, producing reordered or
+    /// duplicate sends.
+    pub fn start(&self) -> Option<tokio::task::JoinHandle<()>> {
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
 
         let socket = self.socket.clone();
         let scheduler = self.scheduler.clone();
         let running = self.running.clone();
 
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             while running.load(Ordering::Acquire) {
                 // Dequeue and send
                 if let Some(packet) = scheduler.dequeue() {
@@ -576,7 +586,7 @@ impl NetRouter {
                     }
                 }
             }
-        })
+        }))
     }
 
     /// Stop the router
@@ -800,6 +810,44 @@ mod tests {
 
         assert!(!router.is_running());
         assert_eq!(router.stats().routes, 0);
+    }
+
+    /// `start()` must spawn at most one dispatch loop. A second
+    /// call while the first loop is still running would race the
+    /// scheduler's `dequeue` and produce reordered or duplicate
+    /// sends.
+    #[tokio::test]
+    async fn start_is_idempotent_returns_none_when_already_running() {
+        let config = RouterConfig::new(0x1234, "127.0.0.1:0".parse().unwrap());
+        let router = NetRouter::new(config).await.unwrap();
+
+        let first = router.start();
+        assert!(first.is_some(), "first start() should spawn a loop");
+        assert!(router.is_running());
+
+        let second = router.start();
+        assert!(
+            second.is_none(),
+            "second start() while running must NOT spawn a duplicate loop",
+        );
+
+        // After stop(), the first loop exits and a fresh start()
+        // is allowed again.
+        router.stop();
+        // Give the loop a tick to observe `running == false`.
+        if let Some(h) = first {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+        }
+
+        let third = router.start();
+        assert!(
+            third.is_some(),
+            "start() after stop() should be allowed to spawn again",
+        );
+        router.stop();
+        if let Some(h) = third {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+        }
     }
 
     #[tokio::test]
