@@ -1,0 +1,27 @@
+net/crates/net/src/ffi/cortex.rs
+  726f3eb25aff9828 90-99,102
+net/crates/net/src/adapter/net/redex/file.rs
+  726f3eb25aff9828 1123
+net/crates/net/src/ffi/mesh.rs
+  726f3eb25aff9828 188-211,509,672,692,707,728,839,857,929,1241,1273,1307,1389,1569,1597,1599,1718,2707
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "55d0bc59b30eaae6a52b23a4e06393e7ba829a16",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 10488,
+      "total_deletions": 62,
+      "accepted_lines": 3835,
+      "overriden_lines": 2
+    }
+  }
+}
