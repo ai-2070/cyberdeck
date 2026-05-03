@@ -2036,4 +2036,60 @@ mod tests {
             );
         }
     }
+
+    /// Pin: zero values for `heartbeat_interval_ms` and
+    /// `session_timeout_ms` must reject the entire config (parser
+    /// returns `None`). Pre-fix the parser threaded `0` through
+    /// to `Duration::from_millis(0)`, which on the Net adapter's
+    /// heartbeat path results in a busy-loop that pegs a CPU and
+    /// produces no diagnostic — the FFI caller saw a successful
+    /// `net_init` followed by a hung daemon. The validator-level
+    /// guard for cooldown / metrics_window has no equivalent on
+    /// the Net-adapter side, so the parser is the only place that
+    /// can refuse the build.
+    #[cfg(feature = "net")]
+    #[test]
+    fn parse_config_rejects_zero_heartbeat_and_session_timeout() {
+        // 32-byte hex strings (64 chars) so `hex::decode` produces
+        // exactly the [u8; 32] the parser requires for `psk` and
+        // `peer_public_key`.
+        let psk = "0".repeat(64);
+        let peer_pk = "1".repeat(64);
+
+        // Sanity: a config with both fields *non-zero* must parse
+        // successfully — proves the rejection in the negative
+        // cases below is caused by the zero, not a missing
+        // required field on the surrounding `net` block.
+        let baseline = format!(
+            r#"{{"net":{{"bind_addr":"127.0.0.1:9000","peer_addr":"127.0.0.1:9001",
+                "psk":"{psk}","peer_public_key":"{peer_pk}",
+                "heartbeat_interval_ms":1000,"session_timeout_ms":30000}}}}"#
+        );
+        assert!(
+            parse_config_json(&baseline).is_some(),
+            "baseline net config with non-zero heartbeat/session_timeout must parse"
+        );
+
+        // heartbeat_interval_ms = 0 → reject.
+        let zero_hb = format!(
+            r#"{{"net":{{"bind_addr":"127.0.0.1:9000","peer_addr":"127.0.0.1:9001",
+                "psk":"{psk}","peer_public_key":"{peer_pk}",
+                "heartbeat_interval_ms":0,"session_timeout_ms":30000}}}}"#
+        );
+        assert!(
+            parse_config_json(&zero_hb).is_none(),
+            "heartbeat_interval_ms=0 must reject (pre-fix this produced a CPU-pegging busy loop)"
+        );
+
+        // session_timeout_ms = 0 → reject.
+        let zero_to = format!(
+            r#"{{"net":{{"bind_addr":"127.0.0.1:9000","peer_addr":"127.0.0.1:9001",
+                "psk":"{psk}","peer_public_key":"{peer_pk}",
+                "heartbeat_interval_ms":1000,"session_timeout_ms":0}}}}"#
+        );
+        assert!(
+            parse_config_json(&zero_to).is_none(),
+            "session_timeout_ms=0 must reject"
+        );
+    }
 }

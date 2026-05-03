@@ -2765,4 +2765,158 @@ mod tests {
 
         cleanup(&base);
     }
+
+    /// Source pin: the idx/dat truncations in
+    /// `pub(super) fn open` recovery MUST each be followed by
+    /// `sync_all()` on the same handle. Pre-fix the recovery code
+    /// did `set_len` without `sync_all`, so a crash between
+    /// truncation and the next durable write could leave the
+    /// torn tail on disk; on next reopen the dat-vs-idx
+    /// invariants would still hold transiently, but a later
+    /// append (which extends the file from the un-synced length
+    /// the OS buffers held) could resurrect the torn region.
+    ///
+    /// The ts (timestamp) sidecar uses `set_len(index.len() * 8)`
+    /// to align length with the (already-recovered) idx — a
+    /// crash here is idempotent because reopen recomputes the
+    /// same surviving index and applies the same alignment, so
+    /// that one set_len is intentionally NOT in scope of this
+    /// pin.
+    ///
+    /// We assert the two recovery-path truncations are present
+    /// in the post-fix shape: `set_len((index.len() * REDEX_ENTRY_SIZE)`
+    /// for idx and `set_len(retained_dat_end)` for dat. For each,
+    /// the next non-blank, non-comment, non-`?` continuation
+    /// line within a small window must contain `sync_all()`.
+    #[test]
+    fn recovery_idx_dat_truncations_must_be_paired_with_sync_all() {
+        let src = include_str!("disk.rs");
+
+        let header = "pub(super) fn open(";
+        let start = src
+            .find(header)
+            .expect("DiskSegment::open must exist");
+        let body_start = start + header.len();
+        let next_fn_offsets: Vec<usize> = ["\n    fn ", "\n    pub fn ", "\n    pub(super) fn "]
+            .iter()
+            .filter_map(|p| src[body_start..].find(p).map(|i| i + body_start))
+            .collect();
+        let next_fn = *next_fn_offsets
+            .iter()
+            .min()
+            .expect("a following fn must exist after open()");
+        let body = &src[start..next_fn];
+
+        let lines: Vec<&str> = body
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(idx) => &l[..idx],
+                None => l,
+            })
+            .collect();
+
+        // The two recovery-path truncations the audit's #11 fix
+        // added sync_all for. The ts-sidecar `set_len` is
+        // intentionally excluded (idempotent across crashes).
+        let in_scope_markers = [
+            "set_len((index.len() * REDEX_ENTRY_SIZE)",
+            "set_len(retained_dat_end)",
+        ];
+
+        let mut found_any = [false; 2];
+        let window = 5;
+        for (i, line) in lines.iter().enumerate() {
+            for (mi, marker) in in_scope_markers.iter().enumerate() {
+                if !line.contains(marker) {
+                    continue;
+                }
+                found_any[mi] = true;
+
+                let mut paired = false;
+                for off in 1..=window {
+                    if i + off >= lines.len() {
+                        break;
+                    }
+                    if lines[i + off].contains("sync_all()") {
+                        paired = true;
+                        break;
+                    }
+                }
+                assert!(
+                    paired,
+                    "regression: `{}` in DiskSegment::open recovery at \
+                     (relative) line {} is not followed within {} lines \
+                     by `sync_all()`. A crash between truncation and \
+                     the next durable write reincarnates the torn tail.",
+                    marker, i, window
+                );
+            }
+        }
+
+        for (mi, marker) in in_scope_markers.iter().enumerate() {
+            assert!(
+                found_any[mi],
+                "expected to find `{}` in DiskSegment::open — the \
+                 recovery walk's truncation step appears to have \
+                 been removed or refactored. Audit the new shape \
+                 to confirm the fsync pairing is preserved.",
+                marker
+            );
+        }
+    }
+
+    /// Source pin: `rollback_truncate` must poison the segment
+    /// on BOTH the open-failure and `set_len`-failure branches.
+    /// Pre-fix the rollback used `if let Ok(f) = OpenOptions::...`
+    /// and silently dropped the open error, leaving the segment
+    /// in a permanently-divergent state with no diagnostic. The
+    /// fixed shape uses `match` and stores `true` to
+    /// `self.poisoned` in every error arm.
+    #[test]
+    fn rollback_truncate_must_poison_on_failure() {
+        let src = include_str!("disk.rs");
+
+        let header = "fn rollback_truncate(";
+        let start = src
+            .find(header)
+            .expect("rollback_truncate must exist");
+        let body_start = start + header.len();
+        let next_fn_offsets: Vec<usize> = ["\n    fn ", "\n    pub fn ", "\n    pub(super) fn "]
+            .iter()
+            .filter_map(|p| src[body_start..].find(p).map(|i| i + body_start))
+            .collect();
+        let next_fn = *next_fn_offsets
+            .iter()
+            .min()
+            .expect("a following fn must exist after rollback_truncate");
+        let body = &src[start..next_fn];
+
+        // The `poisoned.store(true, Ordering::Release)` line
+        // must appear at least twice in the body (once for the
+        // set_len failure arm, once for the open failure arm).
+        // Pre-fix the function silently swallowed the open error
+        // — only one (or zero) `poisoned.store` calls were
+        // present. Two-or-more is the post-fix shape.
+        let poison_count = body.matches("poisoned.store(true").count();
+        assert!(
+            poison_count >= 2,
+            "regression: rollback_truncate must call \
+             `poisoned.store(true, ...)` in BOTH the open-failure \
+             and set_len-failure arms (saw {} occurrences). \
+             Pre-fix the open-failure arm silently dropped the \
+             error and left the segment divergent.",
+            poison_count
+        );
+
+        // The buggy pattern `if let Ok(f) = OpenOptions::` (which
+        // discards the Err and proceeds without poisoning) must
+        // not reappear inside this function.
+        assert!(
+            !body.contains("if let Ok(f) = OpenOptions::"),
+            "regression: rollback_truncate must not use the \
+             `if let Ok(f) = OpenOptions::...` shape — that \
+             discards the open error, the exact pre-fix bug. \
+             Use `match` and poison on the Err arm."
+        );
+    }
 }

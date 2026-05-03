@@ -1453,4 +1453,46 @@ mod tests {
         );
         let _ = detector;
     }
+
+    /// Pin: `get_action` on a node not in the failed list must
+    /// return a non-zero retry delay. Pre-fix the unfailed-node
+    /// branch returned `Retry { delay_ms: 0 }`, which a caller
+    /// dutifully respecting the delay would busy-loop on,
+    /// pegging a CPU. The fix returns the same first-step
+    /// backoff (100ms) the failed-node path uses on retry 1, so
+    /// the caller paces itself even when `get_action` was
+    /// called by mistake on a healthy node.
+    #[test]
+    fn get_action_on_unfailed_node_does_not_busy_loop() {
+        let mgr = RecoveryManager::new();
+        let untracked = 0xDEAD_BEEFu64;
+
+        // Sanity: node is not in the failed list.
+        assert!(
+            !mgr.is_failed(untracked),
+            "precondition: node must not be tracked as failed"
+        );
+
+        let action = mgr.get_action(untracked, 3);
+        match action {
+            RecoveryAction::Retry { delay_ms } => {
+                assert!(
+                    delay_ms > 0,
+                    "regression: get_action on an unfailed node returned \
+                     Retry {{ delay_ms: 0 }} — a delay-respecting caller \
+                     would busy-loop on this and saturate a CPU"
+                );
+                assert_eq!(
+                    delay_ms, 100,
+                    "first-step backoff should match the failed-node \
+                     path's retry-1 delay (100ms) so callers pace \
+                     consistently across both branches"
+                );
+            }
+            other => panic!(
+                "unfailed-node branch must return Retry, got {:?}",
+                other
+            ),
+        }
+    }
 }

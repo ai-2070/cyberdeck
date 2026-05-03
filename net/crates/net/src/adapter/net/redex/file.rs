@@ -2987,4 +2987,89 @@ mod tests {
         );
         f2.close().unwrap();
     }
+
+    /// Source pin: `sweep_retention` must build the renormalized
+    /// index in a temp `Vec` and only then swap it into
+    /// `state.index` / `state.timestamps`. Pre-fix the order was
+    /// (drain, evict, then `iter_mut()` rebase loop) — a panic in
+    /// the middle of the rebase loop left the index half-rebased
+    /// (some entries still pointing past the new compacted dat,
+    /// others rebased), so subsequent reads silently missed.
+    ///
+    /// This is a tripwire against a "simplification" PR that
+    /// reverts to in-place mutation: such a PR would compile and
+    /// pass every behavior test (no panic is ever injected mid-
+    /// loop in unit tests) but reintroduce the half-rebased
+    /// state on a real allocator/signal failure.
+    #[test]
+    fn sweep_retention_must_use_build_then_swap() {
+        let src = include_str!("file.rs");
+
+        // Locate `pub fn sweep_retention` and the next sibling
+        // `fn ` after it — that's our scope.
+        let header = "pub fn sweep_retention(";
+        let start = src
+            .find(header)
+            .expect("sweep_retention must exist");
+        let body_start = start + header.len();
+        let next_fn = src[body_start..]
+            .find("\n    fn ")
+            .or_else(|| src[body_start..].find("\n    pub fn "))
+            .expect("a following fn must exist (mod-private impl block)")
+            + body_start;
+        let body = &src[start..next_fn];
+
+        // Strip line comments so doc / pre-fix-history comments
+        // that mention the rejected pattern don't trip the
+        // negative assertion.
+        let body_no_comments: String = body
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(idx) => &l[..idx],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Phase-1 marker: a fresh local Vec built from
+        // `state.index.iter().skip(drop).map(...)`.
+        assert!(
+            body_no_comments.contains("let new_index"),
+            "regression: sweep_retention must build the new index \
+             into a temp `let new_index` Vec before mutating \
+             state.index. Building in-place reintroduces the \
+             half-rebased-on-panic hazard."
+        );
+        assert!(
+            body_no_comments.contains("let new_timestamps"),
+            "regression: sweep_retention must build the new \
+             timestamps Vec separately before mutating \
+             state.timestamps."
+        );
+
+        // Phase-2 marker: assignment to state.index / state.timestamps.
+        assert!(
+            body_no_comments.contains("state.index = new_index"),
+            "regression: sweep_retention's phase-2 swap into \
+             state.index must follow the temp-Vec build."
+        );
+        assert!(
+            body_no_comments.contains("state.timestamps = new_timestamps"),
+            "regression: sweep_retention's phase-2 swap into \
+             state.timestamps must follow the temp-Vec build."
+        );
+
+        // Negative pin: the in-place mutation pattern that was
+        // the pre-fix shape MUST NOT reappear inside this
+        // function body. The pre-fix used a `for ... iter_mut()`
+        // loop on `state.index` to rebase payload offsets after
+        // draining; reintroducing it brings back the half-rebased
+        // hazard.
+        assert!(
+            !body_no_comments.contains("state.index.iter_mut()"),
+            "regression: sweep_retention must not iter_mut() over \
+             state.index in place — that's the pre-fix pattern \
+             that left the index half-rebased on mid-loop panic."
+        );
+    }
 }
