@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/compute/mod.rs
+  726f3eb25aff9828 35
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  726f3eb25aff9828 925-949,1383-1396,1403,1405,1407,1963-2030
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  726f3eb25aff9828 9,308
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "60723b2f8552fc92a78c7ef1cf100be88e74e343",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 113,
+      "total_deletions": 17,
+      "accepted_lines": 482,
+      "overriden_lines": 2
+    }
+  }
+}
