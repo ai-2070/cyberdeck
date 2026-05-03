@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/compute/migration_source.rs
+  726f3eb25aff9828 49-57,66,125-157,166-169
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "1c592746be152722ef93e88efce10d92e5929fc9",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 511,
+      "total_deletions": 7,
+      "accepted_lines": 417,
+      "overriden_lines": 0
+    }
+  }
+}
