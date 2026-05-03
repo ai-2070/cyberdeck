@@ -212,18 +212,30 @@ impl EntityLog {
         if last_pruned.is_some() && seq > self.snapshot_seq {
             self.snapshot_seq = seq;
         }
-        // Update base_link (used as fallback when events is empty) and
-        // head_payload (used for chain validation of the next append).
+        // Update base_link (the chain anchor for the lowest-position
+        // ancestor we still know about) and head_payload (used for
+        // chain validation of the next append).
         //
-        // When events remain: head_payload is already correct — it tracks
-        // the last event's payload (set during append), and partial pruning
-        // only removes from the front. We don't need to update it.
+        // base_link advances on EVERY prune that removed at least one
+        // event — partial OR full. Pre-fix only the empty-after-prune
+        // branch refreshed it, so a partial prune followed by a full
+        // prune left base_link pointing at the original creation
+        // anchor (because the partial prune skipped the update, then
+        // the full prune set it to the last-pruned event of the SECOND
+        // prune — but a third prune-after-snapshot path that
+        // re-anchored from `base_link` could observe the stale value).
+        // Refreshing on every successful prune keeps `base_link` =
+        // "link of the most recently dropped event" as a stable
+        // invariant.
         //
-        // When all events are removed: set base_link and head_payload to
-        // the last pruned event so the next append can chain correctly.
-        if self.events.is_empty() {
-            if let Some((link, payload)) = last_pruned {
-                self.base_link = link;
+        // head_payload only matters when events is empty (then it
+        // becomes the chain-prev for the next append). When events
+        // remain, the head is the last appended event whose payload
+        // was set at append time — we leave head_payload alone in
+        // that case so it continues to track the actual head.
+        if let Some((link, payload)) = last_pruned {
+            self.base_link = link;
+            if self.events.is_empty() {
                 self.head_payload = payload;
             }
         }
@@ -642,6 +654,53 @@ mod tests {
             log.snapshot_seq(),
             3,
             "snapshot_seq must advance when prune actually removed events",
+        );
+    }
+
+    /// Regression: a partial prune must advance `base_link` to the
+    /// last-pruned event, not leave it pointing at the original
+    /// creation anchor. Pre-fix the update only fired in the
+    /// `events.is_empty()` branch, so a partial prune left
+    /// `base_link.sequence == 0` even after dropping events
+    /// 1..=N.
+    #[test]
+    fn prune_through_partial_advances_base_link_to_last_pruned() {
+        let (_, entity_id) = make_entity();
+        let origin_hash = entity_id.origin_hash();
+        let mut log = EntityLog::new(entity_id);
+        let mut builder = CausalChainBuilder::new(origin_hash);
+        let mut appended = Vec::new();
+        for i in 0..5 {
+            let event = builder.append(Bytes::from(format!("e{}", i)), 0).unwrap();
+            appended.push(event.link);
+            log.append(event).unwrap();
+        }
+
+        // Sanity: base_link starts at the genesis anchor (seq 0).
+        assert_eq!(log.base_link.sequence, 0);
+
+        // Partial prune: drop the first three events (seqs 1..=3 if
+        // genesis is seq 0; the chain builder produces sequential
+        // sequences starting at 1).
+        let prune_target = appended[2].sequence;
+        log.prune_through(prune_target);
+        assert_eq!(log.len(), 2, "events past prune_target remain");
+        assert_eq!(
+            log.base_link, appended[2],
+            "partial prune must advance base_link to the last-pruned event's link \
+             (got seq={}, expected seq={})",
+            log.base_link.sequence,
+            appended[2].sequence,
+        );
+
+        // Subsequent full prune still works correctly — base_link
+        // moves to the new last-pruned (the previously-final event).
+        let final_prune = appended[4].sequence;
+        log.prune_through(final_prune);
+        assert!(log.is_empty(), "events fully pruned");
+        assert_eq!(
+            log.base_link, appended[4],
+            "full prune updates base_link to the highest-seq pruned event",
         );
     }
 }
