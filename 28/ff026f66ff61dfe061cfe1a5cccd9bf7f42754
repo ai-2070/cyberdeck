@@ -1,0 +1,23 @@
+net/crates/net/sdk/src/compute.rs
+  726f3eb25aff9828 66-68,1366,1372-1384,1386-1394,1406-1414,1417-1424,1510-1577,2065,2072-2078,2080-2083,2093-2101,2104-2109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "28ff026f66ff61dfe061cfe1a5cccd9bf7f42754",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 4456,
+      "total_deletions": 4403,
+      "accepted_lines": 138,
+      "overriden_lines": 0
+    }
+  }
+}
