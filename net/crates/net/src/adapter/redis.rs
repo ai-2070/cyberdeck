@@ -477,25 +477,36 @@ impl Adapter for RedisAdapter {
             return false;
         }
 
-        // Pre-fix, the PING relied entirely on the
-        // `ConnectionManager`'s configured request timeout. If
-        // that's unset or large, a network partition leaves the
-        // health check blocked indefinitely, making the adapter
-        // appear "pending" rather than "unhealthy" — a real risk
-        // for liveness probes in orchestrators that treat slow
-        // health responses as "OK". Wrap explicitly in
-        // `command_timeout` so an unhealthy backend always
-        // returns `false` within a bounded window.
-        if let Ok(mut conn) = self.get_conn().await {
-            let cmd = redis::cmd("PING");
-            let fut = cmd.query_async::<String>(&mut conn);
-            matches!(
-                tokio::time::timeout(self.config.command_timeout, fut).await,
-                Ok(Ok(_))
-            )
-        } else {
-            false
-        }
+        // Use a dedicated single-shot multiplexed connection for
+        // the health check rather than the shared
+        // `ConnectionManager` used by `on_batch` / `poll_shard`.
+        // `tokio::time::timeout` cancels the PING future locally
+        // but does NOT roll back bytes already on the wire (same
+        // hazard documented for `on_batch` above). On the SHARED
+        // connection a leftover PING reply could in principle
+        // confuse the multiplexed correlation when followed by
+        // a real command — using a fresh connection that's
+        // dropped after the PING means any leftover bytes go to
+        // a connection that's already being torn down.
+        //
+        // Also bounds the check by `command_timeout` so an
+        // unhealthy backend always returns `false` within a
+        // predictable window (orchestrator liveness probes
+        // require a deterministic cap).
+        let conn_fut = self.client.get_multiplexed_async_connection();
+        let mut conn = match tokio::time::timeout(self.config.command_timeout, conn_fut).await {
+            Ok(Ok(c)) => c,
+            _ => return false,
+        };
+        let cmd = redis::cmd("PING");
+        let fut = cmd.query_async::<String>(&mut conn);
+        matches!(
+            tokio::time::timeout(self.config.command_timeout, fut).await,
+            Ok(Ok(_))
+        )
+        // `conn` is dropped here, so any leftover PING reply
+        // ends up on a torn-down connection rather than the
+        // shared multiplex.
     }
 }
 
