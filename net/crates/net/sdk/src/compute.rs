@@ -1543,10 +1543,7 @@ impl DaemonRuntime {
         });
         let mut reassembled: Vec<u8> = Vec::new();
         for m in &msgs {
-            if let MigrationMessage::SnapshotReady {
-                snapshot_bytes, ..
-            } = m
-            {
+            if let MigrationMessage::SnapshotReady { snapshot_bytes, .. } = m {
                 reassembled.extend_from_slice(snapshot_bytes);
             }
         }
@@ -2102,9 +2099,7 @@ impl MigrationHandle {
         };
 
         for msg in &msgs {
-            self.runtime
-                .send_migration_message(dest_node, msg)
-                .await?;
+            self.runtime.send_migration_message(dest_node, msg).await?;
         }
         Ok(())
     }
