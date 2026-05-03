@@ -4198,7 +4198,14 @@ impl MeshNode {
         // the forwarder has the current view of `hop_count`.
         if ann.hop_count < MAX_CAPABILITY_HOPS - 1 {
             let mut forwarded = ann.clone();
-            forwarded.hop_count += 1;
+            // Saturating bump matches every other hop-count
+            // increment in the crate (`swarm.rs:122`, `route.rs:254`).
+            // The `< MAX_CAPABILITY_HOPS - 1` guard above already
+            // bounds this in practice, but a future refactor that
+            // raises the cap or relaxes the check would otherwise
+            // turn an attacker-controlled byte into a debug-panic /
+            // release-wraparound.
+            forwarded.hop_count = forwarded.hop_count.saturating_add(1);
             // `to_bytes` on a clone with the bumped counter —
             // signature remains valid because `signed_payload()`
             // zeros `hop_count` on verify.
