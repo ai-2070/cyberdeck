@@ -922,6 +922,31 @@ struct MigrationRecord {
     started_at: Instant,
 }
 
+/// Outcome of [`MigrationOrchestrator::buffer_event`].
+///
+/// A `bool` return conflated two distinct caller responses
+/// ("no migration → route to source" vs. "post-cutover →
+/// route to target"); see the method's doc-comment for the
+/// concrete failure mode the bool produced. Branch on this
+/// enum instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferOutcome {
+    /// Event was added to the daemon's migration buffer.
+    /// The migration is between Snapshot and Replay phases.
+    Buffered,
+    /// A migration record exists for this daemon but it has
+    /// already entered Cutover or Complete — the source has
+    /// stopped accepting writes and the target is now (or
+    /// will shortly become) the authoritative copy. Caller
+    /// should route the event to the target node, not the
+    /// source.
+    PostCutover,
+    /// No migration record exists for this daemon. Caller
+    /// should route the event normally (to the source, which
+    /// is still authoritative).
+    NoMigration,
+}
+
 /// Coordinates all 6 phases of daemon migration.
 ///
 /// The orchestrator manages the lifecycle of migrations: initiating snapshots,
@@ -1355,19 +1380,31 @@ impl MigrationOrchestrator {
 
     /// Buffer an event for a daemon that is currently migrating.
     ///
-    /// Returns `true` if the event was buffered (migration in progress),
-    /// `false` if no migration is active for this daemon.
-    pub fn buffer_event(&self, daemon_origin: u32, event: CausalEvent) -> bool {
+    /// Pre-fix this returned a `bool`: `true` if buffered,
+    /// `false` for both "no migration" AND "migration past
+    /// cutover." A caller checking `if !buffer_event(...)
+    /// { route_to_source(...) }` would, post-cutover, route the
+    /// event to a source that has stopped accepting writes for
+    /// this daemon — silently lost. The two `false` cases need
+    /// different remediation: no-migration means "route to the
+    /// source as normal," post-cutover means "route to the
+    /// target (the new authoritative copy)."
+    ///
+    /// Return a typed [`BufferOutcome`] so the caller can branch
+    /// on the actual state instead of inferring the wrong
+    /// behavior from an ambiguous bool.
+    pub fn buffer_event(&self, daemon_origin: u32, event: CausalEvent) -> BufferOutcome {
         if let Some(entry) = self.migrations.get(&daemon_origin) {
             let mut record = entry.lock();
             let phase = record.state.phase();
             // Buffer during Snapshot through Replay phases
             if phase != MigrationPhase::Cutover && phase != MigrationPhase::Complete {
                 record.state.buffer_event(event);
-                return true;
+                return BufferOutcome::Buffered;
             }
+            return BufferOutcome::PostCutover;
         }
-        false
+        BufferOutcome::NoMigration
     }
 
     /// Abort a migration at any phase.
@@ -1923,15 +1960,74 @@ mod tests {
             received_at: 0,
         };
 
-        assert!(orch.buffer_event(origin, event));
-        assert!(!orch.buffer_event(
-            0xDEAD,
-            CausalEvent {
-                link: CausalLink::genesis(0xDEAD, 0),
-                payload: Bytes::from_static(b"nope"),
-                received_at: 0,
-            }
-        ));
+        assert_eq!(orch.buffer_event(origin, event), BufferOutcome::Buffered);
+        assert_eq!(
+            orch.buffer_event(
+                0xDEAD,
+                CausalEvent {
+                    link: CausalLink::genesis(0xDEAD, 0),
+                    payload: Bytes::from_static(b"nope"),
+                    received_at: 0,
+                }
+            ),
+            BufferOutcome::NoMigration,
+        );
+    }
+
+    /// Regression: `buffer_event` must distinguish "no
+    /// migration" from "migration past cutover" via the
+    /// `BufferOutcome` enum. Pre-fix both cases collapsed to
+    /// `false`, so a caller running
+    /// `if !orch.buffer_event(...) { route_to_source(...) }`
+    /// would, post-cutover, route the event to the source —
+    /// which has stopped accepting writes for this daemon, so
+    /// the event was silently lost.
+    #[test]
+    fn buffer_event_distinguishes_post_cutover_from_no_migration() {
+        let (reg, origin) = setup_registry();
+        let orch = MigrationOrchestrator::new(reg, 0x3333);
+
+        let event = || CausalEvent {
+            link: CausalLink::genesis(origin, 0),
+            payload: Bytes::from_static(b"test"),
+            received_at: 0,
+        };
+
+        // Case A: no migration record at all.
+        assert_eq!(
+            orch.buffer_event(origin, event()),
+            BufferOutcome::NoMigration,
+            "buffer_event with no migration must surface as NoMigration"
+        );
+
+        // Case B: migration in Snapshot phase — event buffered.
+        orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+        assert_eq!(
+            orch.buffer_event(origin, event()),
+            BufferOutcome::Buffered,
+            "buffer_event during Snapshot must surface as Buffered"
+        );
+
+        // Force the migration into Cutover via the test-only
+        // phase setter. We can't drive a real cutover here
+        // without going through the full handler protocol, but
+        // BufferOutcome only inspects `state.phase()`.
+        {
+            let entry = orch.migrations.get(&origin).unwrap();
+            let mut record = entry.lock();
+            record.state.force_phase(MigrationPhase::Cutover);
+        }
+
+        // Case C: migration past cutover — must NOT collapse
+        // to NoMigration. Caller needs to route to target.
+        assert_eq!(
+            orch.buffer_event(origin, event()),
+            BufferOutcome::PostCutover,
+            "buffer_event in Cutover phase must surface as PostCutover, \
+             not NoMigration. Pre-fix the bool conflated these and \
+             callers routed post-cutover events to the source, where \
+             they were silently lost."
+        );
     }
 
     #[test]
