@@ -251,6 +251,10 @@ impl DiskSegment {
 
         // Torn-idx tail: the last 20-byte write was partial (crash
         // mid-append). Truncate idx to a whole multiple of 20 bytes.
+        // The `set_len` MUST be paired with `sync_all`: a crash
+        // between truncation and the next durable write would otherwise
+        // leave the torn tail on disk and we'd re-recover the same
+        // bytes on the next open, indefinitely.
         if idx_len_truncated {
             let file = OpenOptions::new()
                 .write(true)
@@ -258,6 +262,7 @@ impl DiskSegment {
                 .map_err(RedexError::io)?;
             file.set_len((index.len() * REDEX_ENTRY_SIZE) as u64)
                 .map_err(RedexError::io)?;
+            file.sync_all().map_err(RedexError::io)?;
         }
 
         // Torn-dat tail: our write ordering is dat-before-idx, so a
@@ -308,6 +313,9 @@ impl DiskSegment {
                 .map_err(RedexError::io)?;
             file.set_len((index.len() * REDEX_ENTRY_SIZE) as u64)
                 .map_err(RedexError::io)?;
+            // sync_all so a crash before the next durable write
+            // doesn't reincarnate the torn idx entries.
+            file.sync_all().map_err(RedexError::io)?;
         }
         // Trim any trailing dat bytes that no idx entry references.
         // Finds the highest `(offset + len)` among retained heap
@@ -324,6 +332,11 @@ impl DiskSegment {
                 .open(&dat_path)
                 .map_err(RedexError::io)?;
             file.set_len(retained_dat_end).map_err(RedexError::io)?;
+            // sync_all so the dat-trim survives a crash that lands
+            // before the next durable write — otherwise reopening
+            // would observe the un-trimmed dat past `retained_dat_end`
+            // and re-trigger the recovery walk.
+            file.sync_all().map_err(RedexError::io)?;
             payload_bytes.truncate(retained_dat_end as usize);
         }
 
