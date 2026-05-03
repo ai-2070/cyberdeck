@@ -855,8 +855,17 @@ impl RecoveryManager {
                 reason: "max retries exceeded".into(),
             }
         } else {
-            // Node not in failed list, normal operation
-            RecoveryAction::Retry { delay_ms: 0 }
+            // Node not in failed list — caller asked for an action
+            // on a node we don't track as failed. Pre-fix this
+            // returned `Retry { delay_ms: 0 }`, which a caller
+            // dutifully respecting the delay would busy-loop on.
+            // The semantically-cleanest answer is "no action
+            // needed, treat as healthy," but the variant doesn't
+            // exist. Return the same 100ms first-backoff step the
+            // failed-node path uses on its first retry, so the
+            // caller paces itself even when get_action was called
+            // by mistake on a healthy node.
+            RecoveryAction::Retry { delay_ms: 100 }
         }
     }
 
