@@ -345,6 +345,17 @@ struct MappedShard {
     drain_started: Option<Instant>,
     /// Last collected metrics.
     last_metrics: ShardMetrics,
+    /// When this shard last transitioned to `Active`. Used by
+    /// `evaluate_scaling` to skip recently-activated shards from
+    /// scale decisions: their `last_metrics` is the
+    /// `ShardMetrics::new(id)` placeholder until at least one
+    /// `collect_metrics` cycle has run, and the placeholder
+    /// (`fill_ratio = 0.0, event_rate = 0`) trips the
+    /// underutilized trigger immediately — oscillating the system
+    /// (scale-up → next tick scale-down → next tick scale-up …)
+    /// when a fresh shard is added but hasn't yet absorbed any
+    /// traffic.
+    activated_at: Instant,
 }
 
 /// Callback type for shard lifecycle events.
@@ -424,6 +435,15 @@ impl ShardMapper {
             .validate()
             .map_err(|e| ScalingError::InvalidPolicy(e.to_string()))?;
 
+        // Initial shards: stamp `activated_at` far enough in the
+        // past that they're not subject to the warmup skip in
+        // `evaluate_scaling`. The boot-time shards have whatever
+        // baseline traffic the system serves; they shouldn't be
+        // exempted from scale decisions just because the mapper
+        // was just constructed.
+        let boot = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .unwrap_or_else(Instant::now);
         let shards: Vec<MappedShard> = (0..initial_shards)
             .map(|id| MappedShard {
                 id,
@@ -431,6 +451,7 @@ impl ShardMapper {
                 metrics: Arc::new(ShardMetricsCollector::new(id, ring_buffer_capacity)),
                 drain_started: None,
                 last_metrics: ShardMetrics::new(id),
+                activated_at: boot,
             })
             .collect();
 
@@ -584,8 +605,33 @@ impl ShardMapper {
         let mut overloaded_count = 0;
         let mut underutilized_count = 0;
 
+        // Warmup window for freshly-activated shards. A just-
+        // activated shard's `last_metrics` is the
+        // `ShardMetrics::new(id)` placeholder
+        // (`fill_ratio = 0.0, event_rate = 0`) until at least one
+        // `collect_metrics` cycle has run. The placeholder
+        // immediately matches the underutilized trigger
+        // (`fill_ratio < underutilized_threshold && event_rate
+        // == 0`), so a fresh shard added by scale-up would
+        // immediately count as underutilized on the next
+        // `evaluate_scaling` and trigger scale-down — oscillating
+        // the system. Reuse `policy.cooldown` as the warmup
+        // window: it's already the minimum gap between scaling
+        // actions, and a shard collected at least once within
+        // that window has accumulated real metrics.
+        let now = Instant::now();
+        let warmup = self.policy.cooldown;
+
         for shard in shards.iter() {
             if shard.state != ShardState::Active {
+                continue;
+            }
+
+            // Skip the placeholder-metrics window for freshly-
+            // activated shards. They count toward `active_count`
+            // (so the budget math stays consistent) but don't
+            // tip the overload/underutilized tallies.
+            if now.duration_since(shard.activated_at) < warmup {
                 continue;
             }
 
@@ -713,6 +759,7 @@ impl ShardMapper {
             .store(next_id_after, AtomicOrdering::Relaxed);
 
         let mut new_ids = Vec::with_capacity(count as usize);
+        let now = Instant::now();
         for i in 0..count {
             let new_id = first_id + i;
             shards.push(MappedShard {
@@ -724,6 +771,13 @@ impl ShardMapper {
                 )),
                 drain_started: None,
                 last_metrics: ShardMetrics::new(new_id),
+                // Stamp the activation moment so `evaluate_scaling`
+                // can skip this shard until at least one collect
+                // cycle has run. Prevents the placeholder
+                // (`fill_ratio = 0, event_rate = 0`) from
+                // immediately tripping the underutilized trigger
+                // and oscillating the system.
+                activated_at: now,
             });
             new_ids.push(new_id);
         }
@@ -906,6 +960,16 @@ impl ShardMapper {
                     return Err(ScalingError::AtMaxShards);
                 }
                 shard.state = ShardState::Active;
+                // Re-stamp `activated_at` so `evaluate_scaling`
+                // gives this freshly-activated shard a warmup
+                // window before counting it in the
+                // overloaded/underutilized tallies. The
+                // Provisioning → Active transition is the moment
+                // traffic starts flowing; the shard's
+                // `last_metrics` is still the
+                // `ShardMetrics::new(id)` placeholder until the
+                // next `collect_metrics` cycle.
+                shard.activated_at = Instant::now();
                 // Publish the increment while still holding the
                 // write lock. `Release` here pairs with the
                 // `Acquire` load above so any later activator that
@@ -1895,6 +1959,84 @@ mod tests {
 
         let decision = mapper.evaluate_scaling();
         assert!(matches!(decision, ScalingDecision::ScaleDown(_)));
+    }
+
+    /// Regression: a freshly-activated shard must NOT
+    /// immediately count toward the underutilized tally on the
+    /// next `evaluate_scaling`. Pre-fix the new shard's
+    /// `last_metrics` was the `ShardMetrics::new(id)` placeholder
+    /// (`fill_ratio = 0.0, event_rate = 0`), which matched the
+    /// underutilized trigger immediately — oscillating the
+    /// system: scale-up → next tick scale-down → next tick
+    /// scale-up.
+    ///
+    /// Post-fix `MappedShard.activated_at` is stamped at the
+    /// Provisioning → Active transition (and at scale-up
+    /// construction for `Active`-from-create shards), and
+    /// `evaluate_scaling` skips shards within `policy.cooldown`
+    /// of activation.
+    #[test]
+    fn freshly_added_shard_skipped_from_evaluate_scaling_warmup() {
+        let policy = ScalingPolicy {
+            underutilized_threshold: 0.2,
+            min_shards: 1,
+            // Long cooldown so the warmup window stays open
+            // throughout the test.
+            cooldown: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let mapper = ShardMapper::new(3, 1024, policy).unwrap();
+
+        // Direct manipulation of the shard list: pin two boot
+        // shards as underutilized (boot stamps put them outside
+        // the warmup window), and inject one freshly-activated
+        // shard with `activated_at = now()` whose placeholder
+        // metrics ALSO trigger the underutilized predicate.
+        // Without the warmup skip, the count would be 3 of 3
+        // shards underutilized → scale-down. WITH the warmup
+        // skip, only the 2 boot shards count, and 2 of 3 still
+        // exceeds the 3/2 = 1 majority — scale-down still fires
+        // (driven by the boot shards), but the decisive property
+        // is that the fresh shard is correctly excluded.
+        {
+            let mut shards = mapper.shards.write();
+            for shard in shards.iter_mut() {
+                shard.last_metrics.fill_ratio = 0.05;
+                shard.last_metrics.event_rate = 0;
+            }
+            // The third shard is "fresh": stamp activated_at to
+            // now, simulating a just-activated shard.
+            shards[2].activated_at = Instant::now();
+        }
+
+        // The fresh shard must satisfy the warmup predicate.
+        let now = Instant::now();
+        let warmup_excluded: Vec<u16> = mapper
+            .shards
+            .read()
+            .iter()
+            .filter(|s| now.duration_since(s.activated_at) < mapper.policy.cooldown)
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(
+            warmup_excluded,
+            vec![2u16],
+            "regression: only shard id 2 (just-stamped) should be \
+             within the warmup window; boot shards are stamped \
+             1 hour in the past"
+        );
+
+        // And evaluate_scaling must still produce ScaleDown
+        // (driven by the 2 boot shards) — the fresh shard's
+        // placeholder doesn't get to vote.
+        let decision = mapper.evaluate_scaling();
+        assert!(
+            matches!(decision, ScalingDecision::ScaleDown(_)),
+            "scale-down still fires from the boot shards' real \
+             underutilization, but driven by 2 of 3 not 3 of 3 — \
+             got {:?}",
+            decision,
+        );
     }
 
     #[test]
