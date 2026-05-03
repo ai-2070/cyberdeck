@@ -294,7 +294,16 @@ impl FailureDetector {
 
     /// Clean up stale entries (nodes that have been failed for too long)
     pub fn cleanup(&self) -> usize {
-        let mut last = self.last_cleanup.lock().unwrap();
+        // Recover from poisoning rather than panic. A panic
+        // anywhere holding this mutex would otherwise turn every
+        // subsequent `cleanup()` call into a runtime panic that
+        // takes the failure-detection loop down with it. Matches
+        // the recovery pattern used elsewhere in the crate
+        // (e.g. `crypto.rs::sliding_window`).
+        let mut last = self
+            .last_cleanup
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if last.elapsed() < self.config.cleanup_interval {
             return 0;
         }
@@ -547,7 +556,7 @@ impl CircuitBreaker {
         // Fast path: read lock for the common Closed/HalfOpen case so
         // typical allow() calls don't contend on the writer lock.
         {
-            let state = *self.state.read().unwrap();
+            let state = *self.state.read().unwrap_or_else(|p| p.into_inner());
             match state {
                 CircuitState::Closed | CircuitState::HalfOpen => return true,
                 CircuitState::Open => {} // fall through to slow path
@@ -562,11 +571,11 @@ impl CircuitBreaker {
         // state. record_success/record_failure deliberately hold the
         // write lock throughout for the same reason; allow() was the
         // outlier.
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
         match *state {
             CircuitState::Closed | CircuitState::HalfOpen => true,
             CircuitState::Open => {
-                let elapsed = self.last_state_change.lock().unwrap().elapsed();
+                let elapsed = self.last_state_change.lock().unwrap_or_else(|p| p.into_inner()).elapsed();
                 if elapsed >= self.reset_timeout {
                     Self::transition_locked(
                         &mut state,
@@ -589,7 +598,7 @@ impl CircuitBreaker {
         // Hold write lock through the entire read-decide-transition path
         // to prevent TOCTOU races where concurrent threads undo each other's
         // state transitions.
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
         match *state {
             CircuitState::Closed => {
                 // Reset failure count on success
@@ -617,7 +626,7 @@ impl CircuitBreaker {
         // Hold write lock through the entire read-decide-transition path
         // to prevent TOCTOU races where concurrent threads undo each other's
         // state transitions.
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
         match *state {
             CircuitState::Closed => {
                 let count = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -649,7 +658,7 @@ impl CircuitBreaker {
 
     /// Get current state
     pub fn state(&self) -> CircuitState {
-        *self.state.read().unwrap()
+        *self.state.read().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Get total trip count
@@ -665,7 +674,7 @@ impl CircuitBreaker {
     }
 
     fn transition_to(&self, new_state: CircuitState) {
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
         Self::transition_locked(
             &mut state,
             new_state,
@@ -689,7 +698,7 @@ impl CircuitBreaker {
         let old_state = *state;
         if old_state != new_state {
             *state = new_state;
-            *last_state_change.lock().unwrap() = Instant::now();
+            *last_state_change.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
 
             // Reset counters on transition
             failure_count.store(0, Ordering::Relaxed);
@@ -809,7 +818,7 @@ impl RecoveryManager {
             self.queued.fetch_add(1, Ordering::Relaxed);
             self.recovery_queue
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|p| p.into_inner())
                 .push_back((node_id, Instant::now()));
             RecoveryAction::Queue
         }
