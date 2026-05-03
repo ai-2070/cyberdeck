@@ -503,10 +503,20 @@ impl NetAdapter {
             // packets from the expected peer. This prevents stray traffic on
             // the shared socket from consuming the handshake slot.
             let (parsed, _source) = tokio::time::timeout(timeout, async {
+                // Stack buffer reused across loop iterations.
+                // `MAX_PACKET_SIZE` is 8192 bytes — small enough to
+                // live on the async stack without spilling, and the
+                // reuse drops the per-iteration `BytesMut::with_capacity`
+                // alloc on the stray-traffic path. Pre-fix every
+                // discarded datagram (an off-peer packet, an invalid
+                // handshake) allocated a fresh 8 KiB and freed it at
+                // loop end — under stray UDP traffic on the same
+                // bind port this churned the allocator. Only the
+                // success path now allocates (a `Bytes::copy_from_slice`
+                // sized to the actual payload, since `ParsedPacket`
+                // owns its `Bytes`).
+                let mut recv_buf = [0u8; protocol::MAX_PACKET_SIZE];
                 loop {
-                    let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
-                    recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
-
                     let (n, source) = socket_arc
                         .recv_from(&mut recv_buf)
                         .await
@@ -517,8 +527,7 @@ impl NetAdapter {
                         continue;
                     }
 
-                    recv_buf.truncate(n);
-                    let data = recv_buf.freeze();
+                    let data = bytes::Bytes::copy_from_slice(&recv_buf[..n]);
 
                     if let Some(p) = ParsedPacket::parse(data, source) {
                         if p.header.flags.is_handshake() {
