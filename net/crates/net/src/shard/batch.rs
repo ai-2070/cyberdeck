@@ -81,12 +81,23 @@ impl AdaptiveBatcher {
         self.velocity_samples.push_back((now, self.total_events));
 
         // Remove old samples outside the time window.
-        let window_start = now - self.config.velocity_window;
-        while let Some(&(ts, _)) = self.velocity_samples.front() {
-            if ts < window_start {
-                self.velocity_samples.pop_front();
-            } else {
-                break;
+        //
+        // `Instant - Duration` panics on underflow, and on Windows
+        // `Instant` is QPC-relative to boot — a process that
+        // starts within `velocity_window` (typically a few
+        // seconds) of boot would abort the batch worker task
+        // here. `checked_sub` returns `None` on underflow; in
+        // that case skip the time-based eviction (every existing
+        // sample is "newer than the window floor" by definition,
+        // since the floor predates `Instant::now()`'s zero point).
+        // The sample-count cap below still bounds memory.
+        if let Some(window_start) = now.checked_sub(self.config.velocity_window) {
+            while let Some(&(ts, _)) = self.velocity_samples.front() {
+                if ts < window_start {
+                    self.velocity_samples.pop_front();
+                } else {
+                    break;
+                }
             }
         }
 
