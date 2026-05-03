@@ -2335,7 +2335,23 @@ fn spawn_drain_worker_for_shard(
                     consecutive_zeros = 0;
                     let batch =
                         std::mem::replace(&mut final_scratch, Vec::with_capacity(FINAL_BATCH));
-                    if sender.send(batch).await.is_err() {
+                    let batch_len = batch.len();
+                    if let Err(_send_err) = sender.send(batch).await {
+                        // Batch worker exited before drain. The
+                        // `mem::replace` already pulled events out
+                        // of the ring buffer, so the dropped batch
+                        // is unrecoverable — the SendError carries
+                        // it back but the consumer is gone. Surface
+                        // the count loudly so the loss is
+                        // observable in operator dashboards rather
+                        // than a silent miss in shutdown stats.
+                        tracing::error!(
+                            shard_id,
+                            dropped = batch_len,
+                            "drain worker (final): batch worker dropped \
+                             channel before final drain completed; \
+                             events removed from ring buffer cannot be redelivered",
+                        );
                         break;
                     }
                 }
@@ -2359,7 +2375,30 @@ fn spawn_drain_worker_for_shard(
                 }
                 Some(_) => {
                     let batch = std::mem::replace(&mut scratch, Vec::with_capacity(STEADY_BATCH));
-                    if sender.send(batch).await.is_err() {
+                    let batch_len = batch.len();
+                    if let Err(_send_err) = sender.send(batch).await {
+                        // Steady-state: the only way the batch
+                        // worker drops the channel is if it
+                        // panicked or `remove_shard_internal`
+                        // tore it down out of order with the
+                        // drain worker (which the documented
+                        // shutdown sequence forbids). Either way,
+                        // the events are unrecoverable — the
+                        // `mem::replace` above already pulled them
+                        // out of the ring buffer. Pre-fix this
+                        // simply `break`-d, leaving the loss
+                        // invisible. Surface a loud error with
+                        // the dropped count so an out-of-order
+                        // shutdown or batch-worker panic shows up
+                        // in dashboards rather than as a silent
+                        // metric gap.
+                        tracing::error!(
+                            shard_id,
+                            dropped = batch_len,
+                            "drain worker: batch worker dropped channel \
+                             during steady-state drain; events removed from \
+                             ring buffer cannot be redelivered",
+                        );
                         break;
                     }
                 }
