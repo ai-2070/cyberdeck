@@ -86,6 +86,22 @@ fn runtime() -> &'static Arc<Runtime> {
     })
 }
 
+/// `block_on(...)` wrapper that aborts on runtime-in-runtime
+/// rather than panicking across the FFI boundary. See
+/// `ffi/mesh.rs::block_on` for the full rationale; the check is the
+/// same `Handle::try_current()` test, the abort message names the
+/// cortex surface so the post-mortem is unambiguous.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        eprintln!(
+            "FATAL: cortex FFI called from inside a tokio runtime context; \
+             aborting to avoid runtime-in-runtime panic across the FFI boundary"
+        );
+        std::process::abort();
+    }
+    runtime().block_on(future)
+}
+
 /// Copy a C string into an owned `String`. Returns `None` on null or
 /// non-UTF-8 input.
 ///
@@ -456,8 +472,7 @@ pub extern "C" fn net_redex_tail_next(
         return NetError::NullPointer.into();
     }
     let cursor = unsafe { &*cursor };
-    let rt = runtime();
-    rt.block_on(async move {
+    block_on(async move {
         let mut guard = cursor.stream.lock().await;
         let Some(stream) = guard.as_mut() else {
             return NET_ERR_STREAM_ENDED;
@@ -533,9 +548,8 @@ pub extern "C" fn net_tasks_adapter_open(
     };
     // `open_with_config` spawns the fold task via `tokio::spawn` and
     // needs a live reactor; run under our runtime.
-    let rt = runtime();
     let redex_inner = redex.inner.clone();
-    let result = rt.block_on(async move {
+    let result = block_on(async move {
         InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
     });
     match result {
@@ -707,8 +721,7 @@ pub extern "C" fn net_tasks_wait_for_seq(
     }
     let tasks = unsafe { &*handle };
     let adapter = tasks.inner.clone();
-    let rt = runtime();
-    rt.block_on(async move {
+    block_on(async move {
         let fut = adapter.wait_for_seq(seq);
         if timeout_ms == 0 {
             fut.await;
@@ -917,8 +930,7 @@ pub extern "C" fn net_tasks_snapshot_and_watch(
     // `watcher.stream()` spawns a forwarding task — needs a live
     // reactor.
     let adapter = tasks.inner.clone();
-    let rt = runtime();
-    let (snapshot, stream) = rt.block_on(async move { adapter.snapshot_and_watch(watcher) });
+    let (snapshot, stream) = block_on(async move { adapter.snapshot_and_watch(watcher) });
     let snapshot_json: Vec<TaskJson> = snapshot.into_iter().map(TaskJson::from).collect();
     let code = write_json_out(&snapshot_json, out_snapshot, out_snapshot_len);
     if code != 0 {
@@ -947,8 +959,7 @@ pub extern "C" fn net_tasks_watch_next(
         return NetError::NullPointer.into();
     }
     let cursor = unsafe { &*cursor };
-    let rt = runtime();
-    rt.block_on(async move {
+    block_on(async move {
         let mut guard = cursor.stream.lock().await;
         let Some(stream) = guard.as_mut() else {
             return NET_ERR_STREAM_ENDED;
@@ -1014,9 +1025,8 @@ pub extern "C" fn net_memories_adapter_open(
     } else {
         RedexFileConfig::default()
     };
-    let rt = runtime();
     let redex_inner = redex.inner.clone();
-    let result = rt.block_on(async move {
+    let result = block_on(async move {
         InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
     });
     match result {
@@ -1236,8 +1246,7 @@ pub extern "C" fn net_memories_wait_for_seq(
     }
     let mem = unsafe { &*handle };
     let adapter = mem.inner.clone();
-    let rt = runtime();
-    rt.block_on(async move {
+    block_on(async move {
         let fut = adapter.wait_for_seq(seq);
         if timeout_ms == 0 {
             fut.await;
@@ -1465,8 +1474,7 @@ pub extern "C" fn net_memories_snapshot_and_watch(
         Err(code) => return code,
     };
     let adapter = mem.inner.clone();
-    let rt = runtime();
-    let (snapshot, stream) = rt.block_on(async move { adapter.snapshot_and_watch(watcher) });
+    let (snapshot, stream) = block_on(async move { adapter.snapshot_and_watch(watcher) });
     let snapshot_json: Vec<MemoryJson> = snapshot.into_iter().map(MemoryJson::from).collect();
     let code = write_json_out(&snapshot_json, out_snapshot, out_snapshot_len);
     if code != 0 {
@@ -1492,8 +1500,7 @@ pub extern "C" fn net_memories_watch_next(
         return NetError::NullPointer.into();
     }
     let cursor = unsafe { &*cursor };
-    let rt = runtime();
-    rt.block_on(async move {
+    block_on(async move {
         let mut guard = cursor.stream.lock().await;
         let Some(stream) = guard.as_mut() else {
             return NET_ERR_STREAM_ENDED;

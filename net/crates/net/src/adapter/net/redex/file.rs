@@ -1120,6 +1120,7 @@ impl RedexFile {
             .iter()
             .skip(drop)
             .map(|entry| {
+                #[allow(unused_mut)] // mut is used only on the redex-disk path
                 let mut e = *entry;
                 #[cfg(feature = "redex-disk")]
                 {

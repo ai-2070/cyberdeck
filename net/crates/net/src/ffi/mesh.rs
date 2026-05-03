@@ -184,6 +184,31 @@ fn runtime() -> &'static Arc<Runtime> {
     })
 }
 
+/// `block_on(...)` wrapper that aborts on runtime-in-runtime
+/// rather than panicking across the FFI boundary.
+///
+/// Calling `Runtime::block_on` from a thread that already holds a
+/// tokio runtime context panics with "Cannot start a runtime from
+/// within a runtime". The cortex / mesh FFI functions are
+/// `extern "C"`, so the panic would unwind across cgo / N-API / cffi
+/// — undefined behavior. The check costs one TLS lookup
+/// (`Handle::try_current`) per FFI call, which is negligible against
+/// the work the FFI is about to do (network I/O, JSON parsing,
+/// channel operations). Common-case callers (C / Go / Python without
+/// an embedding Rust runtime) hit the fast path; embedded-Rust
+/// callers who violate the contract get a clean abort with a
+/// diagnosable message instead of UB.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        eprintln!(
+            "FATAL: mesh FFI called from inside a tokio runtime context; \
+             aborting to avoid runtime-in-runtime panic across the FFI boundary"
+        );
+        std::process::abort();
+    }
+    runtime().block_on(future)
+}
+
 /// The output borrow's lifetime is tied (via Rust's elision rules)
 /// to the input reference's lifetime, so the caller cannot pick
 /// `'static` and produce a dangling borrow. The borrow lives only
@@ -481,8 +506,7 @@ pub extern "C" fn net_mesh_new(
         }
         None => EntityKeypair::generate(),
     };
-    let rt = runtime();
-    let result = rt.block_on(async move { MeshNode::new(identity, node_cfg).await });
+    let result = block_on(async move { MeshNode::new(identity, node_cfg).await });
     match result {
         Ok(mut node) => {
             let channel_configs = Arc::new(ChannelConfigRegistry::new());
@@ -644,9 +668,8 @@ pub extern "C" fn net_mesh_connect(
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&pk_bytes);
 
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move { node.connect(addr, &pk, peer_node_id).await }) {
+    match block_on(async move { node.connect(addr, &pk, peer_node_id).await }) {
         Ok(_) => 0,
         Err(e) => adapter_err_to_code(&e),
     }
@@ -665,9 +688,8 @@ pub extern "C" fn net_mesh_accept(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move { node.accept(peer_node_id).await }) {
+    match block_on(async move { node.accept(peer_node_id).await }) {
         Ok((addr, _)) => write_string_out(addr.to_string(), out_addr, out_len),
         Err(e) => adapter_err_to_code(&e),
     }
@@ -679,11 +701,10 @@ pub extern "C" fn net_mesh_start(handle: *mut MeshNodeHandle) -> c_int {
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let rt = runtime();
     let node = h.inner.clone();
     // `start` spawns internal tasks via tokio::spawn; run under the
     // shared runtime.
-    rt.block_on(async move { node.start() });
+    block_on(async move { node.start() });
     0
 }
 
@@ -704,8 +725,7 @@ pub extern "C" fn net_mesh_shutdown(handle: *mut MeshNodeHandle) -> c_int {
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let rt = runtime();
-    match rt.block_on(async { h.inner.shutdown().await }) {
+    match block_on(async { h.inner.shutdown().await }) {
         Ok(()) => 0,
         Err(e) => adapter_err_to_code(&e),
     }
@@ -815,9 +835,8 @@ pub extern "C" fn net_mesh_probe_reflex(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move { node.probe_reflex(peer_node_id).await }) {
+    match block_on(async move { node.probe_reflex(peer_node_id).await }) {
         Ok(addr) => write_string_out(addr.to_string(), out_str, out_len),
         Err(e) => traversal_err_to_code(&e),
     }
@@ -834,9 +853,8 @@ pub extern "C" fn net_mesh_reclassify_nat(handle: *mut MeshNodeHandle) -> c_int 
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let rt = runtime();
     let node = h.inner.clone();
-    rt.block_on(async move { node.reclassify_nat().await });
+    block_on(async move { node.reclassify_nat().await });
     0
 }
 
@@ -907,9 +925,8 @@ pub extern "C" fn net_mesh_connect_direct(
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&pk_bytes);
 
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move { node.connect_direct(peer_node_id, &pk, coordinator).await }) {
+    match block_on(async move { node.connect_direct(peer_node_id, &pk, coordinator).await }) {
         Ok(_) => 0,
         Err(e) => traversal_err_to_code(&e),
     }
@@ -1215,14 +1232,13 @@ pub extern "C" fn net_mesh_send(
     if !handles_match(sh, nh) {
         return NetError::MismatchedHandles.into();
     }
-    let rt = runtime();
     let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
         Some(v) => v,
         None => return NetError::NullPointer.into(),
     };
     let node = nh.inner.clone();
     let stream = sh.stream.clone();
-    match rt.block_on(async move { node.send_on_stream(&stream, &payloads).await }) {
+    match block_on(async move { node.send_on_stream(&stream, &payloads).await }) {
         Ok(()) => 0,
         Err(e) => stream_err_to_code(&e),
     }
@@ -1248,14 +1264,13 @@ pub extern "C" fn net_mesh_send_with_retry(
     if !handles_match(sh, nh) {
         return NetError::MismatchedHandles.into();
     }
-    let rt = runtime();
     let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
         Some(v) => v,
         None => return NetError::NullPointer.into(),
     };
     let node = nh.inner.clone();
     let stream = sh.stream.clone();
-    match rt.block_on(async move {
+    match block_on(async move {
         node.send_with_retry(&stream, &payloads, max_retries as usize)
             .await
     }) {
@@ -1283,14 +1298,13 @@ pub extern "C" fn net_mesh_send_blocking(
     if !handles_match(sh, nh) {
         return NetError::MismatchedHandles.into();
     }
-    let rt = runtime();
     let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
         Some(v) => v,
         None => return NetError::NullPointer.into(),
     };
     let node = nh.inner.clone();
     let stream = sh.stream.clone();
-    match rt.block_on(async move { node.send_blocking(&stream, &payloads).await }) {
+    match block_on(async move { node.send_blocking(&stream, &payloads).await }) {
         Ok(()) => 0,
         Err(e) => stream_err_to_code(&e),
     }
@@ -1371,9 +1385,8 @@ pub extern "C" fn net_mesh_recv_shard(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let rt = runtime();
     let node = h.inner.clone();
-    let result = rt.block_on(async move { node.poll_shard(shard_id, None, limit as usize).await });
+    let result = block_on(async move { node.poll_shard(shard_id, None, limit as usize).await });
     let result = match result {
         Ok(r) => r,
         Err(e) => return adapter_err_to_code(&e),
@@ -1552,9 +1565,8 @@ pub extern "C" fn net_mesh_subscribe_channel_with_token(
         Ok(t) => t,
         Err(e) => return token_err_to_code(&e),
     };
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move {
+    match block_on(async move {
         node.subscribe_channel_with_token(publisher_node_id, name, parsed)
             .await
     }) {
@@ -1580,12 +1592,11 @@ fn subscribe_or_unsubscribe(
         Ok(n) => n,
         Err(_) => return NET_ERR_CHANNEL,
     };
-    let rt = runtime();
     let node = h.inner.clone();
     let outcome = if subscribe {
-        rt.block_on(async move { node.subscribe_channel(publisher_node_id, name).await })
+        block_on(async move { node.subscribe_channel(publisher_node_id, name).await })
     } else {
-        rt.block_on(async move { node.unsubscribe_channel(publisher_node_id, name).await })
+        block_on(async move { node.unsubscribe_channel(publisher_node_id, name).await })
     };
     match outcome {
         Ok(()) => 0,
@@ -1703,9 +1714,8 @@ pub extern "C" fn net_mesh_publish(
         Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(payload, len) })
     };
 
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move { node.publish(&publisher, bytes).await }) {
+    match block_on(async move { node.publish(&publisher, bytes).await }) {
         Ok(report) => {
             let js = to_publish_report_json(report);
             write_json_out(&js, out_json, out_len)
@@ -2693,9 +2703,8 @@ pub extern "C" fn net_mesh_announce_capabilities(
         Err(_) => return NetError::InvalidJson.into(),
     };
     let caps = capability_set_from_json(parsed);
-    let rt = runtime();
     let node = h.inner.clone();
-    match rt.block_on(async move { node.announce_capabilities(caps).await }) {
+    match block_on(async move { node.announce_capabilities(caps).await }) {
         Ok(()) => 0,
         Err(_) => NET_ERR_CAPABILITY,
     }
