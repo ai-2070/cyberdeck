@@ -249,6 +249,16 @@ impl Drop for FfiOpGuard<'_> {
     }
 }
 
+/// Returns `true` when `handle` is non-null and aligned for
+/// `NetHandle`. Every `extern "C"` entry point that derefs the
+/// raw handle must gate on this — a misaligned pointer produced
+/// by an over-eager `void *` cast in a foreign caller would be
+/// immediate UB on `&*handle`, even before the `is_null` check.
+#[inline]
+fn handle_is_valid(handle: *const NetHandle) -> bool {
+    !handle.is_null() && (handle as usize) % std::mem::align_of::<NetHandle>() == 0
+}
+
 /// Error codes returned by FFI functions.
 #[repr(C)]
 pub enum NetError {
@@ -596,7 +606,7 @@ pub extern "C" fn net_ingest(
     event_json: *const c_char,
     len: usize,
 ) -> c_int {
-    if handle.is_null() || event_json.is_null() {
+    if !handle_is_valid(handle) || event_json.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -651,7 +661,7 @@ pub extern "C" fn net_ingest(
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
 pub extern "C" fn net_ingest_raw(handle: *mut NetHandle, json: *const c_char, len: usize) -> c_int {
-    if handle.is_null() || json.is_null() {
+    if !handle_is_valid(handle) || json.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -698,7 +708,7 @@ pub extern "C" fn net_ingest_raw_batch(
     lens: *const usize,
     count: usize,
 ) -> c_int {
-    if handle.is_null() || jsons.is_null() || lens.is_null() {
+    if !handle_is_valid(handle) || jsons.is_null() || lens.is_null() {
         return NetError::NullPointer.into();
     }
     if count == 0 {
@@ -750,7 +760,7 @@ pub extern "C" fn net_ingest_raw_batch(
 /// Number of successfully ingested events, or negative error code.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_ingest_batch(handle: *mut NetHandle, events_json: *const c_char) -> c_int {
-    if handle.is_null() || events_json.is_null() {
+    if !handle_is_valid(handle) || events_json.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -835,7 +845,7 @@ pub extern "C" fn net_poll(
     out_buffer: *mut c_char,
     buffer_len: usize,
 ) -> c_int {
-    if handle.is_null() || out_buffer.is_null() {
+    if !handle_is_valid(handle) || out_buffer.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -983,7 +993,7 @@ pub extern "C" fn net_stats(
     out_buffer: *mut c_char,
     buffer_len: usize,
 ) -> c_int {
-    if handle.is_null() || out_buffer.is_null() {
+    if !handle_is_valid(handle) || out_buffer.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -1040,7 +1050,7 @@ pub extern "C" fn net_stats(
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
 pub extern "C" fn net_flush(handle: *mut NetHandle) -> c_int {
-    if handle.is_null() {
+    if !handle_is_valid(handle) {
         return NetError::NullPointer.into();
     }
 
@@ -1077,7 +1087,7 @@ pub extern "C" fn net_flush(handle: *mut NetHandle) -> c_int {
 /// callers initialize the bus once and shut down once.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
-    if handle.is_null() {
+    if !handle_is_valid(handle) {
         return NetError::NullPointer.into();
     }
 
@@ -1235,7 +1245,7 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
 /// Number of shards, or 0 if handle is null.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_num_shards(handle: *mut NetHandle) -> u16 {
-    if handle.is_null() {
+    if !handle_is_valid(handle) {
         return 0;
     }
     let handle = unsafe { &*handle };
@@ -1408,7 +1418,7 @@ pub extern "C" fn net_ingest_raw_ex(
     len: usize,
     out: *mut NetReceipt,
 ) -> c_int {
-    if handle.is_null() || json.is_null() {
+    if !handle_is_valid(handle) || json.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -1454,7 +1464,7 @@ pub extern "C" fn net_poll_ex(
     cursor: *const c_char,
     out: *mut NetPollResult,
 ) -> c_int {
-    if handle.is_null() || out.is_null() {
+    if !handle_is_valid(handle) || out.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -1652,7 +1662,7 @@ pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
 /// Get stats without JSON serialization.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_stats_ex(handle: *mut NetHandle, out: *mut NetStats) -> c_int {
-    if handle.is_null() || out.is_null() {
+    if !handle_is_valid(handle) || out.is_null() {
         return NetError::NullPointer.into();
     }
 
@@ -1952,6 +1962,45 @@ mod tests {
                 "CR-22 regression: bindings/go/net/net.h is missing the value {} \
                  (Rust NetError defines it).",
                 v
+            );
+        }
+    }
+
+    /// `handle_is_valid` rejects null and any pointer not aligned for
+    /// `NetHandle`. A foreign caller producing a misaligned pointer
+    /// (e.g. via an over-eager `void *` cast on a packed struct) hits
+    /// `&*handle` UB before any other check fires; this gate is the
+    /// pre-deref discriminator.
+    #[test]
+    fn handle_is_valid_rejects_null_and_misaligned() {
+        // Null is rejected.
+        assert!(
+            !handle_is_valid(std::ptr::null::<NetHandle>()),
+            "null pointer must not be considered a valid handle"
+        );
+
+        // Aligned but non-null is accepted (we use a small backing
+        // buffer to materialize a pointer without dereferencing it).
+        // `align_of::<NetHandle>()` is the alignment we must match.
+        let align = std::mem::align_of::<NetHandle>();
+        let buf = vec![0u8; align * 2];
+        let base = buf.as_ptr() as usize;
+        let aligned = (base + align - 1) & !(align - 1);
+        let aligned_ptr = aligned as *const NetHandle;
+        assert!(
+            handle_is_valid(aligned_ptr),
+            "aligned non-null pointer must validate (align={align}, ptr={aligned_ptr:p})"
+        );
+
+        // A pointer one byte past `aligned_ptr` is misaligned for any
+        // type with align > 1, and `NetHandle` (containing `AtomicU32`,
+        // `AtomicBool`, ManuallyDrop'd EventBus + Runtime) easily
+        // exceeds 1.
+        if align > 1 {
+            let misaligned_ptr = (aligned + 1) as *const NetHandle;
+            assert!(
+                !handle_is_valid(misaligned_ptr),
+                "misaligned pointer must be rejected (align={align}, ptr={misaligned_ptr:p})"
             );
         }
     }
