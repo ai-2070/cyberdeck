@@ -154,8 +154,45 @@ impl CompositeCursor {
             .decode(s)
             .map_err(|e| ConsumerError::InvalidCursor(e.to_string()))?;
 
-        let positions: HashMap<u16, CursorPos> = serde_json::from_slice(&bytes)
+        // Two-pass parse so non-canonical shard-id keys (e.g.
+        // `"00"` aliasing `"0"`) are rejected explicitly. Pre-fix
+        // we deserialized straight into `HashMap<u16, _>`; serde
+        // parses each string key as u16, so `"0"` and `"00"`
+        // both produce key 0 and the second insert silently
+        // overwrites the first. The collision is benign in
+        // production (no caller emits non-canonical keys) but
+        // a malicious or buggy producer could inject a hostile
+        // cursor that ambiguates which shard's position a
+        // consumer ended up with on round-trip.
+        let raw_positions: HashMap<String, CursorPos> = serde_json::from_slice(&bytes)
             .map_err(|e| ConsumerError::InvalidCursor(e.to_string()))?;
+        let mut positions: HashMap<u16, CursorPos> =
+            HashMap::with_capacity(raw_positions.len());
+        for (key, val) in raw_positions {
+            let id: u16 = key.parse().map_err(|_| {
+                ConsumerError::InvalidCursor(format!(
+                    "shard key {key:?} is not a valid u16"
+                ))
+            })?;
+            // Reject non-canonical stringifications. The
+            // round-trip `u16 → String` is the canonical form;
+            // any other string that parses to the same u16 is
+            // a non-canonical alias.
+            if id.to_string() != key {
+                return Err(ConsumerError::InvalidCursor(format!(
+                    "non-canonical shard key {key:?} (parses to {id}, \
+                     canonical form is {id})"
+                )));
+            }
+            if positions.insert(id, val).is_some() {
+                // Defensive: if non-canonical detection above
+                // missed something (it shouldn't), a duplicate
+                // canonical key is also a structural error.
+                return Err(ConsumerError::InvalidCursor(format!(
+                    "duplicate shard key {id} after canonicalization"
+                )));
+            }
+        }
 
         Ok(Self { positions })
     }
@@ -1107,6 +1144,36 @@ mod tests {
         // Valid base64 but not valid JSON
         let result = CompositeCursor::decode(&BASE64.encode(b"not json"));
         assert!(result.is_err());
+    }
+
+    /// Regression: non-canonical shard-id keys must be rejected
+    /// at decode time. Pre-fix `serde_json::from_slice::<HashMap<u16,
+    /// _>>` parsed `"00"` and `"0"` both as u16 0; the second
+    /// insert silently overwrote the first, leaving the consumer
+    /// with whichever entry happened to come later in the JSON.
+    /// Two distinct stringifications collapsed to one shard
+    /// position with no surfaced error.
+    #[test]
+    fn cursor_decode_rejects_non_canonical_shard_keys() {
+        // Construct a JSON cursor with `"00"` aliasing `"0"`.
+        // Both round-trip to u16 0 under standard parsing.
+        let hostile = br#"{"00":"id_a","1":"id_b"}"#;
+        let encoded = BASE64.encode(hostile);
+        let result = CompositeCursor::decode(&encoded);
+        assert!(
+            result.is_err(),
+            "non-canonical shard key `\"00\"` must reject; \
+             pre-fix this silently parsed as shard 0"
+        );
+
+        // Boundary: the canonical "0" (no leading zero) decodes
+        // normally.
+        let canonical = br#"{"0":"id_a","1":"id_b"}"#;
+        let encoded_ok = BASE64.encode(canonical);
+        let cursor = CompositeCursor::decode(&encoded_ok)
+            .expect("canonical shard keys must decode cleanly");
+        assert_eq!(cursor.get(0), Some("id_a"));
+        assert_eq!(cursor.get(1), Some("id_b"));
     }
 
     #[test]
