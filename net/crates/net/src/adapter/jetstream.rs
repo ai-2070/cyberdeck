@@ -269,6 +269,16 @@ impl Adapter for JetStreamAdapter {
             return Ok(());
         }
 
+        // Consult `initialized` before reaching `self.jetstream`.
+        // `shutdown` flips this flag and `drain()`s the client, but
+        // does not (and cannot, behind `&self`) clear the `Option`
+        // fields. Without this gate a post-shutdown `on_batch`
+        // would proceed against a drained client, typically erroring
+        // and sometimes hanging depending on async-nats internals.
+        if !self.initialized.load(Ordering::Acquire) {
+            return Err(AdapterError::Connection("adapter not initialized".into()));
+        }
+
         let js = self
             .jetstream
             .as_ref()
@@ -419,6 +429,12 @@ impl Adapter for JetStreamAdapter {
         from_id: Option<&str>,
         limit: usize,
     ) -> Result<ShardPollResult, AdapterError> {
+        // Same shutdown gate as `on_batch` — `shutdown` cannot
+        // clear `self.client` / `self.jetstream` from `&self`, so
+        // we consult the flag instead.
+        if !self.initialized.load(Ordering::Acquire) {
+            return Err(AdapterError::Connection("adapter not initialized".into()));
+        }
         let mut stream = self.get_or_create_stream(shard_id).await?;
 
         // Parse the cursor (sequence number).
