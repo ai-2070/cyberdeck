@@ -1380,6 +1380,16 @@ pub extern "C" fn net_poll_ex(
     let count = response.events.len();
 
     // Allocate events array.
+    //
+    // Each iteration allocates two boxed byte slices via
+    // `Vec::to_vec().into_boxed_slice()`, which panic on OOM in
+    // the global allocator. A panic across this `extern "C"`
+    // body is UB — under the cgo/N-API/cffi unwind model the
+    // panic propagates into a frame that doesn't expect it. Wrap
+    // the per-event build in `catch_unwind`, track how many
+    // events we've fully written, and on panic / mid-loop
+    // failure free the partial array via `free_events_array`
+    // so neither UB nor the partial allocations leak.
     let events_ptr = if count > 0 {
         let layout = match std::alloc::Layout::array::<NetEvent>(count) {
             Ok(l) => l,
@@ -1390,26 +1400,40 @@ pub extern "C" fn net_poll_ex(
             return NetError::Unknown.into();
         }
 
-        for (i, event) in response.events.iter().enumerate() {
-            // Leak id and raw strings so they live until net_free_poll_result.
-            let id_bytes = event.id.as_bytes().to_vec().into_boxed_slice();
-            let id_len = id_bytes.len();
-            let id_ptr = Box::into_raw(id_bytes) as *const c_char;
+        // Shared counter so the outer scope can clean up partial
+        // writes if any iteration panics.
+        let completed = std::cell::Cell::new(0usize);
+        let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for (i, event) in response.events.iter().enumerate() {
+                let id_bytes = event.id.as_bytes().to_vec().into_boxed_slice();
+                let id_len = id_bytes.len();
+                let id_ptr = Box::into_raw(id_bytes) as *const c_char;
 
-            let raw_bytes = event.raw.to_vec().into_boxed_slice();
-            let raw_len = raw_bytes.len();
-            let raw_ptr = Box::into_raw(raw_bytes) as *const c_char;
+                let raw_bytes = event.raw.to_vec().into_boxed_slice();
+                let raw_len = raw_bytes.len();
+                let raw_ptr = Box::into_raw(raw_bytes) as *const c_char;
 
-            unsafe {
-                ptr.add(i).write(NetEvent {
-                    id: id_ptr,
-                    id_len,
-                    raw: raw_ptr,
-                    raw_len,
-                    insertion_ts: event.insertion_ts,
-                    shard_id: event.shard_id,
-                });
+                unsafe {
+                    ptr.add(i).write(NetEvent {
+                        id: id_ptr,
+                        id_len,
+                        raw: raw_ptr,
+                        raw_len,
+                        insertion_ts: event.insertion_ts,
+                        shard_id: event.shard_id,
+                    });
+                }
+                completed.set(i + 1);
             }
+        }));
+        if build_result.is_err() {
+            // A panic landed mid-loop. Free fully-written events
+            // (those past `completed.get()` were never written, so
+            // the inner `id`/`raw` pointers aren't valid). The
+            // events array was allocated for `count` NetEvent
+            // slots, so the dealloc must use that same layout.
+            free_events_array_partial(ptr, completed.get(), count);
+            return NetError::Unknown.into();
         }
         ptr
     } else {
@@ -1440,11 +1464,29 @@ pub extern "C" fn net_poll_ex(
 }
 
 /// Free an events array and all its id/raw allocations.
+///
+/// `count` is the number of fully-written events (those whose
+/// inner `id` / `raw` boxed slices were initialized). It must
+/// also match the `Layout::array::<NetEvent>` used at allocation
+/// time — every existing caller writes exactly `count` events
+/// before invoking this function. For partial-cleanup paths
+/// (e.g. panic mid-build), use [`free_events_array_partial`].
 fn free_events_array(events: *mut NetEvent, count: usize) {
-    if events.is_null() || count == 0 {
+    free_events_array_partial(events, count, count);
+}
+
+/// Free an events array where only `walk_count` entries have
+/// fully-initialized `id`/`raw` allocations, but the array
+/// itself was allocated for `alloc_count` slots. Per-event
+/// boxes are freed for `0..walk_count`; the array is then
+/// deallocated with the original `Layout::array::<NetEvent>(alloc_count)`
+/// to match the allocation. Used by `net_poll_ex`'s panic-mid-loop
+/// recovery path.
+fn free_events_array_partial(events: *mut NetEvent, walk_count: usize, alloc_count: usize) {
+    if events.is_null() || alloc_count == 0 {
         return;
     }
-    for i in 0..count {
+    for i in 0..walk_count {
         let event = unsafe { &*events.add(i) };
         if !event.id.is_null() {
             unsafe {
@@ -1463,7 +1505,7 @@ fn free_events_array(events: *mut NetEvent, count: usize) {
             }
         }
     }
-    if let Ok(layout) = std::alloc::Layout::array::<NetEvent>(count) {
+    if let Ok(layout) = std::alloc::Layout::array::<NetEvent>(alloc_count) {
         unsafe {
             std::alloc::dealloc(events as *mut u8, layout);
         }
