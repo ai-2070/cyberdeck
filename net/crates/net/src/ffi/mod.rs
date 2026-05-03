@@ -1468,6 +1468,23 @@ pub extern "C" fn net_poll_ex(
         return NetError::NullPointer.into();
     }
 
+    // Pre-validate `limit` BEFORE calling `bus.poll` — the bus
+    // advances the consumer cursor before returning, so any
+    // post-poll allocation failure (e.g. `Layout::array::<NetEvent>`
+    // overflow on a pathological `count`, or `std::alloc::alloc`
+    // returning null under memory pressure) would drop the response
+    // and lose every event the cursor just stepped past. Reject
+    // requests whose `count * size_of::<NetEvent>` would overflow
+    // `isize::MAX` (the `Layout::array` cap) up front, so the
+    // failure happens before the cursor moves.
+    if limit > 0
+        && (std::mem::size_of::<NetEvent>())
+            .checked_mul(limit)
+            .is_none_or(|v| v > isize::MAX as usize)
+    {
+        return NetError::IntOverflow.into();
+    }
+
     let handle = unsafe { &*handle };
     let _guard = match enter_ffi_op(handle) {
         Ok(g) => g,
