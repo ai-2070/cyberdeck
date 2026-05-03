@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/session.rs
+  726f3eb25aff9828 881-889,891,944-952,954
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "f1f21fd325e78dd0944c40744d622802c2274980",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2591,
+      "total_deletions": 2,
+      "accepted_lines": 390,
+      "overriden_lines": 0
+    }
+  }
+}
