@@ -2745,7 +2745,35 @@ impl MeshNode {
         // Registration happens BEFORE the send so that even if the
         // spawned send task is cancelled or panics post-send, the
         // initiator that just derived matching keys finds us.
+        //
+        // Replay guard: if a live session already exists for
+        // `peer_node_id` with the SAME `remote_static_pub`, drop the
+        // new handshake. NKpsk0's responder uses a fresh ephemeral
+        // on each reply so a captured msg1 replayed by a passive
+        // attacker would otherwise overwrite the live session keys
+        // — the legitimate initiator still holds the old keys and
+        // every subsequent AEAD-protected packet would fail open and
+        // be dropped, a trivial DoS against any node that ever
+        // handshook on a routed path. Re-handshake from the same
+        // identity is gated by session expiry / explicit removal,
+        // not by overwriting an active session in place.
         let remote_static_pub = keys.remote_static_pub;
+        if let Some(existing) = ctx.peers.get(&peer_node_id) {
+            if existing.remote_static_pub == remote_static_pub {
+                tracing::warn!(
+                    peer_node_id,
+                    "routed handshake: dropping msg1 — live session already \
+                     established for this peer with matching remote_static_pub \
+                     (replay guard)"
+                );
+                return;
+            }
+            // Different remote_static_pub for the same node_id is
+            // either a peer rotating its static key (legitimate) or
+            // an attacker forging a different static — let the
+            // initiator's matching-keys check resolve which.
+            // Fall through to insert below.
+        }
         let session = Arc::new(NetSession::new(
             keys,
             source,
