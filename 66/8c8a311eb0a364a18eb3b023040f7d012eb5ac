@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/reliability.rs
+  726f3eb25aff9828 188-196,218,231,235-247,339-345,348-356,705-752
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "668c8a311eb0a364a18eb3b023040f7d012eb5ac",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1246,
+      "total_deletions": 3,
+      "accepted_lines": 458,
+      "overriden_lines": 0
+    }
+  }
+}
