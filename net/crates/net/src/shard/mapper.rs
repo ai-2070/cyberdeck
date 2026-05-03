@@ -955,6 +955,17 @@ impl ShardMapper {
         }
         drop(shards);
         self.active_count.fetch_sub(1, AtomicOrdering::Release);
+        // Bump `last_scaling` so a subsequent `scale_up` is gated
+        // by the cooldown floor. Pre-fix `drain_specific` removed
+        // a shard from Active without touching `last_scaling`, so
+        // the sequence `drain_specific(id) → scale_up(N)`
+        // bypassed the cooldown — `scale_down` writes
+        // `last_scaling` precisely for this reason. From the
+        // budget-math perspective `drain_specific` IS a scale-
+        // down (it decrements `active_count` and trips the
+        // `min_shards` floor), so it should also gate
+        // re-expansion the same way.
+        *self.last_scaling.write() = Some(Instant::now());
         Ok(())
     }
 
@@ -2122,6 +2133,59 @@ mod tests {
             .next_shard_id
             .store(u16::MAX, AtomicOrdering::Relaxed);
         assert!(mapper.scale_up(0).is_ok());
+    }
+
+    /// Regression: `drain_specific` must bump `last_scaling` so
+    /// a subsequent `scale_up` is gated by the cooldown floor.
+    /// Pre-fix `scale_down` wrote `last_scaling` but
+    /// `drain_specific` did not, so the sequence
+    /// `drain_specific(id) → scale_up(N)` bypassed the cooldown
+    /// — even though both decrement `active_count` and so
+    /// should be symmetric from the budget-math perspective.
+    #[test]
+    fn drain_specific_bumps_last_scaling_so_scale_up_respects_cooldown() {
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 8,
+            // A cooldown long enough that `Instant::now()` won't
+            // accidentally elapse it during the test, but short
+            // enough not to slow CI.
+            cooldown: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let mapper = ShardMapper::new(3, 1024, policy).unwrap();
+
+        // Pre-condition: no prior scaling action.
+        assert!(mapper.last_scaling.read().is_none());
+
+        let before = Instant::now();
+        mapper.drain_specific(0).unwrap();
+        let after_ts = mapper
+            .last_scaling
+            .read()
+            .expect("drain_specific must record a `last_scaling` timestamp");
+        // Sanity: the recorded timestamp is in the test window.
+        assert!(
+            after_ts >= before,
+            "last_scaling must be bumped to a current Instant (got {:?}, before was {:?})",
+            after_ts,
+            before
+        );
+
+        // The decisive sealed property: a follow-up scale_up
+        // must trip the cooldown gate. Pre-fix this would have
+        // succeeded immediately because `last_scaling` was never
+        // written by `drain_specific`.
+        let err = mapper
+            .scale_up(1)
+            .expect_err("scale_up immediately after drain_specific must hit cooldown");
+        match err {
+            ScalingError::InCooldown => {} // expected
+            other => panic!(
+                "expected InCooldown after drain_specific, got {:?}",
+                other
+            ),
+        }
     }
 
     /// Regression: BUG_REPORT.md #48 — `drain_specific` must
