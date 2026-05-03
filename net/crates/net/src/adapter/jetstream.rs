@@ -417,25 +417,57 @@ impl Adapter for JetStreamAdapter {
             ));
         }
 
-        // Phase 1: enqueue all events in parallel.
-        let ack_futures = futures::future::try_join_all(publishes)
-            .await
-            .map_err(|e| {
+        // Phase 1: enqueue all events in parallel. Wrap in
+        // `tokio::time::timeout` so the bus's outer task
+        // cancellation (or any caller-imposed deadline) doesn't
+        // drop the futures mid-iteration, leaving bytes on the
+        // wire that the dedup window will eventually mask but
+        // that the bus believes never landed. The timeout
+        // surfaces as `Transient` so the bus retries with the
+        // same `Nats-Msg-Id` set — JetStream's dedup window
+        // (configured via `JetStreamAdapterConfig::dedup_window`)
+        // discards the prior copies. Pre-fix the unwrapped
+        // `try_join_all` was vulnerable to outer cancellation
+        // in exactly the way the Redis adapter calls out at
+        // `redis.rs:388-407`.
+        let phase1 =
+            tokio::time::timeout(self.config.request_timeout, futures::future::try_join_all(publishes));
+        let ack_futures = match phase1.await {
+            Ok(result) => result.map_err(|e| {
                 if is_transient_error(&e) {
                     AdapterError::Transient(e.to_string())
                 } else {
                     AdapterError::Fatal(e.to_string())
                 }
-            })?;
+            })?,
+            Err(_) => {
+                return Err(AdapterError::Transient(
+                    "JetStream publish enqueue phase timed out".into(),
+                ))
+            }
+        };
 
         // Phase 2: await all server acks in parallel.
         // `PublishAckFuture` implements `IntoFuture` (not `Future`),
         // so wrap each in an async block to call `.await`.
+        // Wrapped in the same `request_timeout` for the same
+        // cancellation-safety reason as phase 1.
         let acks = ack_futures.into_iter().map(|ack| async move {
             ack.await
                 .map_err(|e| AdapterError::Transient(e.to_string()))
         });
-        futures::future::try_join_all(acks).await?;
+        match tokio::time::timeout(self.config.request_timeout, futures::future::try_join_all(acks))
+            .await
+        {
+            Ok(result) => {
+                result?;
+            }
+            Err(_) => {
+                return Err(AdapterError::Transient(
+                    "JetStream publish ack phase timed out".into(),
+                ))
+            }
+        }
 
         tracing::trace!(
             shard_id = batch.shard_id,
