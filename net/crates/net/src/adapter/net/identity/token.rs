@@ -419,23 +419,40 @@ impl PermissionToken {
         Ok(child)
     }
 
-    /// Serialize the fields that are covered by the signature.
-    fn signed_payload(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(Self::SIGNED_PAYLOAD_SIZE);
-        buf.extend_from_slice(self.issuer.as_bytes());
-        buf.extend_from_slice(self.subject.as_bytes());
-        buf.extend_from_slice(&self.scope.bits().to_le_bytes());
-        buf.extend_from_slice(&self.channel_hash.to_le_bytes());
-        buf.extend_from_slice(&self.not_before.to_le_bytes());
-        buf.extend_from_slice(&self.not_after.to_le_bytes());
-        buf.push(self.delegation_depth);
-        buf.extend_from_slice(&self.nonce.to_le_bytes());
+    /// Serialize the fields that are covered by the signature into
+    /// a fixed-size stack buffer. The struct's signed-payload size
+    /// is a compile-time constant (95 bytes), so we don't need a
+    /// heap allocation per verify — the previous `Vec::with_capacity`
+    /// allocated and freed 95 bytes on every signature check, which
+    /// is the hottest path on every authenticated mesh packet.
+    /// Returning `[u8; SIGNED_PAYLOAD_SIZE]` keeps the layout
+    /// identical to the heap version (the existing callers'
+    /// `&payload` still resolves to a `&[u8]`).
+    fn signed_payload(&self) -> [u8; Self::SIGNED_PAYLOAD_SIZE] {
+        let mut buf = [0u8; Self::SIGNED_PAYLOAD_SIZE];
+        let mut off = 0;
+        buf[off..off + 32].copy_from_slice(self.issuer.as_bytes());
+        off += 32;
+        buf[off..off + 32].copy_from_slice(self.subject.as_bytes());
+        off += 32;
+        buf[off..off + 4].copy_from_slice(&self.scope.bits().to_le_bytes());
+        off += 4;
+        buf[off..off + 2].copy_from_slice(&self.channel_hash.to_le_bytes());
+        off += 2;
+        buf[off..off + 8].copy_from_slice(&self.not_before.to_le_bytes());
+        off += 8;
+        buf[off..off + 8].copy_from_slice(&self.not_after.to_le_bytes());
+        off += 8;
+        buf[off] = self.delegation_depth;
+        off += 1;
+        buf[off..off + 8].copy_from_slice(&self.nonce.to_le_bytes());
         buf
     }
 
     /// Serialize to wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = self.signed_payload();
+        let mut buf = Vec::with_capacity(Self::WIRE_SIZE);
+        buf.extend_from_slice(&self.signed_payload());
         buf.extend_from_slice(&self.signature);
         buf
     }
