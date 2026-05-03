@@ -483,11 +483,23 @@ impl NetRouter {
             0
         };
 
-        // Record stats
-        self.routing_table.record_in(stream_id, len);
+        // Per-stream `record_in` is deferred until the packet
+        // either delivers locally or survives all drop checks
+        // and is queued for forward. Pre-fix the call fired
+        // here (immediately after parse), so a packet that
+        // failed loop suppression or TTL incremented BOTH
+        // `packets_in` and `packets_dropped` for the stream —
+        // double-counting against any dashboard computing
+        // `delivery rate = packets_out / packets_in` (drops
+        // inflated the denominator without affecting the
+        // numerator, masking healthy networks behind apparent
+        // delivery loss). The drop paths now call
+        // `record_drop` only; `record_in` fires once for each
+        // successful local-delivery / forward.
 
         // Check if local delivery
         if self.routing_table.is_local(routing_header.dest_id) {
+            self.routing_table.record_in(stream_id, len);
             self.packets_local.fetch_add(1, Ordering::Relaxed);
             self.record_latency(start);
             return Ok(RouteAction::Local(data.slice(ROUTING_HEADER_SIZE..)));
@@ -533,6 +545,10 @@ impl NetRouter {
             self.routing_table.record_drop(stream_id);
             return Err(RouterError::TtlExpired);
         }
+        // All drop gates passed — count this packet as
+        // successfully ingressed for the stream before queueing
+        // the forward.
+        self.routing_table.record_in(stream_id, len);
         fwd_header.write_to(&mut new_data);
         new_data.extend_from_slice(&data[ROUTING_HEADER_SIZE..]);
 
@@ -1067,6 +1083,71 @@ mod tests {
             Ok(RouteAction::Forwarded(addr)) => assert_eq!(addr, dest_addr),
             other => panic!("expected Forwarded, got {:?}", other),
         }
+    }
+
+    /// Regression: a packet that fails any drop gate (loop
+    /// suppression, pre-decrement TTL, post-decrement TTL) must
+    /// NOT increment the per-stream `packets_in` counter — only
+    /// `packets_dropped`. Pre-fix `record_in` fired immediately
+    /// after parse, so a dropped packet incremented BOTH stream
+    /// counters; a dashboard computing `delivery_rate =
+    /// packets_out / packets_in` would see drops inflate the
+    /// denominator without affecting the numerator, masking
+    /// healthy networks behind apparent delivery loss.
+    ///
+    /// This pins the post-decrement TTL drop path (the audit's
+    /// stated trigger), but the structural change applies to
+    /// every drop path; the per-stream invariant is now
+    /// "packets_in counts only delivered or forwarded packets."
+    #[tokio::test]
+    async fn ttl_drop_does_not_double_count_packets_in_for_stream() {
+        let local_id = 0x1234u64;
+        let dest_id = 0x9999u64;
+        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+
+        let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
+        let router = NetRouter::new(config).await.unwrap();
+        router.routing_table().add_route(dest_id, dest_addr);
+
+        // TTL = 1 hits the post-decrement drop path. Same
+        // setup as `route_packet_drops_when_forward_makes_ttl_zero`.
+        let routing = RoutingHeader::new(dest_id, 0x5678, 1);
+        let routing_bytes = routing.to_bytes();
+        // NetHeader::new params: (session_id, stream_id, sequence, nonce, payload_len, event_count, flags)
+        let session_id = 0xAAAAu64;
+        let stream_id = 0x4242u64;
+        let net = NetHeader::new(
+            session_id,
+            stream_id,
+            1,
+            [0u8; 12],
+            0,
+            0,
+            super::super::protocol::PacketFlags::NONE,
+        );
+        let net_bytes = net.to_bytes();
+        let mut packet = BytesMut::with_capacity(ROUTING_HEADER_SIZE + HEADER_SIZE);
+        packet.extend_from_slice(&routing_bytes);
+        packet.extend_from_slice(&net_bytes);
+        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        let result = router.route_packet(packet.freeze(), from);
+        assert!(matches!(result, Err(RouterError::TtlExpired)));
+
+        let stats = router.routing_table().get_stream_stats(stream_id);
+        assert_eq!(
+            stats.get_packets_in(),
+            0,
+            "regression: a dropped packet must NOT increment per-stream \
+             packets_in. Pre-fix this counter was incremented before \
+             the TTL/loop checks, so drops double-counted as both \
+             ingressed and dropped — masking delivery rate dashboards."
+        );
+        assert_eq!(
+            stats.get_drops(),
+            1,
+            "drop must still increment per-stream packets_dropped"
+        );
     }
 
     #[test]
