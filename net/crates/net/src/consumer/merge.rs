@@ -676,12 +676,16 @@ impl PollMerger {
         };
         // Return the cursor even when all events were filtered out, so the
         // caller advances past the filtered region instead of re-fetching
-        // the same events forever. The cursor is None only when nothing was
-        // fetched at all (truly empty shards).
+        // the same events forever. When the poll made no progress at
+        // all, echo back the caller's input cursor (if any) instead of
+        // returning `None` — pre-fix a stalled poll dropped the cursor,
+        // so a caller that interpreted `next_id == None` as "no events,
+        // restart from the beginning" silently regressed pagination
+        // across the stall. Echoing preserves the cursor across stalls.
         let next_id = if we_made_progress {
             Some(final_cursor.encode()?)
         } else {
-            None
+            request.from_id.clone()
         };
 
         Ok(ConsumeResponse {
@@ -2339,6 +2343,78 @@ mod tests {
             response.next_id.is_none(),
             "next_id must remain None when no progress was made (#50)"
         );
+    }
+
+    /// Pin: a stalled poll (no events, no cursor advance) that
+    /// was given an input cursor must echo the cursor back to the
+    /// caller. Pre-fix the merger returned `next_id = None` on no
+    /// progress, so a caller that interpreted None as "no events
+    /// — restart from the beginning" silently re-fetched from the
+    /// stream's start across the stall, losing pagination
+    /// continuity.
+    #[tokio::test]
+    async fn stalled_poll_echoes_caller_cursor_back() {
+        struct EmptyAdapter;
+
+        #[async_trait]
+        impl Adapter for EmptyAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _shard_id: u16,
+                _from_id: Option<&str>,
+                _limit: usize,
+            ) -> Result<ShardPollResult, AdapterError> {
+                Ok(ShardPollResult {
+                    events: Vec::new(),
+                    next_id: None,
+                    has_more: false,
+                })
+            }
+            fn name(&self) -> &'static str {
+                "empty"
+            }
+        }
+
+        let adapter: Arc<dyn Adapter> = Arc::new(EmptyAdapter);
+        let merger = PollMerger::new(adapter, vec![0, 1]);
+
+        // Build a real composite cursor for the request to echo.
+        let mut cursor = CompositeCursor::new();
+        cursor.set(0, "1702-0".to_string());
+        cursor.set(1, "1703-0".to_string());
+        let encoded = cursor.encode().unwrap();
+
+        let mut req = ConsumeRequest::new(100);
+        req.from_id = Some(encoded.clone());
+
+        let response = merger.poll(req).await.unwrap();
+
+        assert!(response.events.is_empty());
+        assert_eq!(
+            response.next_id.as_deref(),
+            Some(encoded.as_str()),
+            "stalled poll with input cursor must echo cursor back \
+             (got {:?}); pre-fix this was None and callers paged \
+             back to the stream's start",
+            response.next_id,
+        );
+
+        // Without an input cursor, no progress + no input → still
+        // None (preserving the prior behavior of #50).
+        let response_no_cursor = merger.poll(ConsumeRequest::new(100)).await.unwrap();
+        assert!(response_no_cursor.next_id.is_none());
     }
 
     /// Regression: BUG_REPORT.md #52 — `sort_by_key(|e| e.insertion_ts)`
