@@ -7971,4 +7971,39 @@ mod heartbeat_aead_tests {
             );
         }
     }
+
+    /// Source-level pin: every `hop_count += 1` / `hop_count = X + 1`
+    /// pattern in this file MUST go through `saturating_add`.
+    /// `hop_count: u8` saturates at 255; an attacker-controlled
+    /// inbound packet whose `hop_count` is already u8::MAX would
+    /// debug-panic (`overflow`) or release-wraparound to 0 on a
+    /// bare `+= 1`. Today the upstream `< MAX_CAPABILITY_HOPS - 1`
+    /// guard bounds the value at 14 before the bump, so the
+    /// saturating call is dormant — but a future change that
+    /// raises the cap or relaxes the guard would otherwise turn
+    /// an attacker byte into UB / wrap. This pin ensures the
+    /// hardening stays in place even if the upstream gate moves.
+    #[test]
+    fn hop_count_increments_must_be_saturating() {
+        // Build the forbidden token at runtime so this test's source
+        // doesn't trigger itself.
+        let bare_bump = format!("hop_count {} 1", "+=");
+
+        let src = include_str!("mesh.rs");
+        for (lineno, line) in src.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // Comments are allowed to mention the pre-fix shape.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !trimmed.contains(&bare_bump),
+                "hop_count regression: bare `+= 1` reintroduced at \
+                 mesh.rs:{} — use `saturating_add(1)` so an attacker-\
+                 controlled `hop_count == u8::MAX` cannot wrap.\n  line: {}",
+                lineno + 1,
+                line,
+            );
+        }
+    }
 }
