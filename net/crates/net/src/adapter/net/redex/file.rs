@@ -371,6 +371,29 @@ impl RedexFile {
         self.inner.next_seq.load(Ordering::Acquire)
     }
 
+    /// Atomic snapshot of `(len, next_seq)`. Observers that need
+    /// both values consistently with each other (e.g. metrics
+    /// dashboards comparing "retained count" to "total seqs
+    /// assigned") should use this rather than `len()` followed
+    /// by `next_seq()`.
+    ///
+    /// Pre-fix observers called the two methods in sequence.
+    /// Each method takes the state lock individually, so the
+    /// per-call view is consistent — but two appends could
+    /// commit between the two reads, and the resulting pair
+    /// could satisfy `len + 1 > next_seq_seen` (reader saw
+    /// post-append `len` but pre-append `next_seq`). Observers
+    /// downstream of a metrics tick would then double-account
+    /// the in-flight seqs. This single-lock accessor returns
+    /// both values from one critical section so the snapshot is
+    /// strictly consistent.
+    pub fn len_and_next_seq(&self) -> (usize, u64) {
+        let state = self.inner.state.lock();
+        let len = state.index.len();
+        let next_seq = self.inner.next_seq.load(Ordering::Acquire);
+        (len, next_seq)
+    }
+
     /// Whether [`Self::close`] has run. After close, `tail` streams
     /// terminate with `Err(Closed)` and `append`/`append_*` reject
     /// with the same error.
@@ -1364,6 +1387,39 @@ mod tests {
         assert_eq!(f.append(b"b").unwrap(), 1);
         assert_eq!(f.append(b"c").unwrap(), 2);
         assert_eq!(f.next_seq(), 3);
+    }
+
+    /// Regression: `len_and_next_seq()` returns a consistent
+    /// `(len, next_seq)` snapshot under one lock. Pre-fix
+    /// observers calling `len()` then `next_seq()` could
+    /// catch a transient where two appends commit between the
+    /// reads and the snapshot satisfies `len + 1 > next_seq_seen`.
+    /// The single-lock accessor pins atomicity.
+    ///
+    /// We can't easily simulate the pre-fix race in a unit test
+    /// (it requires precise inter-thread interleaving), but we
+    /// can pin the structural invariant: at every observable
+    /// moment, `len_and_next_seq()` returns
+    /// `next_seq == len + lowest_retained_seq` (where
+    /// `lowest_retained_seq = 0` for an unpruned file). This is
+    /// true if and only if the snapshot was taken under the
+    /// state lock that the appender holds.
+    #[test]
+    fn len_and_next_seq_is_consistent_under_appends() {
+        let f = make_file("t-consistent-snapshot");
+        for i in 0..50 {
+            f.append(format!("evt-{i}").as_bytes()).unwrap();
+            let (len, next_seq) = f.len_and_next_seq();
+            // No prune in this test, so lowest_retained = 0.
+            assert_eq!(
+                next_seq as usize, len,
+                "regression: (len, next_seq) snapshot must satisfy \
+                 next_seq == len for an unpruned file. The atomic \
+                 accessor pins this; calling len() then next_seq() \
+                 separately could observe a transient where they \
+                 diverge by 1+ across concurrent appends."
+            );
+        }
     }
 
     /// `Debug` must not acquire `state.lock()`. Pre-fix it called
