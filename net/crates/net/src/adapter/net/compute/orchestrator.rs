@@ -582,6 +582,18 @@ pub const MAX_SNAPSHOT_SIZE: usize = u32::MAX as usize * MAX_SNAPSHOT_CHUNK_SIZE
 /// that will never arrive.
 pub const MAX_TOTAL_CHUNKS: u32 = 700_000;
 
+/// Hard upper bound on bytes buffered for a SINGLE in-flight reassembly.
+///
+/// `MAX_TOTAL_CHUNKS × MAX_SNAPSHOT_CHUNK_SIZE` ≈ 4.3 GiB; combined with the
+/// fact that `seq_through == latest` doesn't trigger eviction, an attacker
+/// can park up to that much memory per `(daemon_origin, seq_through)` and
+/// refresh forever without ever completing the snapshot. This cap is a
+/// hard ceiling on the per-entry buffer regardless of the declared
+/// `total_chunks`. Real daemon snapshots run in the megabytes, not
+/// gigabytes — 64 MiB leaves plenty of headroom while bounding the
+/// flood-amplification a malicious peer can produce.
+pub const MAX_PENDING_REASSEMBLY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Split a snapshot into chunked `SnapshotReady` messages.
 ///
 /// Small snapshots (<= `MAX_SNAPSHOT_CHUNK_SIZE`) produce a single message
@@ -666,6 +678,18 @@ pub enum ReassemblyError {
         /// The newest `seq_through` we've accepted for this daemon.
         latest: u64,
     },
+    /// Buffered bytes for this `(daemon_origin, seq_through)` would
+    /// exceed `MAX_PENDING_REASSEMBLY_BYTES`. Refusing the chunk
+    /// bounds the memory amplification a peer can drive by sending
+    /// only some of the chunks for an outsized declared snapshot.
+    TooManyPendingBytes {
+        /// Bytes already buffered for this entry.
+        buffered: usize,
+        /// Length of the chunk being rejected.
+        incoming: usize,
+        /// Per-entry cap.
+        cap: usize,
+    },
 }
 
 impl std::fmt::Display for ReassemblyError {
@@ -700,6 +724,11 @@ impl std::fmt::Display for ReassemblyError {
                 "seq_through {} is older than latest accepted {} for this daemon",
                 got, latest
             ),
+            Self::TooManyPendingBytes { buffered, incoming, cap } => write!(
+                f,
+                "buffered {} + incoming {} would exceed per-entry cap {}",
+                buffered, incoming, cap
+            ),
         }
     }
 }
@@ -723,6 +752,11 @@ pub struct SnapshotReassembler {
 struct ReassemblyState {
     total_chunks: u32,
     chunks: std::collections::BTreeMap<u32, Vec<u8>>,
+    /// Sum of `chunks` values' lengths. Maintained explicitly (rather
+    /// than recomputed via `chunks.values().map(Vec::len).sum()` per
+    /// feed) so the `MAX_PENDING_REASSEMBLY_BYTES` gate is O(1) per
+    /// chunk instead of O(chunks).
+    bytes_buffered: usize,
 }
 
 impl SnapshotReassembler {
@@ -799,6 +833,7 @@ impl SnapshotReassembler {
         let state = self.pending.entry(key).or_insert_with(|| ReassemblyState {
             total_chunks,
             chunks: std::collections::BTreeMap::new(),
+            bytes_buffered: 0,
         });
 
         // The first chunk fixes total_chunks; later chunks must agree.
@@ -809,7 +844,37 @@ impl SnapshotReassembler {
             });
         }
 
+        // Per-entry bytes cap. Refuse a chunk that would push the
+        // accumulated buffer past `MAX_PENDING_REASSEMBLY_BYTES`.
+        // Re-sending the same chunk index doesn't double-count: we
+        // subtract the displaced chunk's length below before
+        // re-checking. A peer that declares an oversized snapshot
+        // and ships only some of the chunks can no longer park
+        // ~4 GiB indefinitely — the cap forces the entry to be
+        // refused once buffered bytes exceed the ceiling.
+        let displaced_len = state
+            .chunks
+            .get(&chunk_index)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let projected = state
+            .bytes_buffered
+            .saturating_sub(displaced_len)
+            .saturating_add(snapshot_bytes.len());
+        if projected > MAX_PENDING_REASSEMBLY_BYTES {
+            return Err(ReassemblyError::TooManyPendingBytes {
+                buffered: state.bytes_buffered,
+                incoming: snapshot_bytes.len(),
+                cap: MAX_PENDING_REASSEMBLY_BYTES,
+            });
+        }
+
+        let new_len = snapshot_bytes.len();
         state.chunks.insert(chunk_index, snapshot_bytes);
+        state.bytes_buffered = state
+            .bytes_buffered
+            .saturating_sub(displaced_len)
+            .saturating_add(new_len);
 
         // With `chunk_index < total_chunks` enforced above, the BTreeMap's
         // keys are all in 0..total_chunks. Reaching total_chunks entries
@@ -2039,6 +2104,55 @@ mod tests {
             stale
         );
         assert_eq!(reassembler.pending_count(), 1);
+    }
+
+    /// Regression: a peer-driven reassembly that declares a large
+    /// `total_chunks` and ships chunks just up to the per-entry
+    /// byte cap is refused, rather than silently parking memory
+    /// indefinitely. Pre-fix `MAX_TOTAL_CHUNKS × MAX_SNAPSHOT_CHUNK_SIZE`
+    /// could buffer ~4.3 GiB per `(origin, seq)` key forever
+    /// because the eviction at `seq_through > latest` doesn't fire
+    /// when an attacker re-uses the same `seq_through`.
+    #[test]
+    fn reassembler_refuses_chunk_that_overflows_pending_byte_cap() {
+        let mut reassembler = SnapshotReassembler::new();
+
+        // Pre-fill to just under the cap. Each chunk is the max
+        // legal chunk size; we send unique indices so no chunk is
+        // displaced.
+        let chunk_full = vec![0xCCu8; MAX_SNAPSHOT_CHUNK_SIZE];
+        let chunks_to_fill = MAX_PENDING_REASSEMBLY_BYTES / MAX_SNAPSHOT_CHUNK_SIZE;
+        // Choose a `total_chunks` that fits the prefill + at least
+        // two more — so the entry is still incomplete after prefill
+        // and the next chunk lands in the same key.
+        let total_chunks = (chunks_to_fill as u32) + 2;
+        for i in 0..(chunks_to_fill as u32) {
+            reassembler
+                .feed(0xAAAA, chunk_full.clone(), 1, i, total_chunks)
+                .unwrap();
+        }
+
+        // The next chunk would push buffered past the cap. It must
+        // be refused with `TooManyPendingBytes`, not silently
+        // accepted.
+        let next_idx = chunks_to_fill as u32;
+        let result = reassembler.feed(0xAAAA, chunk_full.clone(), 1, next_idx, total_chunks);
+        assert!(
+            matches!(result, Err(ReassemblyError::TooManyPendingBytes { .. })),
+            "chunk that would overflow the per-entry cap must be refused, got {:?}",
+            result,
+        );
+
+        // Re-sending an index that is ALREADY buffered must succeed
+        // (the displaced chunk's bytes are subtracted before the cap
+        // re-check). Pin this so the cap doesn't break legitimate
+        // duplicate-chunk delivery.
+        let resend = reassembler.feed(0xAAAA, chunk_full.clone(), 1, 0, total_chunks);
+        assert!(
+            resend.is_ok(),
+            "re-sending an already-buffered chunk index must succeed, got {:?}",
+            resend
+        );
     }
 
     #[test]
