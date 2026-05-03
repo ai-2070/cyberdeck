@@ -58,7 +58,18 @@ impl AdaptiveBatcher {
     /// Call this each time events are drained from the ring buffer.
     #[inline]
     pub fn record_events(&mut self, count: usize) -> usize {
-        self.total_events += count as u64;
+        // Saturating-add: a stream that's ingested ~2^64 events
+        // is already in trouble, but a wrap from `u64::MAX` to a
+        // small value would interact with the
+        // `saturating_sub(oldest_count)` in `calculate_velocity`
+        // — the saturating-sub would underflow to 0 across the
+        // wraparound boundary and `velocity` would collapse to 0,
+        // forcing the batcher to its `min_size` floor right when
+        // sustained high throughput is exactly what the adaptive
+        // path was meant to handle. Saturating instead clamps at
+        // `u64::MAX` and `newest - oldest = 0` is the documented
+        // stop state.
+        self.total_events = self.total_events.saturating_add(count as u64);
 
         if !self.config.adaptive {
             return self.config.max_size;
