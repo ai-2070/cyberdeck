@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/redis.rs
+  726f3eb25aff9828 480-509
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "cd3661ebc5708b844c3a0b882d8aadbb447cf9cd",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 788,
+      "total_deletions": 19,
+      "accepted_lines": 30,
+      "overriden_lines": 0
+    }
+  }
+}
