@@ -688,20 +688,44 @@ impl Adapter for JetStreamAdapter {
 /// every error other than `WrongLastSequence` as retryable. The
 /// permissive default amplified misconfiguration into infinite
 /// retry storms — `StreamNotFound` and the `WrongLast*` variants
-/// are structural problems that do not become recoverable on retry.
+/// are structural problems that do not become recoverable on
+/// retry.
+///
+/// `PublishErrorKind::Other` is async-nats's catch-all for any
+/// error variant that doesn't have a dedicated arm — auth
+/// failures, permission-denied, account-misconfig, malformed-
+/// subject. None of these become retryable on retry; classifying
+/// them as transient (the pre-fix behaviour) drove the bus's
+/// outer retry loop into a tight infinite retry storm against a
+/// backend that would never succeed, which is a production-down
+/// scenario when an operator misconfigures a NATS account at
+/// deploy time. Treat `Other` as fatal so the misconfig
+/// surfaces as a hard error within seconds. Log the inner error
+/// before returning so the actual cause is grep-able from the
+/// logs (the variant doesn't expose enough context on its own).
 fn is_transient_error(e: &async_nats::jetstream::context::PublishError) -> bool {
     use async_nats::jetstream::context::PublishErrorKind;
     match e.kind() {
         // Network / connection / timing / backpressure — retry is meaningful.
         PublishErrorKind::TimedOut
         | PublishErrorKind::BrokenPipe
-        | PublishErrorKind::MaxAckPending
-        | PublishErrorKind::Other => true,
+        | PublishErrorKind::MaxAckPending => true,
         // Structural failures: missing stream and optimistic-concurrency
         // mismatches don't fix themselves under retry.
         PublishErrorKind::StreamNotFound
         | PublishErrorKind::WrongLastMessageId
         | PublishErrorKind::WrongLastSequence => false,
+        // Catch-all variant — log so the underlying cause is
+        // visible, then treat as fatal.
+        PublishErrorKind::Other => {
+            tracing::error!(
+                error = %e,
+                "JetStream publish: PublishErrorKind::Other treated as fatal \
+                 (auth / permission / account / subject config). Retrying \
+                 would loop until the underlying cause is fixed."
+            );
+            false
+        }
     }
 }
 
@@ -833,11 +857,17 @@ mod tests {
         assert!(is_transient_error(&PublishError::new(
             PublishErrorKind::MaxAckPending
         )));
-        assert!(is_transient_error(&PublishError::new(
+
+        // Fatal: structural / config / concurrency / catch-all.
+        // `Other` was pre-fix classified as transient; it's the
+        // async-nats catch-all for auth / permission / account /
+        // malformed-subject errors that never become retryable.
+        // Treating it as transient drove the outer retry loop
+        // into a tight infinite storm against a backend that
+        // would never succeed.
+        assert!(!is_transient_error(&PublishError::new(
             PublishErrorKind::Other
         )));
-
-        // Fatal: structural / config / concurrency.
         assert!(!is_transient_error(&PublishError::new(
             PublishErrorKind::StreamNotFound
         )));
