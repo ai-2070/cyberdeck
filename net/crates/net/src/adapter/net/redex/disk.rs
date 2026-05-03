@@ -1334,6 +1334,29 @@ impl DiskSegment {
             std::env::temp_dir().join(format!("redex-compact-dat-{}", placeholder_suffix));
         let placeholder_ts =
             std::env::temp_dir().join(format!("redex-compact-ts-{}", placeholder_suffix));
+        // RAII cleanup of the three placeholder files. Pre-fix the
+        // happy-path removal at the bottom of `compact_to` only ran
+        // when every post-rename reopen succeeded; any `?` early
+        // return on `open_or_poison` / `clone_or_poison` left the
+        // placeholders behind in `/tmp` forever, growing without
+        // bound on every reopen-failure event.
+        struct PlaceholderCleanup<'a> {
+            paths: [&'a Path; 3],
+        }
+        impl Drop for PlaceholderCleanup<'_> {
+            fn drop(&mut self) {
+                for path in self.paths {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let _placeholder_cleanup = PlaceholderCleanup {
+            paths: [
+                placeholder_idx.as_path(),
+                placeholder_dat.as_path(),
+                placeholder_ts.as_path(),
+            ],
+        };
         let null_idx = OpenOptions::new()
             .create(true)
             .write(true)
@@ -1470,12 +1493,9 @@ impl DiskSegment {
         *worker_dat_guard = new_dat_worker;
         *worker_ts_guard = new_ts_worker;
 
-        // Clean up placeholders. Best-effort; if the rename
-        // succeeded we can tolerate a stray file in the OS temp
-        // dir.
-        let _ = std::fs::remove_file(&placeholder_idx);
-        let _ = std::fs::remove_file(&placeholder_dat);
-        let _ = std::fs::remove_file(&placeholder_ts);
+        // Placeholder cleanup is handled by `_placeholder_cleanup`'s
+        // Drop above — runs whether we reach this success path OR
+        // bail via an earlier `?` on a post-rename reopen failure.
 
         Ok(())
     }
