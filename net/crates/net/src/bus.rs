@@ -1398,14 +1398,8 @@ impl EventBus {
         while self.in_flight_ingests.load(AtomicOrdering::SeqCst) > 0 {
             if tokio::time::Instant::now() >= in_flight_deadline {
                 let stranded = self.in_flight_ingests.load(AtomicOrdering::SeqCst);
-                let ingested_now = self
-                    .stats
-                    .events_ingested
-                    .load(AtomicOrdering::Acquire);
-                let dispatched_now = self
-                    .stats
-                    .events_dispatched
-                    .load(AtomicOrdering::Acquire);
+                let ingested_now = self.stats.events_ingested.load(AtomicOrdering::Acquire);
+                let dispatched_now = self.stats.events_dispatched.load(AtomicOrdering::Acquire);
                 tracing::warn!(
                     in_flight = stranded,
                     lossy = true,
@@ -1584,13 +1578,8 @@ impl EventBus {
         // remainder is producers whose `try_enter_ingest` succeeded
         // but never reached `shard_manager.ingest()` — those are
         // the genuinely-lost events we should account for.
-        if let Some((stranded, ingested_at_deadline, _dispatched_at_deadline)) =
-            deadline_snapshot
-        {
-            let ingested_after = self
-                .stats
-                .events_ingested
-                .load(AtomicOrdering::Acquire);
+        if let Some((stranded, ingested_at_deadline, _dispatched_at_deadline)) = deadline_snapshot {
+            let ingested_after = self.stats.events_ingested.load(AtomicOrdering::Acquire);
             let post_deadline_ingests = ingested_after.saturating_sub(ingested_at_deadline);
             let actual_drops = stranded.saturating_sub(post_deadline_ingests);
             if actual_drops > 0 {

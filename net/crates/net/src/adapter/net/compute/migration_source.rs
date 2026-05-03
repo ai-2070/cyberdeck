@@ -128,14 +128,14 @@ impl MigrationSourceHandler {
         // observe `Occupied`, another caller is mid-snapshot for
         // this origin; surface AlreadyMigrating without firing the
         // user's snapshot a second time.
-        let _claim = match self.snapshots_in_progress.entry(daemon_origin) {
+        match self.snapshots_in_progress.entry(daemon_origin) {
             dashmap::mapref::entry::Entry::Occupied(_) => {
                 return Err(MigrationError::AlreadyMigrating(daemon_origin));
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 entry.insert(());
             }
-        };
+        }
         // RAII drop of the claim regardless of which branch we exit
         // through. Keeping the claim past `migrations.entry` insert
         // is fine — the contains_key check at the top of subsequent

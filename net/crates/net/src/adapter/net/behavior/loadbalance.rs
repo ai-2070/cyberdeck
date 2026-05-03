@@ -975,6 +975,9 @@ impl LoadBalancer {
         // the function to fall through to the fallback-first path
         // and silently bias every selection to `endpoints[0]`. The
         // negated-greater check catches NaN as well as ≤ 0.0.
+        // Clippy flags the negated comparison; the lint is wrong
+        // for our NaN-safety intent, so suppress it locally.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
         if !(total_weight > 0.0) {
             return self.select_round_robin_at(endpoints, counter as usize);
         }

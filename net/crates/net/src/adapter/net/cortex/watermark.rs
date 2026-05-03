@@ -390,11 +390,8 @@ mod tests {
         let app_seq2 = Arc::new(AtomicU64::new(0));
         let mut wf2 = WatermarkingFold::new(MockFold::new(), app_seq2.clone(), ORIGIN_US);
         let mut state2 = Vec::new();
-        wf2.apply(
-            &ev_with_meta(0, ORIGIN_US, u64::MAX - 1, b""),
-            &mut state2,
-        )
-        .unwrap();
+        wf2.apply(&ev_with_meta(0, ORIGIN_US, u64::MAX - 1, b""), &mut state2)
+            .unwrap();
         assert_eq!(
             app_seq2.load(Ordering::Acquire),
             u64::MAX,

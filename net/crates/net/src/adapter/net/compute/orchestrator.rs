@@ -724,7 +724,11 @@ impl std::fmt::Display for ReassemblyError {
                 "seq_through {} is older than latest accepted {} for this daemon",
                 got, latest
             ),
-            Self::TooManyPendingBytes { buffered, incoming, cap } => write!(
+            Self::TooManyPendingBytes {
+                buffered,
+                incoming,
+                cap,
+            } => write!(
                 f,
                 "buffered {} + incoming {} would exceed per-entry cap {}",
                 buffered, incoming, cap
@@ -852,11 +856,7 @@ impl SnapshotReassembler {
         // and ships only some of the chunks can no longer park
         // ~4 GiB indefinitely — the cap forces the entry to be
         // refused once buffered bytes exceed the ceiling.
-        let displaced_len = state
-            .chunks
-            .get(&chunk_index)
-            .map(Vec::len)
-            .unwrap_or(0);
+        let displaced_len = state.chunks.get(&chunk_index).map(Vec::len).unwrap_or(0);
         let projected = state
             .bytes_buffered
             .saturating_sub(displaced_len)
@@ -1815,7 +1815,11 @@ mod tests {
         let orch = MigrationOrchestrator::new(reg, 0x3333);
 
         let msgs = orch.start_migration(origin, 0x1111, 0x2222).unwrap();
-        assert_eq!(msgs.len(), 1, "remote-source path emits exactly one TakeSnapshot");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "remote-source path emits exactly one TakeSnapshot"
+        );
         match &msgs[0] {
             MigrationMessage::TakeSnapshot {
                 daemon_origin,
@@ -1851,17 +1855,14 @@ mod tests {
     /// found nobody to attempt against.
     #[test]
     fn start_migration_auto_returns_no_target_available_when_scheduler_finds_nothing() {
-        use crate::adapter::net::behavior::capability::{
-            CapabilityIndex, CapabilitySet,
-        };
+        use crate::adapter::net::behavior::capability::{CapabilityIndex, CapabilitySet};
 
         let (reg, origin) = setup_registry();
         let orch = MigrationOrchestrator::new(reg, 0x1111);
 
         // Empty index — no candidate nodes anywhere.
         let index = Arc::new(CapabilityIndex::new());
-        let scheduler =
-            super::super::Scheduler::new(index, 0x1111, CapabilitySet::default());
+        let scheduler = super::super::Scheduler::new(index, 0x1111, CapabilitySet::default());
 
         // A filter that nothing in the empty index can satisfy.
         let filter = CapabilityFilter::default();
@@ -1926,7 +1927,10 @@ mod tests {
         // only cleared its own record, leaving the source mirror
         // intact.
         orch.start_migration(origin, 0x1111, 0x2222).unwrap();
-        assert!(orch.is_migrating(origin), "orchestrator records the migration");
+        assert!(
+            orch.is_migrating(origin),
+            "orchestrator records the migration"
+        );
         assert!(
             source.is_migrating(origin),
             "source handler also records the migration via the orchestrator",
@@ -1934,7 +1938,10 @@ mod tests {
 
         // Abort. Both sides must clear.
         orch.abort_migration(origin, "test abort".into()).unwrap();
-        assert!(!orch.is_migrating(origin), "orchestrator must clear its record");
+        assert!(
+            !orch.is_migrating(origin),
+            "orchestrator must clear its record"
+        );
         assert!(
             !source.is_migrating(origin),
             "source handler must also clear its mirror entry on abort",

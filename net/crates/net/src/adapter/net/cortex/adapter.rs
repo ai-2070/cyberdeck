@@ -650,18 +650,15 @@ mod tests {
         // Wrap each in a tight timeout — pre-fix behavior was
         // an indefinite block.
         for seq in 0..5u64 {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                adapter.wait_for_seq(seq),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "wait_for_seq({}) blocked past start_seq=5 — \
+            tokio::time::timeout(std::time::Duration::from_secs(2), adapter.wait_for_seq(seq))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "wait_for_seq({}) blocked past start_seq=5 — \
                      short-circuit regressed",
-                    seq
-                )
-            });
+                        seq
+                    )
+                });
         }
     }
 

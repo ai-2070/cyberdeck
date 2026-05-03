@@ -2793,9 +2793,7 @@ mod tests {
         let src = include_str!("disk.rs");
 
         let header = "pub(super) fn open(";
-        let start = src
-            .find(header)
-            .expect("DiskSegment::open must exist");
+        let start = src.find(header).expect("DiskSegment::open must exist");
         let body_start = start + header.len();
         let next_fn_offsets: Vec<usize> = ["\n    fn ", "\n    pub fn ", "\n    pub(super) fn "]
             .iter()
@@ -2877,9 +2875,7 @@ mod tests {
         let src = include_str!("disk.rs");
 
         let header = "fn rollback_truncate(";
-        let start = src
-            .find(header)
-            .expect("rollback_truncate must exist");
+        let start = src.find(header).expect("rollback_truncate must exist");
         let body_start = start + header.len();
         let next_fn_offsets: Vec<usize> = ["\n    fn ", "\n    pub fn ", "\n    pub(super) fn "]
             .iter()

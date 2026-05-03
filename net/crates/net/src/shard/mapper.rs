@@ -177,17 +177,15 @@ impl ShardMetricsCollector {
         // desync. Saturating ops cap at u32::MAX inside the
         // pack window (~4 G calls / 4 s of accumulated latency),
         // which is far beyond any sane metrics tick.
-        let _ = self.push_latency.fetch_update(
-            AtomicOrdering::Relaxed,
-            AtomicOrdering::Relaxed,
-            |v| {
-                let count = (v >> 32) as u32;
-                let sum = (v & 0xFFFF_FFFF) as u32;
-                let new_count = count.saturating_add(1) as u64;
-                let new_sum = sum.saturating_add(latency_ns.min(u32::MAX as u64) as u32) as u64;
-                Some((new_count << 32) | new_sum)
-            },
-        );
+        let _ =
+            self.push_latency
+                .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
+                    let count = (v >> 32) as u32;
+                    let sum = (v & 0xFFFF_FFFF) as u32;
+                    let new_count = count.saturating_add(1) as u64;
+                    let new_sum = sum.saturating_add(latency_ns.min(u32::MAX as u64) as u32) as u64;
+                    Some((new_count << 32) | new_sum)
+                });
         // Always increment — the cost is one fetch_add and the
         // counter only matters when the shard is draining. Cheaper
         // than branching on `self.draining.load()` in the hot path.
@@ -282,11 +280,11 @@ impl ShardMetricsCollector {
         // chance of catching the sum without the matching count
         // (or vice versa) the way two independent swaps did.
         let push_packed = self.push_latency.swap(0, AtomicOrdering::Relaxed);
-        let push_count = (push_packed >> 32) as u64;
-        let push_latency_sum = (push_packed & 0xFFFF_FFFF) as u64;
+        let push_count = push_packed >> 32;
+        let push_latency_sum = push_packed & 0xFFFF_FFFF;
         let flush_packed = self.flush_latency.swap(0, AtomicOrdering::Relaxed);
-        let flush_count = (flush_packed >> 32) as u64;
-        let flush_latency_sum = (flush_packed & 0xFFFF_FFFF) as u64;
+        let flush_count = flush_packed >> 32;
+        let flush_latency_sum = flush_packed & 0xFFFF_FFFF;
 
         let fill_ratio = if self.capacity > 0 {
             current_len as f64 / self.capacity as f64
@@ -2472,10 +2470,7 @@ mod tests {
             .expect_err("scale_up immediately after drain_specific must hit cooldown");
         match err {
             ScalingError::InCooldown => {} // expected
-            other => panic!(
-                "expected InCooldown after drain_specific, got {:?}",
-                other
-            ),
+            other => panic!("expected InCooldown after drain_specific, got {:?}", other),
         }
     }
 

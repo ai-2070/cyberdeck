@@ -347,7 +347,10 @@ impl std::fmt::Display for MigrationError {
             Self::DaemonNotFound(id) => write!(f, "daemon {:#x} not found", id),
             Self::TargetUnavailable(id) => write!(f, "target node {:#x} unavailable", id),
             Self::NoTargetAvailable => {
-                write!(f, "no candidate node satisfies the daemon's capability requirements")
+                write!(
+                    f,
+                    "no candidate node satisfies the daemon's capability requirements"
+                )
             }
             Self::StateFailed(msg) => write!(f, "state operation failed: {}", msg),
             Self::AlreadyMigrating(id) => write!(f, "daemon {:#x} already migrating", id),
@@ -537,9 +540,7 @@ mod tests {
         // `elapsed_ms` must derive from `started_at.elapsed()`,
         // not from `current_timestamp().saturating_sub(...)`.
         let elapsed_marker = "pub fn elapsed_ms(";
-        let elapsed_start = src
-            .find(elapsed_marker)
-            .expect("elapsed_ms must exist");
+        let elapsed_start = src.find(elapsed_marker).expect("elapsed_ms must exist");
         let elapsed_end_offset = src[elapsed_start..]
             .find("\n    }")
             .expect("elapsed_ms body must terminate")

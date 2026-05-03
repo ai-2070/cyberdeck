@@ -1284,12 +1284,12 @@ impl SafetyEnforcer {
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     Some(current.saturating_sub(claim.concurrent_slots))
                 });
-        let _ =
-            self.usage
-                .memory_mb
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    Some(current.saturating_sub(claim.memory_mb))
-                });
+        let _ = self
+            .usage
+            .memory_mb
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(claim.memory_mb))
+            });
         // Release tokens and cost that were acquired — without this,
         // both counters grow monotonically, hitting limits prematurely.
         let _ = self

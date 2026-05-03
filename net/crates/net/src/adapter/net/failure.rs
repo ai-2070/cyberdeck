@@ -300,10 +300,7 @@ impl FailureDetector {
         // takes the failure-detection loop down with it. Matches
         // the recovery pattern used elsewhere in the crate
         // (e.g. `crypto.rs::sliding_window`).
-        let mut last = self
-            .last_cleanup
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut last = self.last_cleanup.lock().unwrap_or_else(|p| p.into_inner());
         if last.elapsed() < self.config.cleanup_interval {
             return 0;
         }
@@ -575,7 +572,11 @@ impl CircuitBreaker {
         match *state {
             CircuitState::Closed | CircuitState::HalfOpen => true,
             CircuitState::Open => {
-                let elapsed = self.last_state_change.lock().unwrap_or_else(|p| p.into_inner()).elapsed();
+                let elapsed = self
+                    .last_state_change
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .elapsed();
                 if elapsed >= self.reset_timeout {
                     Self::transition_locked(
                         &mut state,
@@ -1489,10 +1490,7 @@ mod tests {
                      consistently across both branches"
                 );
             }
-            other => panic!(
-                "unfailed-node branch must return Retry, got {:?}",
-                other
-            ),
+            other => panic!("unfailed-node branch must return Retry, got {:?}", other),
         }
     }
 }

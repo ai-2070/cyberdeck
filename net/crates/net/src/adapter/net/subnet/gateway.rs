@@ -301,13 +301,8 @@ mod tests {
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
         // Parent → child must drop.
-        let decision = gw.should_forward(
-            SubnetId::new(&[1]),
-            SubnetId::new(&[1, 2]),
-            ch,
-            TEST_TTL,
-            0,
-        );
+        let decision =
+            gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[1, 2]), ch, TEST_TTL, 0);
         assert_eq!(
             decision,
             ForwardDecision::Drop(DropReason::NotAncestor),

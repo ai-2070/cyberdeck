@@ -733,13 +733,25 @@ mod tests {
         let typed_transient: &[(ErrorKind, &str)] = &[
             (ErrorKind::Server(ServerErrorKind::Moved), "MOVED redirect"),
             (ErrorKind::Server(ServerErrorKind::Ask), "ASK redirect"),
-            (ErrorKind::Server(ServerErrorKind::ClusterDown), "cluster down"),
-            (ErrorKind::Server(ServerErrorKind::MasterDown), "master down"),
-            (ErrorKind::Server(ServerErrorKind::ReadOnly), "read-only replica"),
+            (
+                ErrorKind::Server(ServerErrorKind::ClusterDown),
+                "cluster down",
+            ),
+            (
+                ErrorKind::Server(ServerErrorKind::MasterDown),
+                "master down",
+            ),
+            (
+                ErrorKind::Server(ServerErrorKind::ReadOnly),
+                "read-only replica",
+            ),
             (ErrorKind::Server(ServerErrorKind::BusyLoading), "loading"),
             (ErrorKind::Server(ServerErrorKind::TryAgain), "try again"),
             (ErrorKind::Io, "I/O error"),
-            (ErrorKind::ClusterConnectionNotFound, "no cluster connection"),
+            (
+                ErrorKind::ClusterConnectionNotFound,
+                "no cluster connection",
+            ),
         ];
         for (kind, label) in typed_transient {
             let err = RedisError::from((*kind, "test"));
@@ -754,15 +766,9 @@ mod tests {
         // Untyped extension errors — message-substring branch.
         // `NOREPLICAS` doesn't have a typed kind in this redis
         // crate version, so it surfaces as Extension.
-        let extension_transient: &[&str] = &[
-            "NOREPLICAS Not enough good replicas to write",
-        ];
+        let extension_transient: &[&str] = &["NOREPLICAS Not enough good replicas to write"];
         for msg in extension_transient {
-            let err = RedisError::from((
-                ErrorKind::Extension,
-                "test",
-                msg.to_string(),
-            ));
+            let err = RedisError::from((ErrorKind::Extension, "test", msg.to_string()));
             assert!(
                 is_transient_error(&err),
                 "extension `{}` must classify as transient",

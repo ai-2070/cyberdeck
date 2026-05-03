@@ -1211,7 +1211,10 @@ mod tests {
         // Freshness arm: `last_seq` still advances on the newer
         // pingwave so subsequent staleness / restart checks see the
         // current sequence number.
-        assert!(node.last_seq > direct_last_seq, "freshness must still advance");
+        assert!(
+            node.last_seq > direct_last_seq,
+            "freshness must still advance"
+        );
         assert_eq!(node.last_seq, 9);
     }
 

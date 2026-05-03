@@ -15,9 +15,9 @@ use net::adapter::net::behavior::capability::{
 use net::adapter::net::behavior::loadbalance::{RequestContext, Strategy};
 use net::adapter::net::compute::migration_target::RestoreContext;
 use net::adapter::net::compute::{
-    chunk_snapshot, DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, ForkGroup,
-    ForkGroupConfig, GroupCoordinator, GroupError, GroupHealth, MemberInfo, MemberRole, MeshDaemon,
-    MigrationMessage, MigrationOrchestrator, MigrationPhase, MigrationSourceHandler,
+    chunk_snapshot, BufferOutcome, DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry,
+    ForkGroup, ForkGroupConfig, GroupCoordinator, GroupError, GroupHealth, MemberInfo, MemberRole,
+    MeshDaemon, MigrationMessage, MigrationOrchestrator, MigrationPhase, MigrationSourceHandler,
     MigrationTargetHandler, ReplicaGroup, ReplicaGroupConfig, Scheduler, SnapshotReassembler,
     StandbyGroup, StandbyGroupConfig, MAX_SNAPSHOT_CHUNK_SIZE,
 };
@@ -166,7 +166,10 @@ fn test_orchestrator_phase_chain_with_buffered_events() {
 
     // Buffer events while snapshot is in flight
     for seq in 1..=5 {
-        assert!(orch.buffer_event(origin, make_event(0xBBBB, seq)));
+        assert_eq!(
+            orch.buffer_event(origin, make_event(0xBBBB, seq)),
+            BufferOutcome::Buffered,
+        );
     }
 
     // Restore complete → should drain buffered events

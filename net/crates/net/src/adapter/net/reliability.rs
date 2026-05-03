@@ -712,8 +712,7 @@ mod tests {
     #[test]
     fn reliable_stream_records_untracked_evictions_when_window_full() {
         const MAX_PENDING: usize = 4;
-        let mut mode =
-            ReliableStream::with_settings(Duration::from_millis(50), MAX_PENDING, 3);
+        let mut mode = ReliableStream::with_settings(Duration::from_millis(50), MAX_PENDING, 3);
         assert_eq!(mode.untracked_evictions(), 0);
 
         // Fill the window — no evictions yet.

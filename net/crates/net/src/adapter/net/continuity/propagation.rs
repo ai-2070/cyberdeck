@@ -105,8 +105,7 @@ impl PropagationModel {
         }
 
         // Compute implied per-hop base latency: RTT / 2 / hops / multiplier
-        let per_hop_f =
-            measured_rtt_nanos as f64 / (2.0 * hop_count as f64 * multiplier as f64);
+        let per_hop_f = measured_rtt_nanos as f64 / (2.0 * hop_count as f64 * multiplier as f64);
         // Reject samples that overflow the u64 cast or aren't a
         // real number. Pre-fix, a pathological RTT (or a NaN
         // multiplier slipping through) clamped `per_hop` at

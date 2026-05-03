@@ -227,9 +227,7 @@ impl<'a> FfiOpGuard<'a> {
         if handle
             .shutting_down
             .load(std::sync::atomic::Ordering::SeqCst)
-            || handle
-                .bus_taken
-                .load(std::sync::atomic::Ordering::SeqCst)
+            || handle.bus_taken.load(std::sync::atomic::Ordering::SeqCst)
         {
             handle
                 .active_ops
@@ -256,7 +254,7 @@ impl Drop for FfiOpGuard<'_> {
 /// immediate UB on `&*handle`, even before the `is_null` check.
 #[inline]
 fn handle_is_valid(handle: *const NetHandle) -> bool {
-    !handle.is_null() && (handle as usize) % std::mem::align_of::<NetHandle>() == 0
+    !handle.is_null() && (handle as usize).is_multiple_of(std::mem::align_of::<NetHandle>())
 }
 
 /// Error codes returned by FFI functions.
@@ -1018,7 +1016,7 @@ pub extern "C" fn net_poll(
         .unwrap_or_else(|_| String::from(
             r#"{"events":[],"next_id":null,"has_more":true,"count":0,"parse_errors":0,"buffer_too_small":true}"#
         ));
-        if fallback.len() + 1 <= buffer_len {
+        if fallback.len() < buffer_len {
             unsafe {
                 ptr::copy_nonoverlapping(
                     fallback.as_ptr() as *const c_char,
@@ -1910,7 +1908,10 @@ mod tests {
         // `and_then(|v| v.as_str())` short-circuit and was
         // ignored entirely.
         let cfg = parse_config_json(r#"{"backpressure_mode": 42}"#);
-        assert!(cfg.is_none(), "non-string non-object backpressure_mode must reject");
+        assert!(
+            cfg.is_none(),
+            "non-string non-object backpressure_mode must reject"
+        );
         let cfg = parse_config_json(r#"{"backpressure_mode": true}"#);
         assert!(cfg.is_none(), "boolean backpressure_mode must reject");
     }
@@ -1922,10 +1923,7 @@ mod tests {
     #[test]
     fn parse_config_supports_sample_mode_with_validation() {
         let cfg = parse_config_json(r#"{"backpressure_mode": {"Sample": {"rate": 10}}}"#);
-        assert!(
-            cfg.is_some(),
-            "Sample with non-zero rate must parse"
-        );
+        assert!(cfg.is_some(), "Sample with non-zero rate must parse");
 
         let cfg = parse_config_json(r#"{"backpressure_mode": {"Sample": {"rate": 0}}}"#);
         assert!(cfg.is_none(), "Sample with rate=0 must reject");

@@ -669,12 +669,9 @@ async fn manual_scale_down_returns_within_bounded_time_when_adapter_wedged() {
     // (which uses adapter_timeout = 150 ms with retries). Allow
     // generous slack for CI.
     let started = std::time::Instant::now();
-    let result = tokio::time::timeout(
-        Duration::from_secs(15),
-        bus.manual_scale_down(2),
-    )
-    .await
-    .expect("manual_scale_down hung past 15s — timeout-bounded teardown regressed");
+    let result = tokio::time::timeout(Duration::from_secs(15), bus.manual_scale_down(2))
+        .await
+        .expect("manual_scale_down hung past 15s — timeout-bounded teardown regressed");
     result.expect("manual_scale_down returned Err");
 
     let elapsed = started.elapsed();

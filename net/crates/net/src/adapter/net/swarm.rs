@@ -1124,7 +1124,11 @@ mod tests {
             graph.on_pingwave(pw, legit);
         }
         assert_eq!(
-            graph.nodes.get(&0xBEEF).map(|n| (n.addr, n.last_seq, n.hops)).unwrap(),
+            graph
+                .nodes
+                .get(&0xBEEF)
+                .map(|n| (n.addr, n.last_seq, n.hops))
+                .unwrap(),
             (legit, 1000, 3),
         );
 

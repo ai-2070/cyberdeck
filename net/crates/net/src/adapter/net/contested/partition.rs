@@ -253,8 +253,7 @@ impl PartitionDetector {
                 if record.other_side.is_empty() {
                     record.phase = PartitionPhase::Healed;
                 } else {
-                    let ratio =
-                        reappeared.len() as f32 / record.other_side.len() as f32;
+                    let ratio = reappeared.len() as f32 / record.other_side.len() as f32;
                     if ratio >= self.healing_threshold {
                         record.phase = PartitionPhase::Healed;
                     }

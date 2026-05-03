@@ -166,7 +166,12 @@ impl JetStreamAdapter {
             ))
         })?;
 
-        Ok(StoredEvent::new(seq.to_string(), raw_bytes, parsed.t, shard_id))
+        Ok(StoredEvent::new(
+            seq.to_string(),
+            raw_bytes,
+            parsed.t,
+            shard_id,
+        ))
     }
 
     /// Get or create a stream for a shard.
@@ -430,11 +435,7 @@ impl Adapter for JetStreamAdapter {
             // Push the un-awaited future. `js.publish_with_headers`
             // borrows `js`, which lives for the rest of this
             // function — fine for `try_join_all` here.
-            publishes.push(js.publish_with_headers(
-                subject.clone(),
-                headers,
-                data.into(),
-            ));
+            publishes.push(js.publish_with_headers(subject.clone(), headers, data.into()));
         }
 
         // Phase 1: enqueue all events in parallel. Wrap in
@@ -450,8 +451,10 @@ impl Adapter for JetStreamAdapter {
         // `try_join_all` was vulnerable to outer cancellation
         // in exactly the way the Redis adapter calls out at
         // `redis.rs:388-407`.
-        let phase1 =
-            tokio::time::timeout(self.config.request_timeout, futures::future::try_join_all(publishes));
+        let phase1 = tokio::time::timeout(
+            self.config.request_timeout,
+            futures::future::try_join_all(publishes),
+        );
         let ack_futures = match phase1.await {
             Ok(result) => result.map_err(|e| {
                 if is_transient_error(&e) {
@@ -476,8 +479,11 @@ impl Adapter for JetStreamAdapter {
             ack.await
                 .map_err(|e| AdapterError::Transient(e.to_string()))
         });
-        match tokio::time::timeout(self.config.request_timeout, futures::future::try_join_all(acks))
-            .await
+        match tokio::time::timeout(
+            self.config.request_timeout,
+            futures::future::try_join_all(acks),
+        )
+        .await
         {
             Ok(result) => {
                 result?;

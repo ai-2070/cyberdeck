@@ -533,9 +533,8 @@ impl Serialize for StoredEvent {
         // not a silent null" guarantee is preserved), but emits
         // the original bytes verbatim instead of round-tripping
         // through a value tree.
-        let raw_str = std::str::from_utf8(&self.raw).map_err(|e| {
-            serde::ser::Error::custom(format!("invalid raw UTF-8: {}", e))
-        })?;
+        let raw_str = std::str::from_utf8(&self.raw)
+            .map_err(|e| serde::ser::Error::custom(format!("invalid raw UTF-8: {}", e)))?;
         let raw_value = serde_json::value::RawValue::from_string(raw_str.to_string())
             .map_err(|e| serde::ser::Error::custom(format!("invalid raw JSON: {}", e)))?;
         state.serialize_field("raw", &*raw_value)?;

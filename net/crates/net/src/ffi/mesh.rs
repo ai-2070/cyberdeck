@@ -3228,7 +3228,8 @@ mod tests {
         // x10 storage must reproduce 65_535, NOT some lossily
         // rounded approximation of 1_000_000_000.
         assert_eq!(
-            info.fp16_tflops_x10, u16::MAX as u32,
+            info.fp16_tflops_x10,
+            u16::MAX as u32,
             "fp16_tflops_x10 must saturate at u16::MAX (65535) instead of \
              losing precision through the f32 round-trip; got {}",
             info.fp16_tflops_x10,

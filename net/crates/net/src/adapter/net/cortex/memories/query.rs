@@ -82,16 +82,12 @@ impl MemoriesFilterSpec {
         // trap-prone for callers building filters from UI multi-
         // select widgets that emit empty vectors.
         if let Some(tags) = &self.require_any_tag {
-            if !tags.is_empty()
-                && !tags.iter().any(|want| m.tags.iter().any(|t| t == want))
-            {
+            if !tags.is_empty() && !tags.iter().any(|want| m.tags.iter().any(|t| t == want)) {
                 return false;
             }
         }
         if let Some(tags) = &self.require_all_tags {
-            if !tags.is_empty()
-                && !tags.iter().all(|want| m.tags.iter().any(|t| t == want))
-            {
+            if !tags.is_empty() && !tags.iter().all(|want| m.tags.iter().any(|t| t == want)) {
                 return false;
             }
         }
@@ -371,10 +367,7 @@ mod tests {
         let total = s.memories.len();
 
         // `require_any_tag(empty)` → no constraint, returns all.
-        let any_empty: Vec<_> = s
-            .query()
-            .where_any_tag(Vec::<String>::new())
-            .collect();
+        let any_empty: Vec<_> = s.query().where_any_tag(Vec::<String>::new()).collect();
         assert_eq!(
             any_empty.len(),
             total,
@@ -388,10 +381,7 @@ mod tests {
         // all (this branch was already accepting all pre-fix; the
         // assertion ensures the new semantics keep the same
         // result for callers).
-        let all_empty: Vec<_> = s
-            .query()
-            .where_all_tags(Vec::<String>::new())
-            .collect();
+        let all_empty: Vec<_> = s.query().where_all_tags(Vec::<String>::new()).collect();
         assert_eq!(
             all_empty.len(),
             total,

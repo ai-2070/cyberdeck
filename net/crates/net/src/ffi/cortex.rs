@@ -208,7 +208,9 @@ const _: fn() = || {
     assert_send_sync::<InnerRedexFile>();
     assert_send_sync::<InnerTasksAdapter>();
     assert_send_sync::<InnerMemoriesAdapter>();
-    assert_send_sync::<TokioMutex<Option<BoxStream<'static, std::result::Result<RedexEvent, RedexError>>>>>();
+    assert_send_sync::<
+        TokioMutex<Option<BoxStream<'static, std::result::Result<RedexEvent, RedexError>>>>,
+    >();
     assert_send_sync::<TokioMutex<Option<BoxStream<'static, Vec<Task>>>>>();
     assert_send_sync::<TokioMutex<Option<BoxStream<'static, Vec<Memory>>>>>();
 };
@@ -1718,7 +1720,10 @@ mod tests {
         ];
         for (name, cfg) in valid {
             let rc = open_file(r, name, Some(cfg));
-            assert_eq!(rc, 0, "valid config {name:?} ({cfg}) should succeed (got {rc})");
+            assert_eq!(
+                rc, 0,
+                "valid config {name:?} ({cfg}) should succeed (got {rc})"
+            );
         }
 
         net_redex_free(r);

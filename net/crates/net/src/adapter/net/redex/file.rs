@@ -3078,9 +3078,7 @@ mod tests {
         // Locate `pub fn sweep_retention` and the next sibling
         // `fn ` after it — that's our scope.
         let header = "pub fn sweep_retention(";
-        let start = src
-            .find(header)
-            .expect("sweep_retention must exist");
+        let start = src.find(header).expect("sweep_retention must exist");
         let body_start = start + header.len();
         let next_fn = src[body_start..]
             .find("\n    fn ")

@@ -355,9 +355,7 @@ pub fn assess_continuity(log: &EntityLog, snapshot: Option<&StateSnapshot>) -> C
                 // — the typed signal for "we can't decide yet,
                 // re-fetch a clean snapshot."
                 (0, Some(payload)) if !payload.is_empty() => None,
-                (0, Some(_)) | (0, None) => {
-                    Some(compute_parent_hash(&s.chain_link, &[]))
-                }
+                (0, Some(_)) | (0, None) => Some(compute_parent_hash(&s.chain_link, &[])),
                 (_, Some(payload)) => Some(compute_parent_hash(&s.chain_link, payload)),
                 (_, None) => None, // missing context — Unverifiable
             }

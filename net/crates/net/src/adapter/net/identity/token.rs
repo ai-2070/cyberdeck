@@ -2186,10 +2186,9 @@ mod tests {
         for ch in 0u32..prefill as u32 {
             let mut t = template.clone();
             t.channel_hash = ch as u16;
-            cache.tokens.insert(
-                (*subject.entity_id().as_bytes(), ch as u16),
-                vec![t],
-            );
+            cache
+                .tokens
+                .insert((*subject.entity_id().as_bytes(), ch as u16), vec![t]);
         }
         assert_eq!(cache.tokens.len(), prefill);
 

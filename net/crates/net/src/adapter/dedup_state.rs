@@ -180,10 +180,8 @@ impl PersistentProducerNonce {
         // The OS-random samples below dominate the predictable
         // sources and restore the security margin.
         use std::hash::BuildHasher;
-        let os_entropy_a = std::collections::hash_map::RandomState::new()
-            .hash_one(0u64);
-        let os_entropy_b = std::collections::hash_map::RandomState::new()
-            .hash_one(0u64);
+        let os_entropy_a = std::collections::hash_map::RandomState::new().hash_one(0u64);
+        let os_entropy_b = std::collections::hash_map::RandomState::new().hash_one(0u64);
 
         let mut hash_input = [0u8; 64];
         hash_input[..8].copy_from_slice(&wall_nanos.to_le_bytes());

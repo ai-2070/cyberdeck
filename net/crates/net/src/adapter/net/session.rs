@@ -2716,9 +2716,9 @@ mod tests {
         // but we want to assert the length gate fires first
         // (no cipher work, no last_activity nudge).
         let mut nonce = [0u8; 12];
-        nonce[0..4].copy_from_slice(
-            &crate::adapter::net::crypto::session_prefix_from_id(keys.session_id),
-        );
+        nonce[0..4].copy_from_slice(&crate::adapter::net::crypto::session_prefix_from_id(
+            keys.session_id,
+        ));
         nonce[4..12].copy_from_slice(&0u64.to_le_bytes());
 
         let header = NetHeader::new(
@@ -2733,7 +2733,7 @@ mod tests {
 
         for bad_len in [0usize, 1, TAG_SIZE - 1, TAG_SIZE + 1, 64] {
             let parsed = ParsedPacket {
-                header: header.clone(),
+                header,
                 payload: Bytes::from(vec![0u8; bad_len]),
                 source: peer_addr,
             };

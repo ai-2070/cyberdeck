@@ -126,7 +126,7 @@ fn net_poll_accepts_buffers_at_or_above_minimum() {
     let mut buf = vec![0u8; 4096];
     let code = net_poll(
         handle,
-        b"{\"limit\": 10}\0".as_ptr() as *const c_char,
+        c"{\"limit\": 10}".as_ptr(),
         buf.as_mut_ptr() as *mut c_char,
         buf.len(),
     );

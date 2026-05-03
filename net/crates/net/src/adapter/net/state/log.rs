@@ -689,8 +689,7 @@ mod tests {
             log.base_link, appended[2],
             "partial prune must advance base_link to the last-pruned event's link \
              (got seq={}, expected seq={})",
-            log.base_link.sequence,
-            appended[2].sequence,
+            log.base_link.sequence, appended[2].sequence,
         );
 
         // Subsequent full prune still works correctly — base_link

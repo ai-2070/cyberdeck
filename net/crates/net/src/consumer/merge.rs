@@ -166,13 +166,10 @@ impl CompositeCursor {
         // consumer ended up with on round-trip.
         let raw_positions: HashMap<String, CursorPos> = serde_json::from_slice(&bytes)
             .map_err(|e| ConsumerError::InvalidCursor(e.to_string()))?;
-        let mut positions: HashMap<u16, CursorPos> =
-            HashMap::with_capacity(raw_positions.len());
+        let mut positions: HashMap<u16, CursorPos> = HashMap::with_capacity(raw_positions.len());
         for (key, val) in raw_positions {
             let id: u16 = key.parse().map_err(|_| {
-                ConsumerError::InvalidCursor(format!(
-                    "shard key {key:?} is not a valid u16"
-                ))
+                ConsumerError::InvalidCursor(format!("shard key {key:?} is not a valid u16"))
             })?;
             // Reject non-canonical stringifications. The
             // round-trip `u16 → String` is the canonical form;
@@ -964,12 +961,7 @@ mod tests {
     fn cursor_refuses_to_advance_across_backend_format_change() {
         let mut cursor = CompositeCursor::new();
         // Cursor starts at JetStream-style numeric "42".
-        cursor.update_from_events(&[StoredEvent::from_value(
-            "42".to_string(),
-            json!({}),
-            42,
-            0,
-        )]);
+        cursor.update_from_events(&[StoredEvent::from_value("42".to_string(), json!({}), 42, 0)]);
         assert_eq!(cursor.get(0), Some("42"));
 
         // A new event arrives in Redis format. Pre-fix this would
@@ -1170,8 +1162,8 @@ mod tests {
         // normally.
         let canonical = br#"{"0":"id_a","1":"id_b"}"#;
         let encoded_ok = BASE64.encode(canonical);
-        let cursor = CompositeCursor::decode(&encoded_ok)
-            .expect("canonical shard keys must decode cleanly");
+        let cursor =
+            CompositeCursor::decode(&encoded_ok).expect("canonical shard keys must decode cleanly");
         assert_eq!(cursor.get(0), Some("id_a"));
         assert_eq!(cursor.get(1), Some("id_b"));
     }

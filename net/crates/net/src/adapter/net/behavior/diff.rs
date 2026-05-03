@@ -232,9 +232,7 @@ impl CapabilityDiff {
     /// drops the empty payload and the two sides diverge with no
     /// diagnostic. New callers MUST use [`Self::try_to_bytes`],
     /// which surfaces the cap violation as a typed error.
-    #[deprecated(
-        note = "use `try_to_bytes` — `to_bytes` swallows cap-violations as an empty Vec"
-    )]
+    #[deprecated(note = "use `try_to_bytes` — `to_bytes` swallows cap-violations as an empty Vec")]
     pub fn to_bytes(&self) -> Vec<u8> {
         self.try_to_bytes().unwrap_or_default()
     }

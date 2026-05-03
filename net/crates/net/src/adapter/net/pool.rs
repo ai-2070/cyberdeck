@@ -1261,7 +1261,10 @@ mod tests {
         pool_a.release(b);
         let pool_a_id = pool_a.pool_id;
         let with_a = LOCAL_BUILDERS.with(|m| m.borrow().contains_key(&pool_a_id));
-        assert!(with_a, "pool A's TLS slot must be populated after acquire/release");
+        assert!(
+            with_a,
+            "pool A's TLS slot must be populated after acquire/release"
+        );
 
         // Drop the pool.
         drop(pool_a);

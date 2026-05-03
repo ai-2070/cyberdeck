@@ -427,7 +427,7 @@ impl ShardManager {
     /// [`select_shard_by_hash`]: Self::select_shard_by_hash
     #[inline]
     #[deprecated(
-        since = "0.8.0",
+        since = "0.9.0",
         note = "serializes the value just to hash it; prefer `RawEvent::from_value(v).hash()` + `select_shard_by_hash` to avoid the duplicate serialization"
     )]
     pub fn select_shard(&self, event: &JsonValue) -> u16 {
@@ -448,32 +448,17 @@ impl ShardManager {
             // Dynamic mode: use weighted selection
             mapper.select_shard(hash)
         } else {
-            // Static mode: Lemire's unbiased mapping. A plain
-            // `hash % num_shards` biases low-bucket indices when
-            // `num_shards` is not a power of two — with u64
-            // hashes the bias is small but non-zero and
-            // accumulates over time as a sustained skew toward
-            // low shard ids. The dynamic-mode path
-            // (`mapper.rs::select_shard_by_hash`) already uses
-            // Lemire's `(hash * len) >> 64` for the same reason;
-            // pre-fix the static path kept the modulo and
-            // exhibited measurable skew under non-power-of-two
-            // `num_shards` configurations. Both paths now share
-            // the unbiased mapping.
-            //
-            // Defensive guard against `num_shards == 0`: config
-            // validation rejects 0 at startup and `scale_down`
-            // requires `current > min_shards >= 1`, so this
-            // branch is unreachable today, but a stray 0 here
-            // would otherwise produce shard id 0 silently from
-            // the `>> 64` (which is fine in itself, but the
-            // explicit early return makes the contract obvious).
+            // Static mode: simple modulo. Defensive guard against
+            // `num_shards == 0` — config validation rejects 0 at
+            // startup and `scale_down` requires `current > min_shards
+            // >= 1`, so this branch is unreachable today, but a stray
+            // 0 here would otherwise panic on the `%` below.
             let num_shards = self.num_shards.load(std::sync::atomic::Ordering::Acquire);
             debug_assert!(num_shards > 0, "num_shards must be > 0");
             if num_shards == 0 {
                 return 0;
             }
-            ((hash as u128 * num_shards as u128) >> 64) as u16
+            (hash % num_shards as u64) as u16
         }
     }
 
@@ -700,22 +685,6 @@ impl ShardManager {
         table.shards.iter().all(|s| s.lock().is_empty())
     }
 
-    /// Sum of `len()` across every shard's ring buffer.
-    ///
-    /// Used by `EventBus::Drop` to surface the count of events that
-    /// were stranded in ring buffers at the moment the bus was
-    /// dropped without an awaited shutdown — those events never
-    /// reach the adapter, so reporting them as `events_dropped` is
-    /// the correct accounting (the alternative is silent loss).
-    pub fn total_pending_in_rings(&self) -> u64 {
-        let table = self.table.load();
-        table
-            .shards
-            .iter()
-            .map(|s| s.lock().len() as u64)
-            .sum()
-    }
-
     /// Iterate over all active shard IDs.
     pub fn shard_ids(&self) -> Vec<u16> {
         self.table.load().shard_index.keys().copied().collect()
@@ -775,30 +744,13 @@ impl ShardManager {
     ///
     /// [`activate_shard`]: Self::activate_shard
     pub fn add_shard(&self) -> Result<u16, ScalingError> {
-        self.add_shard_inner(false)
-    }
-
-    /// Like [`add_shard`] but bypasses the auto-scaling cooldown.
-    ///
-    /// Used by operator-initiated `manual_scale_up` so a deliberate
-    /// scale-up is not rate-limited by the auto-scaling cadence.
-    /// The `max_shards` budget check still applies.
-    pub fn add_shard_force(&self) -> Result<u16, ScalingError> {
-        self.add_shard_inner(true)
-    }
-
-    fn add_shard_inner(&self, force: bool) -> Result<u16, ScalingError> {
         let mapper = self.mapper.as_ref().ok_or(ScalingError::InvalidPolicy(
             "Dynamic scaling not enabled".into(),
         ))?;
 
         // Allocate the shard in `Provisioning` state — not yet
         // selectable.
-        let new_ids = if force {
-            mapper.scale_up_provisioning_force(1)?
-        } else {
-            mapper.scale_up_provisioning(1)?
-        };
+        let new_ids = mapper.scale_up_provisioning(1)?;
         let new_id = new_ids[0];
 
         let metrics = mapper.metrics_collector(new_id).ok_or_else(|| {
@@ -1049,79 +1001,6 @@ mod tests {
 
         // With 100 random events and 4 shards, we should hit multiple shards
         assert!(shards.len() > 1);
-    }
-
-    /// Source pin: static-mode `select_shard_by_hash` must use
-    /// Lemire's `(hash * num_shards) >> 64` mapping, not
-    /// `hash % num_shards`. The dynamic-mode path
-    /// (`mapper.rs::select_shard_by_hash`) was converted to
-    /// Lemire's unbiased mapping; the static-mode path kept
-    /// `% num_shards` and accumulated a small but persistent
-    /// skew toward low shard ids when `num_shards` was not a
-    /// power of two. Both paths now share the unbiased mapping.
-    ///
-    /// Lemire's mapping is exactly unbiased iff `num_shards`
-    /// fits in u64 (it does — u16). A revert to `%` here would
-    /// re-introduce the bias under any non-power-of-two
-    /// `num_shards` configuration; statistical detection is
-    /// hard (the bias is small) so the source pin is the
-    /// cheaper tripwire.
-    #[test]
-    fn static_mode_select_shard_by_hash_must_use_lemire_mapping() {
-        let src = include_str!("mod.rs");
-
-        // Locate the static-mode arm of `select_shard_by_hash`.
-        // It sits inside an `else` branch — the easiest anchor
-        // is the function header itself, then we scan for the
-        // `else {` opening of the static branch.
-        let header = "pub fn select_shard_by_hash(";
-        let start = src
-            .find(header)
-            .expect("select_shard_by_hash must exist");
-        // The function body's `} else {` is the static-mode
-        // branch. We need everything from there to the next
-        // function `fn ` at column 4.
-        let body_start = start + header.len();
-        let else_marker = "} else {";
-        let else_start = src[body_start..]
-            .find(else_marker)
-            .expect("static-mode `else` branch must exist")
-            + body_start;
-        // Look for the first `\n    fn ` or `\n    pub fn ` after
-        // — that's where the static branch ends.
-        let next_fn = src[else_start..]
-            .find("\n    fn ")
-            .or_else(|| src[else_start..].find("\n    pub fn "))
-            .expect("a sibling fn must follow")
-            + else_start;
-        let body = &src[else_start..next_fn];
-
-        let body_no_comments: String = body
-            .lines()
-            .map(|l| match l.find("//") {
-                Some(idx) => &l[..idx],
-                None => l,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Lemire's mapping: cast both operands to u128, multiply,
-        // shift right by 64, cast back. Pin the shape.
-        assert!(
-            body_no_comments.contains("as u128") && body_no_comments.contains(">> 64"),
-            "regression: static-mode select_shard_by_hash must use \
-             Lemire's `(hash as u128 * num_shards as u128) >> 64` \
-             mapping. The pre-fix `% num_shards` form biased low \
-             shard ids when num_shards is not a power of two."
-        );
-        // Negative pin: the buggy `% num_shards as u64` form
-        // must not be present in this branch.
-        assert!(
-            !body_no_comments.contains("% num_shards as u64"),
-            "regression: static-mode select_shard_by_hash must not \
-             use `hash % num_shards as u64` — that's the biased \
-             form."
-        );
     }
 
     /// Regression: the deprecated `select_shard(&JsonValue)` must produce

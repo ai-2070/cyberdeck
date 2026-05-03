@@ -68,9 +68,7 @@ impl ObservationWindow {
         if self.last_observed.len() < MAX_TRACKED_ENTITIES {
             return;
         }
-        if let Some((&oldest, _)) =
-            self.last_observed.iter().min_by_key(|(_, &ts)| ts)
-        {
+        if let Some((&oldest, _)) = self.last_observed.iter().min_by_key(|(_, &ts)| ts) {
             self.last_observed.remove(&oldest);
             self.estimated_delay.remove(&oldest);
         }
@@ -149,8 +147,7 @@ impl ObservationWindow {
                     // `seq_diff_sum` and report a misleadingly
                     // small divergence (potentially zero), making
                     // `is_converged()` falsely return true.
-                    seq_diff_sum =
-                        seq_diff_sum.saturating_add(self_seq.abs_diff(other_seq));
+                    seq_diff_sum = seq_diff_sum.saturating_add(self_seq.abs_diff(other_seq));
                 }
                 None => only_self += 1,
             }
@@ -358,7 +355,8 @@ mod tests {
         let div = w1.divergence_from(&w2);
         assert_eq!(div.common_entities, 2);
         assert_eq!(
-            div.total_seq_difference, u64::MAX,
+            div.total_seq_difference,
+            u64::MAX,
             "two u64::MAX-sized diffs must saturate, not wrap",
         );
         assert!(

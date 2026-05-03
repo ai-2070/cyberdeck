@@ -592,8 +592,7 @@ mod tests {
 
         // Backoff doubles up to a cap.
         assert!(
-            src_no_comments.contains("backoff_ms")
-                && src_no_comments.contains("MAX_BACKOFF_MS"),
+            src_no_comments.contains("backoff_ms") && src_no_comments.contains("MAX_BACKOFF_MS"),
             "regression: batched recv loop must use exponential \
              backoff (`backoff_ms` / `MAX_BACKOFF_MS`). Pre-fix the \
              loop slept exactly 1ms forever, producing a 1000Hz \
@@ -602,8 +601,7 @@ mod tests {
 
         // Hard-error early return.
         assert!(
-            src_no_comments.contains("libc::EBADF")
-                && src_no_comments.contains("libc::ENOTSOCK"),
+            src_no_comments.contains("libc::EBADF") && src_no_comments.contains("libc::ENOTSOCK"),
             "regression: batched recv loop must check for EBADF / \
              ENOTSOCK and exit. Without it an unrecoverable socket \
              silently consumes a thread until shutdown."
