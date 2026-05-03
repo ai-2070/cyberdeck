@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  726f3eb25aff9828 321-337,342-345,347-355,726-802
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "fc2797ce2da4520b1eb5ca5eb73367f61f123152",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1255,
+      "total_deletions": 6,
+      "accepted_lines": 477,
+      "overriden_lines": 0
+    }
+  }
+}
