@@ -46,6 +46,15 @@ pub struct MigrationSourceHandler {
     daemon_registry: Arc<DaemonRegistry>,
     /// Active migrations on this node as source: daemon_origin → state.
     migrations: DashMap<u32, Mutex<SourceMigrationState>>,
+    /// Single-flight claim set: a daemon present here has a snapshot
+    /// in flight. `start_snapshot` CAS-inserts the origin BEFORE
+    /// running the user-supplied `MeshDaemon::snapshot()` and
+    /// removes it on insertion-into-`migrations` OR on early return.
+    /// Pre-fix the contains_key→entry window let two callers each
+    /// run a full snapshot for the same origin, double-firing any
+    /// non-idempotent side-effect (counter bumps, deferred I/O,
+    /// etc.) inside the user's snapshot impl.
+    snapshots_in_progress: DashMap<u32, ()>,
 }
 
 impl MigrationSourceHandler {
@@ -54,6 +63,7 @@ impl MigrationSourceHandler {
         Self {
             daemon_registry,
             migrations: DashMap::new(),
+            snapshots_in_progress: DashMap::new(),
         }
     }
 
@@ -108,13 +118,42 @@ impl MigrationSourceHandler {
             return Err(MigrationError::DaemonNotFound(daemon_origin));
         }
 
-        // Cheap pre-check on the migrations map without holding
-        // a guard across the snapshot. Avoids the wasted snapshot
-        // in the common case where another caller already got
-        // there first.
         if self.migrations.contains_key(&daemon_origin) {
             return Err(MigrationError::AlreadyMigrating(daemon_origin));
         }
+
+        // Single-flight claim. CAS-insert into `snapshots_in_progress`
+        // BEFORE running the user-supplied snapshot — DashMap's
+        // `Entry::Vacant`/`Occupied` is the atomic fence. If we
+        // observe `Occupied`, another caller is mid-snapshot for
+        // this origin; surface AlreadyMigrating without firing the
+        // user's snapshot a second time.
+        let _claim = match self.snapshots_in_progress.entry(daemon_origin) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(MigrationError::AlreadyMigrating(daemon_origin));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(());
+            }
+        };
+        // RAII drop of the claim regardless of which branch we exit
+        // through. Keeping the claim past `migrations.entry` insert
+        // is fine — the contains_key check at the top of subsequent
+        // callers' `start_snapshot` already returns AlreadyMigrating
+        // once `migrations` is populated.
+        struct ClaimGuard<'a> {
+            map: &'a DashMap<u32, ()>,
+            origin: u32,
+        }
+        impl Drop for ClaimGuard<'_> {
+            fn drop(&mut self) {
+                self.map.remove(&self.origin);
+            }
+        }
+        let _claim_guard = ClaimGuard {
+            map: &self.snapshots_in_progress,
+            origin: daemon_origin,
+        };
 
         let snapshot = self
             .daemon_registry
@@ -124,9 +163,10 @@ impl MigrationSourceHandler {
                 MigrationError::StateFailed("daemon is stateless or snapshot failed".into())
             })?;
 
-        // Atomic insert. If another caller raced past the
-        // pre-check above and inserted first, our snapshot is
-        // wasted but we surface the same AlreadyMigrating error.
+        // Atomic insert. The single-flight claim above guarantees
+        // no second snapshot call ran for this origin while we were
+        // computing — so the Occupied branch here is unreachable
+        // in practice, but kept for defense-in-depth.
         let entry = match self.migrations.entry(daemon_origin) {
             dashmap::mapref::entry::Entry::Occupied(_) => {
                 return Err(MigrationError::AlreadyMigrating(daemon_origin));
