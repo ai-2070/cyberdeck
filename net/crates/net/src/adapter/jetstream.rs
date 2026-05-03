@@ -101,50 +101,52 @@ impl JetStreamAdapter {
     }
 
     /// Deserialize a stored event.
+    ///
+    /// Uses `RawValue` to slice the `r` field directly out of the
+    /// stored bytes — no full JSON tree allocation, no
+    /// re-serialize. Pre-fix the function parsed the payload
+    /// into a `serde_json::Value` tree per event and then
+    /// re-serialized the `r` subtree, allocating ~event-size
+    /// bytes twice per event. At 100 k events/poll this was
+    /// measurable; on a hot replay potentially OOM. The audit
+    /// (`adapter/mod.rs:88`) requires "MUST NOT allocate per-
+    /// event," matching the Redis adapter's pattern.
+    ///
+    /// `s` is parsed as `u64` instead of `u16` so an out-of-
+    /// range stored value surfaces as a typed `Fatal` error
+    /// rather than silently truncating via `serde`'s u16 parse
+    /// (which would mis-route the event at consume time).
     fn deserialize_event(seq: u64, data: &[u8]) -> Result<StoredEvent, AdapterError> {
-        let value: serde_json::Value = serde_json::from_slice(data)?;
+        #[derive(serde::Deserialize)]
+        struct StoredFormat<'a> {
+            #[serde(borrow)]
+            r: &'a serde_json::value::RawValue,
+            #[serde(default)]
+            t: u64,
+            #[serde(default)]
+            s: u64,
+        }
 
-        let raw = value.get("r").cloned().unwrap_or(serde_json::Value::Null);
-        // Pre-fix used `unwrap_or_default()` on the
-        // re-serialize, so a malformed/oversized `r` value whose
-        // serialization failed silently became empty bytes. The
-        // event was then "delivered" with an empty payload
-        // instead of surfacing the corruption — silent on-wire
-        // data loss. `serde_json::to_vec` on a serde_json::Value
-        // can't actually fail under normal conditions (the value
-        // came from a successful from_slice round-trip just
-        // above), but the audit's concern stands as defense in
-        // depth: surface any failure as a fatal parse error so
-        // the corruption is observable.
-        let raw_bytes = Bytes::from(serde_json::to_vec(&raw).map_err(|e| {
-            AdapterError::Fatal(format!(
-                "JetStream stored event seq={seq}: re-serialize of `r` field failed: {e}"
-            ))
-        })?);
-        let insertion_ts = value.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
+        let parsed: StoredFormat = serde_json::from_slice(data)?;
+        let raw_bytes = Bytes::copy_from_slice(parsed.r.get().as_bytes());
 
         // Pre-fix this was `... as u16`, which silently
         // wrapped on a stored shard_id > 65 535 (e.g. 100 000 →
         // 34 464). The result was a misrouted event at consume
         // time, classified to a different shard than it was
-        // originally written under. Reject the event with a fatal
-        // error so the corruption surfaces at parse time rather
-        // than as a "wrong shard" mystery downstream.
-        let shard_id_raw = value.get("s").and_then(|v| v.as_u64()).unwrap_or(0);
-        let shard_id = u16::try_from(shard_id_raw).map_err(|_| {
+        // originally written under. Reject the event with a
+        // fatal error so the corruption surfaces at parse time
+        // rather than as a "wrong shard" mystery downstream.
+        let shard_id = u16::try_from(parsed.s).map_err(|_| {
             AdapterError::Fatal(format!(
-                "JetStream stored event seq={seq} has shard_id {shard_id_raw} \
+                "JetStream stored event seq={seq} has shard_id {} \
                  outside u16 range (0..=65535); refusing to mis-route as \
-                 truncated value"
+                 truncated value",
+                parsed.s
             ))
         })?;
 
-        Ok(StoredEvent::new(
-            seq.to_string(),
-            raw_bytes,
-            insertion_ts,
-            shard_id,
-        ))
+        Ok(StoredEvent::new(seq.to_string(), raw_bytes, parsed.t, shard_id))
     }
 
     /// Get or create a stream for a shard.
