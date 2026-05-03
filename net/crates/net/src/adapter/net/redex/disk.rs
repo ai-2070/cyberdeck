@@ -589,6 +589,89 @@ impl DiskSegment {
         }
     }
 
+    /// Roll back one of the three append files to a recorded length.
+    /// If the open or `set_len` fails, log AND poison the segment:
+    /// the on-disk state is now inconsistent and any subsequent
+    /// append would compound the divergence rather than narrow it.
+    ///
+    /// Pre-fix the rollback used `if let Ok(f) = ...` and silently
+    /// continued on open failure, leaving the segment in a
+    /// permanently-divergent state with no diagnostic.
+    fn rollback_truncate(&self, file_name: &str, target_len: u64) {
+        let path = self.dir.join(file_name);
+        match OpenOptions::new().write(true).open(&path) {
+            Ok(f) => {
+                if let Err(e) = f.set_len(target_len) {
+                    tracing::error!(
+                        error = %e,
+                        path = %path.display(),
+                        "redex disk rollback: {file_name} set_len failed; poisoning segment",
+                    );
+                    self.poisoned.store(true, Ordering::Release);
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    path = %path.display(),
+                    "redex disk rollback: {file_name} open failed; poisoning segment",
+                );
+                self.poisoned.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Roll back a partial single-entry append after the idx (or
+    /// ts-metadata read) failed. The dat rollback uses
+    /// (current_len - payload_len) as the target since the
+    /// single-entry path doesn't snapshot the pre-write dat length.
+    fn rollback_after_idx_failure(&self, pre_idx_len: u64, dat_rollback: Option<u64>) {
+        self.rollback_truncate("idx", pre_idx_len);
+        if let Some(payload_len) = dat_rollback {
+            let dat_path = self.dir.join("dat");
+            let dat_target = match OpenOptions::new().read(true).open(&dat_path) {
+                Ok(f) => match f.metadata() {
+                    Ok(m) => Some(m.len().saturating_sub(payload_len)),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            path = %dat_path.display(),
+                            "redex disk rollback: dat metadata failed; poisoning segment",
+                        );
+                        self.poisoned.store(true, Ordering::Release);
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        path = %dat_path.display(),
+                        "redex disk rollback: dat open(read) failed; poisoning segment",
+                    );
+                    self.poisoned.store(true, Ordering::Release);
+                    None
+                }
+            };
+            if let Some(target) = dat_target {
+                self.rollback_truncate("dat", target);
+            }
+        }
+    }
+
+    /// Roll back a partial single-entry append after the ts write
+    /// failed: idx + ts + (optionally) dat all need to be trimmed
+    /// back. Same poison-on-failure semantics as
+    /// `rollback_after_idx_failure`.
+    fn rollback_after_ts_failure(
+        &self,
+        pre_idx_len: u64,
+        pre_ts_len: u64,
+        dat_rollback: Option<u64>,
+    ) {
+        self.rollback_truncate("ts", pre_ts_len);
+        self.rollback_after_idx_failure(pre_idx_len, dat_rollback);
+    }
+
     /// Test-only: arm a one-shot failure on the next
     /// `append_entry` / `append_entries` call. Returns `Io` before
     /// touching either file. Used to exercise the caller's rollback
@@ -731,20 +814,12 @@ impl DiskSegment {
         };
         if let Err(e) = idx.write_all(&entry.to_bytes()) {
             drop(idx);
-            let idx_path = self.dir.join("idx");
-            if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                let _ = f.set_len(pre_idx_len);
-            }
-            // Also roll back any dat bytes we just wrote — leaving
-            // them as orphaned tail bytes is the same hazard the
-            // dat-side rollback closes.
-            if !entry.is_inline() {
-                let dat_path = self.dir.join("dat");
-                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
-                    let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
-                }
-            }
+            let dat_rollback = if entry.is_inline() {
+                None
+            } else {
+                Some(payload.len() as u64)
+            };
+            self.rollback_after_idx_failure(pre_idx_len, dat_rollback);
             return Err(RedexError::io(e));
         }
         drop(idx);
@@ -774,38 +849,23 @@ impl DiskSegment {
             Ok(m) => m.len(),
             Err(e) => {
                 drop(ts);
-                let idx_path = self.dir.join("idx");
-                if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                    let _ = f.set_len(pre_idx_len);
-                }
-                if !entry.is_inline() {
-                    let dat_path = self.dir.join("dat");
-                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                        let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
-                        let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
-                    }
-                }
+                let dat_rollback = if entry.is_inline() {
+                    None
+                } else {
+                    Some(payload.len() as u64)
+                };
+                self.rollback_after_idx_failure(pre_idx_len, dat_rollback);
                 return Err(RedexError::io(e));
             }
         };
         if let Err(e) = ts.write_all(&timestamp_ns.to_le_bytes()) {
             drop(ts);
-            let ts_path = self.dir.join("ts");
-            if let Ok(f) = OpenOptions::new().write(true).open(&ts_path) {
-                let _ = f.set_len(pre_ts_len);
-            }
-            // Roll back idx by 20 bytes (one entry).
-            let idx_path = self.dir.join("idx");
-            if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                let _ = f.set_len(pre_idx_len);
-            }
-            if !entry.is_inline() {
-                let dat_path = self.dir.join("dat");
-                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
-                    let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
-                }
-            }
+            let dat_rollback = if entry.is_inline() {
+                None
+            } else {
+                Some(payload.len() as u64)
+            };
+            self.rollback_after_ts_failure(pre_idx_len, pre_ts_len, dat_rollback);
             return Err(RedexError::io(e));
         }
         drop(ts);
@@ -922,10 +982,7 @@ impl DiskSegment {
             let pre_len = dat.metadata().map_err(RedexError::io)?.len();
             if let Err(e) = dat.write_all(&dat_buf) {
                 drop(dat);
-                let dat_path = self.dir.join("dat");
-                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let _ = f.set_len(pre_len);
-                }
+                self.rollback_truncate("dat", pre_len);
                 return Err(RedexError::io(e));
             }
             drop(dat);
@@ -951,25 +1008,16 @@ impl DiskSegment {
             Err(e) => {
                 drop(idx);
                 if let Some(pre_len) = dat_pre_len {
-                    let dat_path = self.dir.join("dat");
-                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                        let _ = f.set_len(pre_len);
-                    }
+                    self.rollback_truncate("dat", pre_len);
                 }
                 return Err(RedexError::io(e));
             }
         };
         if let Err(e) = idx.write_all(&idx_buf) {
             drop(idx);
-            let idx_path = self.dir.join("idx");
-            if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                let _ = f.set_len(idx_pre_len);
-            }
+            self.rollback_truncate("idx", idx_pre_len);
             if let Some(pre_len) = dat_pre_len {
-                let dat_path = self.dir.join("dat");
-                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let _ = f.set_len(pre_len);
-                }
+                self.rollback_truncate("dat", pre_len);
             }
             return Err(RedexError::io(e));
         }
@@ -994,34 +1042,19 @@ impl DiskSegment {
             Ok(m) => m.len(),
             Err(e) => {
                 drop(ts);
-                let idx_path = self.dir.join("idx");
-                if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                    let _ = f.set_len(idx_pre_len);
-                }
+                self.rollback_truncate("idx", idx_pre_len);
                 if let Some(pre_len) = dat_pre_len {
-                    let dat_path = self.dir.join("dat");
-                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                        let _ = f.set_len(pre_len);
-                    }
+                    self.rollback_truncate("dat", pre_len);
                 }
                 return Err(RedexError::io(e));
             }
         };
         if let Err(e) = ts.write_all(&ts_buf) {
             drop(ts);
-            let ts_path = self.dir.join("ts");
-            if let Ok(f) = OpenOptions::new().write(true).open(&ts_path) {
-                let _ = f.set_len(ts_pre_len);
-            }
-            let idx_path = self.dir.join("idx");
-            if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                let _ = f.set_len(idx_pre_len);
-            }
+            self.rollback_truncate("ts", ts_pre_len);
+            self.rollback_truncate("idx", idx_pre_len);
             if let Some(pre_len) = dat_pre_len {
-                let dat_path = self.dir.join("dat");
-                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let _ = f.set_len(pre_len);
-                }
+                self.rollback_truncate("dat", pre_len);
             }
             return Err(RedexError::io(e));
         }
