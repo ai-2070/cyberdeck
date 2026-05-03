@@ -1072,10 +1072,12 @@ impl ShardMapper {
                 // that is only reset by `set_draining(true)`, so any
                 // push observed since the drain began is sticky —
                 // exactly the signal we want.
-                let pushes_after_drain = shard
-                    .metrics
-                    .pushes_since_drain_start
-                    .load(AtomicOrdering::Relaxed);
+                // Acquire pairs with `set_draining`'s SeqCst reset so
+                // the load can't observe a stale value from before the
+                // drain began. A Relaxed load here let weakly-ordered
+                // hardware see the pre-reset count and finalize while
+                // a producer was still pushing.
+                let pushes_after_drain = shard.metrics.pushes_since_drain_start();
                 if fill_ratio == 0.0 && pushes_after_drain == 0 {
                     // Check if we've waited long enough
                     if let Some(drain_start) = shard.drain_started {
