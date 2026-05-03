@@ -501,19 +501,39 @@ impl Adapter for RedisAdapter {
 
 /// Check if a Redis error is transient (retryable).
 fn is_transient_error(e: &RedisError) -> bool {
-    use redis::ErrorKind;
+    use redis::{ErrorKind, ServerErrorKind};
     match e.kind() {
         // I/O errors are always transient
         ErrorKind::Io => true,
         // Cluster connection issues are transient
         ErrorKind::ClusterConnectionNotFound => true,
-        // Server errors may be transient - check the message
-        ErrorKind::Server(_) => {
+        // Typed server errors with documented retryable semantics.
+        // Pre-fix the cluster-topology errors (Moved/Ask/ReadOnly/
+        // ClusterDown) were classified fatal, taking the adapter
+        // offline until process restart on any cluster slot move
+        // or replica-failover event.
+        ErrorKind::Server(ServerErrorKind::BusyLoading)
+        | ErrorKind::Server(ServerErrorKind::Moved)
+        | ErrorKind::Server(ServerErrorKind::Ask)
+        | ErrorKind::Server(ServerErrorKind::TryAgain)
+        | ErrorKind::Server(ServerErrorKind::ClusterDown)
+        | ErrorKind::Server(ServerErrorKind::MasterDown)
+        | ErrorKind::Server(ServerErrorKind::ReadOnly) => true,
+        // Catch-all for `Server(ResponseError)` and unknown
+        // extension errors that surface only via the message
+        // body. Includes `NOREPLICAS` (a wait-aof timeout) which
+        // doesn't have a typed kind in this redis crate version.
+        ErrorKind::Server(_) | ErrorKind::Extension => {
             let msg = e.to_string().to_uppercase();
             msg.contains("LOADING")
                 || msg.contains("BUSY")
                 || msg.contains("TRYAGAIN")
                 || msg.contains("MASTERDOWN")
+                || msg.contains("MOVED")
+                || msg.contains("ASK")
+                || msg.contains("READONLY")
+                || msg.contains("CLUSTERDOWN")
+                || msg.contains("NOREPLICAS")
         }
         _ => false,
     }
@@ -650,5 +670,78 @@ mod tests {
         assert!(result.events.is_empty());
         assert!(result.next_id.is_none());
         assert!(!result.has_more);
+    }
+
+    /// Pin: Redis Cluster topology errors (`MOVED`, `ASK`,
+    /// `READONLY`, `CLUSTERDOWN`, etc.) must be classified as
+    /// transient. Pre-fix only `LOADING | BUSY | TRYAGAIN |
+    /// MASTERDOWN` substrings matched — every cluster failover
+    /// took the adapter offline until process restart.
+    #[test]
+    fn is_transient_error_recognizes_cluster_recoverables() {
+        use redis::{ErrorKind, ServerErrorKind};
+
+        // Typed server errors — the production path. Cluster-
+        // topology errors map to specific `ServerErrorKind`
+        // variants and must classify as transient.
+        let typed_transient: &[(ErrorKind, &str)] = &[
+            (ErrorKind::Server(ServerErrorKind::Moved), "MOVED redirect"),
+            (ErrorKind::Server(ServerErrorKind::Ask), "ASK redirect"),
+            (ErrorKind::Server(ServerErrorKind::ClusterDown), "cluster down"),
+            (ErrorKind::Server(ServerErrorKind::MasterDown), "master down"),
+            (ErrorKind::Server(ServerErrorKind::ReadOnly), "read-only replica"),
+            (ErrorKind::Server(ServerErrorKind::BusyLoading), "loading"),
+            (ErrorKind::Server(ServerErrorKind::TryAgain), "try again"),
+            (ErrorKind::Io, "I/O error"),
+            (ErrorKind::ClusterConnectionNotFound, "no cluster connection"),
+        ];
+        for (kind, label) in typed_transient {
+            let err = RedisError::from((*kind, "test"));
+            assert!(
+                is_transient_error(&err),
+                "{} ({:?}) must classify as transient",
+                label,
+                kind,
+            );
+        }
+
+        // Untyped extension errors — message-substring branch.
+        // `NOREPLICAS` doesn't have a typed kind in this redis
+        // crate version, so it surfaces as Extension.
+        let extension_transient: &[&str] = &[
+            "NOREPLICAS Not enough good replicas to write",
+        ];
+        for msg in extension_transient {
+            let err = RedisError::from((
+                ErrorKind::Extension,
+                "test",
+                msg.to_string(),
+            ));
+            assert!(
+                is_transient_error(&err),
+                "extension `{}` must classify as transient",
+                msg,
+            );
+        }
+
+        // Genuinely fatal — must remain non-transient.
+        let fatal: &[ErrorKind] = &[
+            ErrorKind::AuthenticationFailed,
+            ErrorKind::UnexpectedReturnType,
+            ErrorKind::InvalidClientConfig,
+            ErrorKind::Client,
+            ErrorKind::Server(ServerErrorKind::ExecAbort),
+            ErrorKind::Server(ServerErrorKind::NoScript),
+            ErrorKind::Server(ServerErrorKind::CrossSlot),
+            ErrorKind::Server(ServerErrorKind::NoPerm),
+        ];
+        for kind in fatal {
+            let err = RedisError::from((*kind, "test"));
+            assert!(
+                !is_transient_error(&err),
+                "{:?} must classify as fatal (non-transient)",
+                kind,
+            );
+        }
     }
 }
