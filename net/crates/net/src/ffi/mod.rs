@@ -536,12 +536,27 @@ fn parse_config_json(json_str: &str) -> Option<EventBusConfig> {
             }
         }
 
+        // Reject `0` for `heartbeat_interval_ms` and
+        // `session_timeout_ms`. `EventBusConfig::validate` rejects
+        // zero `Duration`s for `cooldown`, `metrics_window`, etc.,
+        // but the Net adapter's JSON parser had no equivalent guard
+        // — a `0` here flowed through to `Duration::from_millis(0)`,
+        // which on the heartbeat path busy-loops the heartbeat task
+        // and saturates a CPU. Treat zero as a misconfig and refuse
+        // to build the bus, surfacing as `InvalidJson` so the FFI
+        // caller sees a typed failure rather than a hung daemon.
         if let Some(interval_ms) = net.get("heartbeat_interval_ms").and_then(|v| v.as_u64()) {
+            if interval_ms == 0 {
+                return None;
+            }
             net_config =
                 net_config.with_heartbeat_interval(std::time::Duration::from_millis(interval_ms));
         }
 
         if let Some(timeout_ms) = net.get("session_timeout_ms").and_then(|v| v.as_u64()) {
+            if timeout_ms == 0 {
+                return None;
+            }
             net_config =
                 net_config.with_session_timeout(std::time::Duration::from_millis(timeout_ms));
         }

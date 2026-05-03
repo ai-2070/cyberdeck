@@ -444,10 +444,23 @@ pub extern "C" fn net_mesh_new(
     psk.copy_from_slice(&psk_bytes);
 
     let mut node_cfg = MeshNodeConfig::new(bind_addr, psk);
+    // Reject `0` for `heartbeat_ms` and `session_timeout_ms`.
+    // A zero heartbeat interval busy-loops the heartbeat task
+    // (saturating a CPU); a zero session timeout makes every
+    // session expire instantly. The Rust-side configs do their
+    // own validation but the FFI JSON path bypasses that — pin
+    // the guard here so a misconfig fails fast rather than
+    // producing a hung daemon.
     if let Some(ms) = cfg.heartbeat_ms {
+        if ms == 0 {
+            return NetError::InvalidJson.into();
+        }
         node_cfg = node_cfg.with_heartbeat_interval(std::time::Duration::from_millis(ms));
     }
     if let Some(ms) = cfg.session_timeout_ms {
+        if ms == 0 {
+            return NetError::InvalidJson.into();
+        }
         node_cfg = node_cfg.with_session_timeout(std::time::Duration::from_millis(ms));
     }
     if let Some(n) = cfg.num_shards {
