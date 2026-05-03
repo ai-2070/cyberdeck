@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/cortex/watermark.rs
+  726f3eb25aff9828 95-114,342-356,360-361,364-402
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  726f3eb25aff9828 9,340,342
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "c9ac05eaf3e7a3911e4bfce171012ec9b17c81b8",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 79,
+      "total_deletions": 14,
+      "accepted_lines": 447,
+      "overriden_lines": 3
+    }
+  }
+}
