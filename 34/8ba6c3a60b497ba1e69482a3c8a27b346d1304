@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  726f3eb25aff9828 1382-1390,1400-1407,1825-1867
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "348ba6c3a60b497ba1e69482a3c8a27b346d1304",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2514,
+      "total_deletions": 11,
+      "accepted_lines": 430,
+      "overriden_lines": 0
+    }
+  }
+}
