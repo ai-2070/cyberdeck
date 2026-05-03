@@ -666,6 +666,19 @@ impl NetSession {
     /// cleartext `session_id` and source UDP address could spoof
     /// heartbeats indefinitely.
     pub fn verify_and_touch_heartbeat(&self, parsed: &ParsedPacket) -> bool {
+        // A heartbeat encrypts an empty payload, so the on-wire
+        // ciphertext is exactly the 16-byte AEAD tag (see
+        // `PacketBuilder::build_heartbeat`). Reject any other
+        // length BEFORE invoking the cipher: the AEAD will
+        // catch a length mismatch on its own, but a cheap
+        // up-front check shortcuts a cleartext-flood attacker
+        // who sends short / empty / oversized packets to drain
+        // CPU on the decrypt path. ChaCha20-Poly1305 isn't
+        // hugely expensive per packet, but the gate is free
+        // and removes the cipher from the per-probe budget.
+        if parsed.payload.len() != super::protocol::TAG_SIZE {
+            return false;
+        }
         let aad = parsed.header.aad();
         let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
         if !self.rx_cipher.is_valid_rx_counter(counter) {
@@ -2672,6 +2685,67 @@ mod tests {
                 !trimmed.contains(&needle),
                 "CR-12 regression: tx_key accessor reintroduced into session.rs:\n  {}",
                 line
+            );
+        }
+    }
+
+    /// Regression: `verify_and_touch_heartbeat` short-circuits
+    /// any `parsed.payload.len() != TAG_SIZE` packet before
+    /// invoking the cipher. AEAD decryption would catch the
+    /// mismatch on its own, but the pre-check shortcuts a
+    /// cleartext-flood attacker spamming undersized / oversized
+    /// payloads to drain CPU on the decrypt path. The
+    /// session must be unmutated on rejection — a flood that
+    /// nudged `last_activity` would still be a side-channel for
+    /// liveness inference.
+    #[test]
+    fn verify_and_touch_heartbeat_rejects_wrong_length_before_decrypt() {
+        use super::super::protocol::{NetHeader, PacketFlags, TAG_SIZE};
+        use bytes::Bytes;
+
+        let keys = test_keys();
+        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let session = NetSession::new(keys.clone(), peer_addr, 4, false);
+
+        // Capture last_activity before the spoof attempts so we
+        // can assert no mutation.
+        let baseline_activity = session.last_activity.load(Ordering::Acquire);
+
+        // Build a fake heartbeat header with a ciphertext that
+        // ISN'T 16 bytes — the AEAD would reject this anyway,
+        // but we want to assert the length gate fires first
+        // (no cipher work, no last_activity nudge).
+        let mut nonce = [0u8; 12];
+        nonce[0..4].copy_from_slice(
+            &crate::adapter::net::crypto::session_prefix_from_id(keys.session_id),
+        );
+        nonce[4..12].copy_from_slice(&0u64.to_le_bytes());
+
+        let header = NetHeader::new(
+            keys.session_id,
+            0, // stream_id
+            0, // sequence
+            nonce,
+            0, // payload_len
+            0, // event_count
+            PacketFlags::HEARTBEAT,
+        );
+
+        for bad_len in [0usize, 1, TAG_SIZE - 1, TAG_SIZE + 1, 64] {
+            let parsed = ParsedPacket {
+                header: header.clone(),
+                payload: Bytes::from(vec![0u8; bad_len]),
+                source: peer_addr,
+            };
+            assert!(
+                !session.verify_and_touch_heartbeat(&parsed),
+                "wrong-length payload ({bad_len} bytes, expected {TAG_SIZE}) \
+                 must be rejected before AEAD decrypt"
+            );
+            assert_eq!(
+                session.last_activity.load(Ordering::Acquire),
+                baseline_activity,
+                "rejected heartbeat must not advance last_activity ({bad_len} bytes)"
             );
         }
     }
