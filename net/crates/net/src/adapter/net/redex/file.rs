@@ -474,6 +474,20 @@ impl RedexFile {
         let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let entry = RedexEntry::new_inline(seq, payload, cks);
 
+        // Disk FIRST. If it fails, roll back the seq allocation
+        // and leave memory untouched so callers don't observe a
+        // record that was never durably persisted.
+        //
+        // INVARIANT: every operation after this block must be
+        // infallible. Pre-fix the rollback lived inside the
+        // `if let Some(disk)` arm, so a `disk == None` configuration
+        // would silently skip rollback. Today every post-block
+        // operation (`Vec::push`, `notify_watchers` against a
+        // `Vec<Sender>`) is provably infallible, so the disk-None
+        // path never reaches a state where rollback is needed.
+        // If a future change introduces a fallible operation
+        // between this disk block and `Ok(seq)`, factor out the
+        // rollback so it fires regardless of the disk arm.
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
             if let Err(e) = disk.append_entry_at(&entry, payload, ts) {
