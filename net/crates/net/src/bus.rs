@@ -1581,9 +1581,21 @@ impl EventBus {
         while finalized.len() < target.len() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let stopped = mapper.finalize_draining();
+            // `finalize_draining` is destructive — every qualifying
+            // Draining shard transitions to Stopped in one shot,
+            // regardless of who initiated the drain. Pre-fix the
+            // `if target.contains(&shard_id)` filter dropped non-
+            // target ids on the floor; if the scaling monitor (or
+            // a parallel `manual_scale_down` on a different target
+            // set) finalized one of THEIR shards in the same tick,
+            // that shard ended up Stopped with workers + routing
+            // entry intact — leaked. Always tear down via
+            // `remove_shard_internal` so the bus-side state
+            // (workers, sender, routing) is freed; only count the
+            // target subset toward the returned Vec.
             for shard_id in stopped {
+                let _ = self.remove_shard_internal(shard_id).await;
                 if target.contains(&shard_id) {
-                    let _ = self.remove_shard_internal(shard_id).await;
                     finalized.insert(shard_id);
                 }
             }
