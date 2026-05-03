@@ -546,3 +546,103 @@ async fn repeated_scale_cycles_preserve_every_event_with_unique_msg_ids() {
         "duplicate msg-id tuples observed across scale cycles",
     );
 }
+
+/// Adapter whose `on_batch` parks indefinitely. Models a wedged
+/// downstream (network partition, deadlocked driver) and lets us
+/// observe whether `remove_shard_internal` returns within bounded
+/// time when its workers are themselves parked inside an adapter
+/// call.
+struct WedgedAdapter;
+
+#[async_trait]
+impl Adapter for WedgedAdapter {
+    async fn init(&mut self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+    async fn flush(&self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    async fn shutdown(&self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    async fn poll_shard(
+        &self,
+        _shard_id: u16,
+        _from_id: Option<&str>,
+        _limit: usize,
+    ) -> Result<ShardPollResult, AdapterError> {
+        Ok(ShardPollResult::empty())
+    }
+    fn name(&self) -> &'static str {
+        "wedged"
+    }
+}
+
+/// Pin: when worker handles cannot make progress (wedged adapter),
+/// `manual_scale_down` must NOT pin indefinitely waiting for them
+/// to exit. The worker handles are awaited under a timeout derived
+/// from `adapter_timeout`; on expiry the JoinHandle is detached.
+///
+/// Pre-fix `remove_shard_internal` awaited the JoinHandles bare,
+/// AND in the wrong order (batch before drain), so a drain worker
+/// parked mid-`sender.send().await` against a batch worker parked
+/// mid-adapter call would deadlock the awaiter forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_scale_down_returns_within_bounded_time_when_adapter_wedged() {
+    let policy = ScalingPolicy {
+        min_shards: 1,
+        max_shards: 16,
+        cooldown: Duration::from_nanos(1),
+        ..Default::default()
+    };
+    let cfg = EventBusConfig::builder()
+        .num_shards(2)
+        .ring_buffer_capacity(1024)
+        .scaling(policy)
+        .adapter_timeout(Duration::from_millis(150))
+        .build()
+        .unwrap();
+
+    let bus = EventBus::new_with_adapter(cfg, Box::new(WedgedAdapter))
+        .await
+        .unwrap();
+
+    bus.manual_scale_up(2).await.unwrap();
+
+    // Push enough events to keep workers busy in `on_batch` (which
+    // never returns).
+    for i in 0..2_000u64 {
+        let _ = bus.ingest(Event::new(json!({"i": i})));
+    }
+
+    // Each worker await is bounded by 2 × adapter_timeout = 300 ms,
+    // and we tear down 2 shards sequentially, so the upper bound is
+    // ~1.2 s of worker waits plus the stranded-flush dispatch_batch
+    // (which uses adapter_timeout = 150 ms with retries). Allow
+    // generous slack for CI.
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        bus.manual_scale_down(2),
+    )
+    .await
+    .expect("manual_scale_down hung past 15s — timeout-bounded teardown regressed");
+    result.expect("manual_scale_down returned Err");
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "manual_scale_down took {:?}; expected bounded by adapter_timeout",
+        elapsed,
+    );
+
+    // Best-effort shutdown — the wedged adapter will not let us
+    // drain cleanly, but shutdown itself is bounded by its own
+    // deadline. We don't assert success here; the assertion above
+    // is the regression target.
+    let _ = tokio::time::timeout(Duration::from_secs(5), bus.shutdown()).await;
+}

@@ -672,42 +672,63 @@ impl EventBus {
         // via the standard `dispatch_batch` path with their PROPER
         // `next_sequence` values, and exits.
         //
-        // Await both handles before constructing the stranded
-        // batch. Dropping the `JoinHandle`s without await would let
-        // a draining shard whose ring buffer transiently emptied
-        // finalize and remove while the BatchWorker still had
-        // events in its `current_batch` or in the mpsc channel —
-        // those events would be dispatched (the worker keeps
-        // running on a dropped handle) but their dispatch could
-        // overlap with this function's own stranded-flush, racing
-        // through JetStream dedup with their msg-ids. Awaiting
-        // first means we observe a quiescent worker before
-        // constructing the stranded batch.
+        // Await order: drain first, then batch. The drain worker's
+        // `Some(N>0)` arm `mem::replace`s scratch into a batch and
+        // `sender.send(batch).await`s it; that send must complete
+        // (or fail) before drain breaks. The batch worker's
+        // `Ok(None)` arm runs after the sender drops and flushes
+        // any pending batch. Awaiting in the reverse order would
+        // park here forever: the batch worker's `recv()` only
+        // returns `None` once every sender clone (including the
+        // drain worker's) has dropped.
+        //
+        // Both awaits are bounded by `2 × adapter_timeout` so a
+        // worker parked inside a slow adapter call cannot pin
+        // teardown indefinitely. A timeout leaks the JoinHandle —
+        // acceptable because step 1 already removed the bus-side
+        // sender and step 2 unmapped the shard, so the detached
+        // task can't observe new work and will exit on its next
+        // loop iteration.
         let workers = self.batch_workers.lock().remove(&shard_id);
         let final_next_sequence = if let Some(workers) = workers {
-            // Errors here mean the task panicked or was cancelled.
-            // We log and proceed — the stranded-flush still runs
-            // either way, and the atomic was last written under the
-            // worker's last successful flush so it remains a valid
-            // upper bound (just possibly stale by one batch's worth
-            // of events the worker never finished dispatching).
-            if let Err(e) = workers.batch.await {
-                tracing::warn!(
-                    shard_id,
-                    error = %e,
-                    "BatchWorker JoinHandle errored on await; \
-                     proceeding with stranded-flush using last \
-                     published next_sequence",
-                );
+            let bound = self.config.adapter_timeout.saturating_mul(2);
+            match tokio::time::timeout(bound, workers.drain).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        shard_id,
+                        error = %e,
+                        "drain worker JoinHandle errored on await; \
+                         drain worker should have already exited via \
+                         `with_shard -> None`",
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        shard_id,
+                        timeout_ms = bound.as_millis() as u64,
+                        "drain worker did not exit within timeout on remove_shard; detaching",
+                    );
+                }
             }
-            if let Err(e) = workers.drain.await {
-                tracing::warn!(
-                    shard_id,
-                    error = %e,
-                    "drain worker JoinHandle errored on await; \
-                     drain worker should have already exited via \
-                     `with_shard -> None`",
-                );
+            match tokio::time::timeout(bound, workers.batch).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        shard_id,
+                        error = %e,
+                        "BatchWorker JoinHandle errored on await; \
+                         proceeding with stranded-flush using last \
+                         published next_sequence",
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        shard_id,
+                        timeout_ms = bound.as_millis() as u64,
+                        "BatchWorker did not exit within timeout on remove_shard; detaching",
+                    );
+                }
             }
             workers.next_sequence.load(AtomicOrdering::Acquire)
         } else {
