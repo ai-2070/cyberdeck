@@ -208,15 +208,18 @@ struct FfiOpGuard<'a> {
 
 impl<'a> FfiOpGuard<'a> {
     /// Try to enter an FFI operation. Returns `None` if the handle is
-    /// shutting down.
+    /// shutting down or if `bus` / `runtime` have already been taken.
     ///
     /// Soundness rests on the fact that the box backing `handle` is
     /// never freed (see `NetHandle` doc). The `fetch_add` is therefore
     /// always on valid memory regardless of whether shutdown is in
-    /// progress. The subsequent load of `shutting_down` decides
-    /// whether the op is allowed to proceed; if shutdown was signaled
+    /// progress. The subsequent loads decide whether the op is allowed
+    /// to proceed; if shutdown was signaled or `bus_taken` flipped
     /// before our increment was visible, we bail without touching
-    /// `bus` / `runtime`.
+    /// `bus` / `runtime`. The `bus_taken` check defends against a
+    /// contract-violating caller that races a post-shutdown call: even
+    /// if `shutting_down` was reset somehow, an op that would touch the
+    /// already-taken `ManuallyDrop` fields is rejected.
     fn try_enter(handle: &'a NetHandle) -> Option<Self> {
         handle
             .active_ops
@@ -224,6 +227,9 @@ impl<'a> FfiOpGuard<'a> {
         if handle
             .shutting_down
             .load(std::sync::atomic::Ordering::SeqCst)
+            || handle
+                .bus_taken
+                .load(std::sync::atomic::Ordering::SeqCst)
         {
             handle
                 .active_ops
