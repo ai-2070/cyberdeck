@@ -174,6 +174,21 @@ impl BatchedTransport {
         // below issues sendmmsg against the tail starting at
         // `&self.msgs[sent_so_far]`, so the slot contents remain
         // valid for the entire call.
+        // `iov_base: *mut c_void` is the Linux ABI shape; the
+        // kernel reads through this pointer for sendmmsg and
+        // never writes. The const→mut cast at `packet.as_ptr()
+        // as *mut _` below is API-mandated (libc::iovec doesn't
+        // expose a read-only variant) and the actual behavior is
+        // sound — the `&[Bytes]` argument keeps the storage alive
+        // for the syscall's duration, and the kernel's reads
+        // through `iov_base` don't violate Rust's aliasing model.
+        //
+        // Strict-provenance / Miri does flag the const→mut cast
+        // as "pointer laundering" because Miri can't know the
+        // kernel won't write. Documenting the soundness argument
+        // here is the static answer; a dynamic answer would need
+        // `pointer::with_addr` or a similar provenance-explicit
+        // API once stabilized.
         for (i, packet) in packets.iter().enumerate() {
             self.iovecs[i] = libc::iovec {
                 iov_base: packet.as_ptr() as *mut _,
