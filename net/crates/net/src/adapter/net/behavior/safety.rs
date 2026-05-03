@@ -1200,9 +1200,20 @@ impl SafetyEnforcer {
         } else {
             // Audit-only: still increment so observers see realistic
             // counters without any commit failing.
-            self.rate_limiter
-                .global_tokens
-                .fetch_add(claim.tokens as u64, Ordering::Relaxed);
+            //
+            // Saturating CAS rather than `fetch_add` so a long-lived
+            // process can't tip the audit counter into wrap (release)
+            // or panic (debug). The audit-only path takes no commit
+            // failure on overflow — by definition this counter only
+            // drives observability dashboards — so wrap is silent
+            // corruption (operators see the counter reset to ~0 mid-
+            // window and conclude traffic dropped). `fetch_update`
+            // with saturating_add inside is the standard pattern.
+            let _ = self.rate_limiter.global_tokens.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| Some(v.saturating_add(claim.tokens as u64)),
+            );
         }
 
         // tokens (per-request `usage` counter) — free-running,
