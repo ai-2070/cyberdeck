@@ -322,6 +322,17 @@ impl Default for BatchConfig {
 }
 
 impl BatchConfig {
+    /// Upper bound on `max_size`. The adaptive-batching code in
+    /// `shard/batch.rs` uses arithmetic like
+    /// `current_batch_size * 3 + target` against `max_size`-clamped
+    /// values; with `max_size = usize::MAX` the multiplication
+    /// panics in debug builds and wraps in release. The default
+    /// production `max_size = 10_000` is far below this cap, so
+    /// this is purely a hostile-config guard. Set well above any
+    /// plausible workload (`high_throughput` ships `50_000`) but
+    /// well below the arithmetic-blast radius.
+    pub const MAX_BATCH_SIZE_LIMIT: usize = 1_000_000;
+
     /// Validate the batch configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.min_size == 0 {
@@ -331,6 +342,13 @@ impl BatchConfig {
             return Err(ConfigError::InvalidValue(
                 "max_size must be >= min_size".into(),
             ));
+        }
+        if self.max_size > Self::MAX_BATCH_SIZE_LIMIT {
+            return Err(ConfigError::InvalidValue(format!(
+                "max_size must be <= {} (hostile-config guard against \
+                 `current_batch_size * 3 + target` overflow in adaptive batching)",
+                Self::MAX_BATCH_SIZE_LIMIT,
+            )));
         }
         if self.max_delay.is_zero() {
             return Err(ConfigError::InvalidValue("max_delay must be > 0".into()));
@@ -1142,6 +1160,50 @@ mod tests {
         assert!(
             result.is_err(),
             "BackpressureMode::Sample.rate == 0 must reject"
+        );
+    }
+
+    /// Regression: `BatchConfig::validate` must reject an
+    /// unbounded `max_size`. The adaptive-batching code in
+    /// `shard/batch.rs` does arithmetic like
+    /// `current_batch_size * 3 + target` against `max_size`-clamped
+    /// values; with `max_size = usize::MAX` the multiplication
+    /// panics in debug builds and wraps in release. The default
+    /// `max_size = 10_000` is safe; only a hostile config can
+    /// trip the overflow. Cap at `MAX_BATCH_SIZE_LIMIT` so the
+    /// arithmetic stays well below the blast radius.
+    #[test]
+    fn batch_config_rejects_max_size_above_limit() {
+        // Boundary at the limit is OK.
+        let at_limit = BatchConfig {
+            max_size: BatchConfig::MAX_BATCH_SIZE_LIMIT,
+            ..Default::default()
+        };
+        assert!(
+            at_limit.validate().is_ok(),
+            "max_size at MAX_BATCH_SIZE_LIMIT must be valid"
+        );
+
+        // Just past the limit must reject.
+        let above = BatchConfig {
+            max_size: BatchConfig::MAX_BATCH_SIZE_LIMIT + 1,
+            ..Default::default()
+        };
+        assert!(
+            above.validate().is_err(),
+            "max_size > MAX_BATCH_SIZE_LIMIT must reject — adaptive \
+             arithmetic overflows past this cap"
+        );
+
+        // The pathological case the audit's example targets.
+        let hostile = BatchConfig {
+            max_size: usize::MAX,
+            ..Default::default()
+        };
+        assert!(
+            hostile.validate().is_err(),
+            "max_size = usize::MAX must reject (regression: \
+             current_batch_size * 3 + target overflow)"
         );
     }
 
