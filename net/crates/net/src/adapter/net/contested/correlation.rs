@@ -242,9 +242,20 @@ impl CorrelatedFailureDetector {
         for &node_id in failed_nodes {
             if let Some(&subnet) = self.node_subnets.get(&node_id) {
                 with_subnet += 1;
-                // Count at each hierarchy level
+                // Count at each hierarchy level. The break
+                // conditions (`parent == current`, `parent.is_global`)
+                // cover every well-formed `SubnetId::parent`
+                // implementation, but a defensive depth cap
+                // matches the 4-level hierarchy and forecloses
+                // an infinite loop if a future regression in
+                // `SubnetId::parent` ever returns a non-self,
+                // non-global subnet that cycles back to an
+                // ancestor (e.g., a typo in a 4→3→2→1→4 walk
+                // returning to the deepest level). The cap is
+                // generously above the 4-level hierarchy so
+                // legitimate walks always complete inside it.
                 let mut current = subnet;
-                loop {
+                for _ in 0..8 {
                     *subnet_counts.entry(current).or_insert(0) += 1;
                     let parent = current.parent();
                     if parent == current || parent.is_global() {
