@@ -1136,6 +1136,7 @@ impl EventBus {
         // single-`max_delay`-sleep approach a frequent flake.
         let target_ingested = self.stats.events_ingested.load(AtomicOrdering::Acquire);
         let dropped_at_start = self.stats.events_dropped.load(AtomicOrdering::Acquire);
+        let dispatched_at_start = self.stats.events_dispatched.load(AtomicOrdering::Acquire);
 
         // Outer deadline still bounds Phase 2 in case a wedged
         // adapter never returns. `max_delay * num_workers` is the
@@ -1160,16 +1161,31 @@ impl EventBus {
         loop {
             let dispatched = self.stats.events_dispatched.load(AtomicOrdering::Acquire);
             let dropped = self.stats.events_dropped.load(AtomicOrdering::Acquire);
-            // `dropped - dropped_at_start` is the number of events
-            // dropped *during* flush() (e.g. an adapter that
-            // exhausted retries on a pre-flush ingest). Those count
-            // toward the barrier — the corresponding `events_ingested`
-            // bumps already happened pre-flush so the dispatched
-            // bucket and the dropped-during-flush bucket together
-            // must catch up to `target_ingested` for the barrier to
-            // be met.
-            let dropped_during_flush = dropped.saturating_sub(dropped_at_start);
-            if dispatched.saturating_add(dropped_during_flush) >= target_ingested
+            // The barrier: every event ingested pre-flush has been
+            // either dispatched or dropped. The bus's invariant
+            // `events_ingested = events_dispatched + events_dropped`
+            // holds at quiescence; we wait until
+            // `dispatched + dropped >= target_ingested`.
+            //
+            // Pre-fix this used `dispatched + (dropped -
+            // dropped_at_start) >= target_ingested`, which under-
+            // counted by `dropped_at_start`: even after every
+            // pre-flush event was processed, the inequality
+            // required `dropped_at_start` MORE post-flush events
+            // before signalling done. Workloads with no post-flush
+            // ingest hung at the barrier until the deadline fired.
+            //
+            // Cross-shard race remains: a fast shard's post-flush
+            // dispatches can satisfy the global target while a
+            // slow shard's pre-flush events linger in its mpsc
+            // channel or pending batch. `all_shards_empty()`
+            // checks ring buffers but not those downstream
+            // queues. Operators relying on flush as a hard
+            // delivery barrier should call it during quiet
+            // ingest, or in `shutdown` (which gates ingest via
+            // `try_enter_ingest`).
+            let _ = dispatched_at_start; // reserved for future per-shard accounting
+            if dispatched.saturating_add(dropped) >= target_ingested
                 && self.shard_manager.all_shards_empty()
             {
                 break;
