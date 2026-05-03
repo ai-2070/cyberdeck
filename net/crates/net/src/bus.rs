@@ -1293,9 +1293,14 @@ impl EventBus {
             // override is `#[cfg(test)]`-only; production cargo
             // builds compile out the override entirely.
             let deadline_dur = shutdown_via_ref_spin_deadline();
-            let deadline = std::time::Instant::now() + deadline_dur;
+            // Use `tokio::time::Instant` so tests using
+            // `tokio::time::pause()` virtualize this clock too.
+            // Pre-fix `std::time::Instant` was wall-clock and
+            // ignored `pause()`, breaking timeout-bounded tests
+            // that wanted to fast-forward the spin deadline.
+            let deadline = tokio::time::Instant::now() + deadline_dur;
             while !self.shutdown_completed.load(AtomicOrdering::Acquire) {
-                if std::time::Instant::now() >= deadline {
+                if tokio::time::Instant::now() >= deadline {
                     return Err(AdapterError::Transient(
                         "shutdown_via_ref: another caller is mid-shutdown; \
                          deadline elapsed before shutdown_completed \
@@ -1343,9 +1348,13 @@ impl EventBus {
         // log below (so it's diagnosable). The "no stranding"
         // promise on the happy path stands; the deadline path is
         // the documented escape hatch.
-        let in_flight_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Use `tokio::time::Instant` so tests using
+        // `tokio::time::pause()` virtualize this 5-second
+        // deadline too — pre-fix the `std::time::Instant`
+        // was wall-clock and ignored the test's paused clock.
+        let in_flight_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while self.in_flight_ingests.load(AtomicOrdering::SeqCst) > 0 {
-            if std::time::Instant::now() >= in_flight_deadline {
+            if tokio::time::Instant::now() >= in_flight_deadline {
                 let stranded = self.in_flight_ingests.load(AtomicOrdering::SeqCst);
                 tracing::warn!(
                     in_flight = stranded,
