@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/redis.rs
+  726f3eb25aff9828 54-66
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  726f3eb25aff9828 9,354
+net/crates/net/src/adapter/redis_dedup.rs
+  726f3eb25aff9828 134,136-150
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "e2994f17c226eece3ae24a8d2feb7e3166b32362",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 32,
+      "total_deletions": 13,
+      "accepted_lines": 401,
+      "overriden_lines": 2
+    }
+  }
+}
