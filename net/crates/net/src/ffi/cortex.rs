@@ -232,6 +232,21 @@ pub extern "C" fn net_redex_open_file(
         }
         _ => {}
     }
+    // Reject `Some(0)` for every retention dimension at the same
+    // gate that rejects fsync zeros above. Setting
+    // `retention_max_events = 0` (or _bytes / _age_ms) means
+    // "evict everything immediately on first append" — almost
+    // certainly a config mistake intended as "no limit", which in
+    // every JSON schema this crate accepts is expressed as `null`
+    // / omission. Pre-fix `Some(0)` was propagated unchecked,
+    // turning a config typo into silent total data loss on every
+    // write.
+    if matches!(cfg_json.retention_max_events, Some(0))
+        || matches!(cfg_json.retention_max_bytes, Some(0))
+        || matches!(cfg_json.retention_max_age_ms, Some(0))
+    {
+        return NET_ERR_REDEX;
+    }
     cfg.retention_max_events = cfg_json.retention_max_events;
     cfg.retention_max_bytes = cfg_json.retention_max_bytes;
     if let Some(ms) = cfg_json.retention_max_age_ms {
@@ -1566,6 +1581,48 @@ mod tests {
                 rc, NET_ERR_REDEX,
                 "config {name:?} ({cfg}) should be rejected with NET_ERR_REDEX (got {rc})"
             );
+        }
+
+        net_redex_free(r);
+    }
+
+    /// Pin: `net_redex_open_file` rejects `Some(0)` for any
+    /// retention dimension at the same gate that rejects fsync
+    /// zeros. Pre-fix the retention triple was propagated
+    /// unchecked, so a config typo
+    /// (`{"retention_max_events": 0}` instead of `null`) silently
+    /// configured "evict everything immediately" and lost every
+    /// write to the file.
+    #[test]
+    fn redex_open_file_rejects_zero_retention() {
+        let r = redex();
+        let invalid = [
+            ("zero-events", r#"{"retention_max_events":0}"#),
+            ("zero-bytes", r#"{"retention_max_bytes":0}"#),
+            ("zero-age", r#"{"retention_max_age_ms":0}"#),
+            (
+                "any-zero-among-many",
+                r#"{"retention_max_events":1000,"retention_max_bytes":0}"#,
+            ),
+        ];
+        for (name, cfg) in invalid {
+            let rc = open_file(r, name, Some(cfg));
+            assert_eq!(
+                rc, NET_ERR_REDEX,
+                "config {name:?} ({cfg}) must be rejected with NET_ERR_REDEX (got {rc})"
+            );
+        }
+
+        // Non-zero retention still parses.
+        let valid = [
+            ("non-zero-events", r#"{"retention_max_events":10000}"#),
+            ("non-zero-bytes", r#"{"retention_max_bytes":1048576}"#),
+            ("non-zero-age", r#"{"retention_max_age_ms":60000}"#),
+            ("null-retention", r#"{"retention_max_events":null}"#),
+        ];
+        for (name, cfg) in valid {
+            let rc = open_file(r, name, Some(cfg));
+            assert_eq!(rc, 0, "valid config {name:?} ({cfg}) should succeed (got {rc})");
         }
 
         net_redex_free(r);
