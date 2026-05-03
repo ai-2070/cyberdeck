@@ -1,0 +1,25 @@
+net/crates/net/docs/misc/BUG_AUDIT_2026_05_03.md
+  726f3eb25aff9828 9,236
+net/crates/net/src/shard/mapper.rs
+  726f3eb25aff9828 112-132,154-155,172-190,201-213,281-289,1460-1555
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "10f61560f3a64c59857e7dbdc91ce9d049da03ce",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 162,
+      "total_deletions": 24,
+      "accepted_lines": 531,
+      "overriden_lines": 2
+    }
+  }
+}
