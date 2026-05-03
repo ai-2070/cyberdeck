@@ -1255,16 +1255,28 @@ impl SafetyEnforcer {
         // `Enforce` is the real-world trigger). The matching
         // tokens/cost paths already use `fetch_update` +
         // `saturating_sub` for exactly this reason.
+        //
+        // Use `AcqRel` (not `Relaxed`) to mirror the acquire path's
+        // `try_fetch_add_capped_u32` ordering. Pre-fix the
+        // asymmetric `Relaxed` release on weakly-ordered cores
+        // (ARM / RISC-V) let a subsequent acquirer observe the
+        // post-release counter while the release-side caller's
+        // prior reads of the freed resource were still visible to
+        // its CPU only — a window where the resource looked
+        // available to the acquirer while the previous owner was
+        // still touching it. The total counter eventually
+        // converges, but the ordering mismatch produced
+        // observable drift on metrics readers.
         let _ =
             self.usage
                 .concurrent
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     Some(current.saturating_sub(claim.concurrent_slots))
                 });
         let _ =
             self.usage
                 .memory_mb
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     Some(current.saturating_sub(claim.memory_mb))
                 });
         // Release tokens and cost that were acquired — without this,
@@ -1272,12 +1284,12 @@ impl SafetyEnforcer {
         let _ = self
             .usage
             .tokens
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(claim.tokens as u64))
             });
         let _ = self.usage.cost_cents_per_hour.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
             |current| Some(current.saturating_sub(claim.cost_cents)),
         );
     }
