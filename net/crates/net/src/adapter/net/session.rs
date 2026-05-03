@@ -540,25 +540,51 @@ impl NetSession {
         }
 
         // Pass 2: if still over the cap, LRU-evict the oldest.
+        //
+        // The (key, last_activity) pair is captured in the same
+        // iteration that selects the victim, then `remove_if`
+        // re-checks the activity stamp atomically before
+        // removing. If a concurrent `open_stream_full` reused the
+        // same `stream_id` slot or `touch`-ed it between selection
+        // and removal, the stamp differs and we skip the eviction
+        // for this round (it'll be re-evaluated on the next sweep
+        // if the cap is still exceeded). Pre-fix the iter then
+        // remove pair was non-atomic, so a freshly-opened stream
+        // could be torn down in the gap between selection and
+        // removal — observed as "stream just opened, immediately
+        // closed" in production logs.
         while self.streams.len() > max_streams {
             let oldest = self
                 .streams
                 .iter()
                 .min_by_key(|e| e.value().last_activity_ns())
-                .map(|e| *e.key());
+                .map(|e| (*e.key(), e.value().last_activity_ns()));
             match oldest {
-                Some(sid) => {
-                    if let Some((_, state)) = self.streams.remove(&sid) {
-                        state.deactivate();
-                        self.recently_closed.insert(sid, Instant::now());
-                        evicted += 1;
-                        tracing::warn!(
-                            stream_id = format!("{:#x}", sid),
-                            reason = "cap_exceeded",
-                            total_streams = self.streams.len(),
-                            max_streams = max_streams,
-                            "stream evicted: max_streams cap"
-                        );
+                Some((sid, expected_activity_ns)) => {
+                    let removed = self
+                        .streams
+                        .remove_if(&sid, |_, v| v.last_activity_ns() == expected_activity_ns);
+                    match removed {
+                        Some((_, state)) => {
+                            state.deactivate();
+                            self.recently_closed.insert(sid, Instant::now());
+                            evicted += 1;
+                            tracing::warn!(
+                                stream_id = format!("{:#x}", sid),
+                                reason = "cap_exceeded",
+                                total_streams = self.streams.len(),
+                                max_streams = max_streams,
+                                "stream evicted: max_streams cap"
+                            );
+                        }
+                        None => {
+                            // The stream was touched / replaced
+                            // between selection and removal. Pick a
+                            // new victim on the next loop iteration.
+                            // Bail if the cap is no longer exceeded,
+                            // otherwise the loop terminates anyway.
+                            continue;
+                        }
                     }
                 }
                 None => break,
