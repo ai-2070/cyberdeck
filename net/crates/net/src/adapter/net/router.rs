@@ -493,6 +493,19 @@ impl NetRouter {
             return Ok(RouteAction::Local(data.slice(ROUTING_HEADER_SIZE..)));
         }
 
+        // Loop suppression: if we're about to forward a packet whose
+        // `src_id` is us, we sent it earlier and it has come back via
+        // a misconfigured route or a malicious peer. Drop it locally
+        // so the only thing breaking the loop is TTL exhaustion;
+        // every looping hop wastes one queue slot and 2x bandwidth
+        // on the link. The `src_id` field is u32; `local_id` is u64
+        // (only the low 32 bits identify us on the wire).
+        if routing_header.src_id == (self.routing_table.local_id() as u32) {
+            self.packets_dropped.fetch_add(1, Ordering::Relaxed);
+            self.routing_table.record_drop(stream_id);
+            return Err(RouterError::RoutingLoop);
+        }
+
         // Check TTL
         if routing_header.is_expired() {
             self.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -659,6 +672,9 @@ pub enum RouterError {
     NoRoute,
     /// Queue full
     QueueFull,
+    /// Source is this node — packet looped back via a misconfigured
+    /// route or hostile peer.
+    RoutingLoop,
 }
 
 impl std::fmt::Display for RouterError {
@@ -669,6 +685,7 @@ impl std::fmt::Display for RouterError {
             Self::TtlExpired => write!(f, "TTL expired"),
             Self::NoRoute => write!(f, "no route to destination"),
             Self::QueueFull => write!(f, "queue full"),
+            Self::RoutingLoop => write!(f, "routing loop (packet returned to its source)"),
         }
     }
 }
@@ -903,6 +920,65 @@ mod tests {
             1,
             "stream stats should record 1 packet for stream_id 0x{:X}",
             expected_stream_id
+        );
+    }
+
+    /// Pin: a packet whose `src_id` matches this router's
+    /// `local_id` must be dropped immediately on receipt with
+    /// `RoutingLoop` instead of being forwarded again. Pre-fix
+    /// the router happily looped the packet back along the
+    /// route, only breaking the cycle on TTL exhaustion (so
+    /// every loop wasted up to 64 hops × bandwidth before
+    /// dying).
+    #[tokio::test]
+    async fn route_packet_drops_when_src_id_is_local() {
+        let local_id = 0x1234u64;
+        let dest_id = 0x9999u64;
+        let dest_addr: SocketAddr = "127.0.0.2:6000".parse().unwrap();
+
+        let config = RouterConfig::new(local_id, "127.0.0.1:0".parse().unwrap());
+        let router = NetRouter::new(config).await.unwrap();
+        router.routing_table().add_route(dest_id, dest_addr);
+
+        // RoutingHeader stores src_id as u32 — the low 32 bits of
+        // the local node id are what identifies us on the wire.
+        let routing = RoutingHeader::new(dest_id, local_id as u32, 16);
+        let routing_bytes = routing.to_bytes();
+
+        let net = NetHeader::new(
+            0xAAAA,
+            0xBEEF,
+            1,
+            [0u8; 12],
+            0,
+            0,
+            super::super::protocol::PacketFlags::NONE,
+        );
+        let net_bytes = net.to_bytes();
+
+        let mut packet = BytesMut::with_capacity(ROUTING_HEADER_SIZE + HEADER_SIZE);
+        packet.extend_from_slice(&routing_bytes);
+        packet.extend_from_slice(&net_bytes);
+
+        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let result = router.route_packet(packet.freeze(), from);
+        match result {
+            Err(RouterError::RoutingLoop) => {}
+            other => panic!(
+                "expected RoutingLoop for src_id == local_id, got {:?}",
+                other
+            ),
+        }
+
+        // Counters: dropped += 1, forwarded unchanged.
+        let stats = router.stats();
+        assert_eq!(
+            stats.packets_dropped, 1,
+            "looping packet must increment packets_dropped"
+        );
+        assert_eq!(
+            stats.packets_forwarded, 0,
+            "looping packet must NOT be forwarded"
         );
     }
 
