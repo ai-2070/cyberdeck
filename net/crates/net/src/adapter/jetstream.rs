@@ -515,131 +515,55 @@ impl Adapter for JetStreamAdapter {
         // saturating value cannot itself cause an overflow.
         let fetch_limit = limit.saturating_add(1);
 
-        // Get messages directly from the stream
+        // Get messages directly from the stream.
+        //
+        // Pre-fix this loop walked `current_seq` one at a time,
+        // calling `stream.direct_get(seq)` per sequence. On a
+        // 1ms-RTT link a 100-event poll cost ≥100ms wall, bounded
+        // by latency rather than bandwidth. `direct_get_next_for_subject`
+        // returns the NEXT message at or after `seq` for a given
+        // subject in a single RTT — gaps from deletions, MAXLEN
+        // trims, or sparse writes are skipped server-side. This
+        // also eliminates the cold-stream-bail and
+        // `consecutive_not_found` heuristics, which were
+        // workarounds for the per-seq walk: with next-by-subject,
+        // a NotFound result is definitive ("no more messages at
+        // or after this seq"), not noise.
+        //
+        // The shard-scoped subject (one stream per shard, exact
+        // subject `<prefix>.shard.<id>`) means the next-by-subject
+        // call returns events that belong only to this shard.
         let mut events = Vec::with_capacity(limit);
         let mut current_seq = start_seq;
+        let subject_str = self.subject(shard_id);
 
-        // Use the stream's actual last sequence to bound the search,
-        // rather than an arbitrary multiplier that can miss events in
-        // streams with large gaps (deletions, compaction). The
-        // fallback saturates so a caller-supplied `limit` near
-        // `usize::MAX` cannot wrap to a tiny `max_seq` and silently
-        // cap the poll at zero events.
-        //
-        // Also extract `first_sequence` so the per-event walk below
-        // can skip past a long retention-rollover gap in a single
-        // jump. Without it, `direct_get(seq)` returns NotFound for
-        // every deleted seq and the loop would increment by one
-        // and try again — after a MAXLEN trim of the first 10M
-        // sequences, `poll_shard(from_id=None)` resumes at
-        // `start_seq=1` and the consumer would do 10M sequential
-        // network RTTs before returning a single event (hung for
-        // minutes, request timeout fires, next poll resumes from
-        // where it left off — never made progress). With
-        // `first_sequence` captured up-front, the first `NotFound`
-        // jumps `current_seq` to `first_sequence` in one step.
-        let (max_seq, first_seq) = match stream.info().await {
-            Ok(info) => (info.state.last_sequence, info.state.first_sequence),
-            // Pre-fix, an `info()` error fabricated `first_seq = 0`
-            // (treating it as a cold/empty stream) and a synthetic
-            // `max_seq`. That made `cold_stream_bail_enabled` true
-            // below, so a populated stream with a deletion gap
-            // would bail after 64 NotFounds — the consumer would
-            // believe the stream had drained while events were
-            // still ahead. Surface the failure as `Transient`
-            // instead so the caller retries the poll once the
-            // backend recovers; pre-fix this was a recoverable
-            // condition silently converted to under-delivery.
-            Err(e) => {
-                return Err(AdapterError::Transient(format!(
-                    "JetStream stream.info() failed for shard {} (poll \
-                     suspended; retry after backoff): {}",
-                    shard_id, e
-                )));
-            }
-        };
-        // Apply the retention-rollover jump up-front: if
-        // `start_seq` is below the stream's first retained
-        // sequence, advance the cursor immediately rather than
-        // walking the deleted range one-by-one.
-        if first_seq > current_seq {
-            current_seq = first_seq;
+        // We still call `stream.info()` once up-front so a
+        // transient backend hiccup surfaces as `Transient` rather
+        // than "stream is empty." The `max_seq`/`first_seq`
+        // walking heuristics are no longer needed (the
+        // next-by-subject API handles gaps natively), but
+        // failing fast on info() preserves the
+        // recoverable-error contract.
+        if let Err(e) = stream.info().await {
+            return Err(AdapterError::Transient(format!(
+                "JetStream stream.info() failed for shard {} (poll \
+                 suspended; retry after backoff): {}",
+                shard_id, e
+            )));
         }
 
-        // Use direct get to fetch messages by sequence
-        // Use while loop so gaps don't consume our fetch count.
-        // Track every sequence we observe (regardless of deserialize
-        // outcome) so the cursor can advance past corrupt entries
-        // instead of stalling on them.
-        //
-        // The loop's `current_seq > max_seq` short-circuit re-reads
-        // `info()` once before declaring drain, to catch concurrent
-        // writes that appeared after our initial sample. Without
-        // the re-read, a producer writing new messages during the
-        // read would be silently truncated — `has_more=false` would
-        // come back even though the stream tail had more events.
-        // `max_seq_re_checked` tracks whether we've already paid
-        // the one bounded re-read, so a relentless producer can't
-        // spin us forever in a re-info loop.
         let mut last_seen_seq: Option<u64> = None;
-        let mut max_seq = max_seq;
-        let mut max_seq_re_checked = false;
-        // Pre-fix, on `stream.info()` failure for a
-        // cold/empty stream, `first_seq=0` and `max_seq=start_seq+
-        // fetch_limit*10` together caused the loop to walk every
-        // sequence from 1 to `max_seq`, doing one direct_get RTT
-        // per missing seq. With `fetch_limit=101`, that's ~1010
-        // RTTs per poll, observed as "JetStream is slow" in
-        // production.
-        //
-        // After K consecutive NotFound responses, declare the
-        // stream cold and bail. K is `max(64, fetch_limit / 2)` —
-        // big enough to skip ordinary gaps in a dense stream
-        // (the `first_sequence` jump above already collapses huge
-        // retention-rollover gaps in a single step) but small
-        // enough that a cold stream doesn't burn 1000+ RTTs.
-        //
-        // The cap is gated on `first_seq == 0`: when the stream's
-        // first retained sequence is non-zero, `info()` succeeded
-        // and reported real data, so there's no risk of an
-        // unbounded walk on a cold/empty stream — `current_seq >
-        // max_seq` is the natural stop. Applying the cap there
-        // would truncate polling on a *sparse* populated stream
-        // (events at e.g. seq 1, 500, 1000) by breaking before
-        // reaching later valid sequences. `first_seq == 0` now
-        // means a genuinely empty stream — `info()` failures are
-        // surfaced as `Transient` above, never reaching this
-        // branch with a fabricated `first_seq = 0`.
-        let consecutive_not_found_cap = (fetch_limit / 2).max(64);
-        let cold_stream_bail_enabled = first_seq == 0;
-        let mut consecutive_not_found = 0usize;
         while events.len() < fetch_limit {
-            if current_seq > max_seq {
-                // Before declaring drain, re-read `info()` once to
-                // catch concurrent writes that appeared after our
-                // initial sample. One bounded re-read per poll
-                // preserves the loop's O(span) worst-case while
-                // closing the truncation hole.
-                if !max_seq_re_checked {
-                    max_seq_re_checked = true;
-                    if let Ok(info) = stream.info().await {
-                        if info.state.last_sequence > max_seq {
-                            max_seq = info.state.last_sequence;
-                            continue;
-                        }
-                    }
-                }
-                // Searched too far without finding enough events
-                break;
-            }
-
-            match stream.direct_get(current_seq).await {
+            match stream
+                .direct_get_next_for_subject(subject_str.clone(), Some(current_seq))
+                .await
+            {
                 Ok(msg) => {
-                    consecutive_not_found = 0;
-                    match Self::deserialize_event(current_seq, &msg.payload) {
+                    let msg_seq = msg.sequence;
+                    match Self::deserialize_event(msg_seq, &msg.payload) {
                         Ok(event) => {
                             events.push(event);
-                            last_seen_seq = Some(current_seq);
+                            last_seen_seq = Some(msg_seq);
                         }
                         // Per-record JSON corruption is treated as a
                         // skippable hole in the stream — the cursor
@@ -648,11 +572,11 @@ impl Adapter for JetStreamAdapter {
                         Err(e @ AdapterError::Serialization(_)) => {
                             tracing::warn!(
                                 stream = %self.stream_name(shard_id),
-                                seq = current_seq,
+                                seq = msg_seq,
                                 error = %e,
                                 "Failed to deserialize event, skipping"
                             );
-                            last_seen_seq = Some(current_seq);
+                            last_seen_seq = Some(msg_seq);
                         }
                         // `deserialize_event` returns
                         // `AdapterError::Fatal` when the stored
@@ -661,26 +585,16 @@ impl Adapter for JetStreamAdapter {
                         // silent truncation would mis-route the
                         // event). Return the good prefix
                         // accumulated so far with the cursor
-                        // pointing at the LAST GOOD seq (i.e. the
-                        // last one the consumer actually saw), so
-                        // a retry of `poll_shard` re-walks just
-                        // the corrupt record and surfaces the
-                        // Fatal error at that exact seq — without
-                        // also re-emitting the good prefix as
+                        // pointing at the LAST GOOD seq, so a
+                        // retry of `poll_shard` re-walks just the
+                        // corrupt record and surfaces the Fatal
+                        // error at that exact seq — without also
+                        // re-emitting the good prefix as
                         // duplicates.
-                        //
-                        // Pre-fix this returned `Err(e)` directly,
-                        // dropping the accumulated `events`. A
-                        // consumer that retried after operator
-                        // recovery (or that the bus retry loop
-                        // didn't gate via `is_retryable`) would
-                        // re-poll from the previous cursor and
-                        // re-emit the entire good prefix —
-                        // duplicate delivery on every Fatal.
                         Err(e) => {
                             tracing::error!(
                                 stream = %self.stream_name(shard_id),
-                                seq = current_seq,
+                                seq = msg_seq,
                                 accumulated = events.len(),
                                 error = %e,
                                 "JetStream: structurally-corrupt event; \
@@ -688,9 +602,6 @@ impl Adapter for JetStreamAdapter {
                                  good seq so retry surfaces Fatal at the \
                                  exact corrupt seq"
                             );
-                            // Cursor stays at `last_seen_seq` —
-                            // not advanced past `current_seq`.
-                            // Build the SubmitOutcome and return.
                             let next_id = last_seen_seq.map(|s| s.to_string());
                             return Ok(ShardPollResult {
                                 events,
@@ -699,36 +610,24 @@ impl Adapter for JetStreamAdapter {
                             });
                         }
                     }
-                    current_seq += 1;
+                    // Advance past the seq we just observed.
+                    // Saturating-add guards against `u64::MAX`
+                    // (a stream that's run for ~2^64 events is
+                    // already in trouble, but we won't wrap to 0
+                    // and re-emit from the start).
+                    current_seq = msg_seq.saturating_add(1);
                 }
                 Err(e) => {
                     use async_nats::jetstream::stream::DirectGetErrorKind;
                     match e.kind() {
-                        DirectGetErrorKind::NotFound => {
-                            // Try next sequence (there might be gaps due to deletions),
-                            // but bail after `consecutive_not_found_cap` to avoid
-                            // burning RTTs on a cold stream. Only applies when
-                            // `cold_stream_bail_enabled` (i.e. `first_seq == 0`):
-                            // a sparse populated stream needs to walk past arbitrarily
-                            // long deletion gaps to reach later events.
-                            consecutive_not_found += 1;
-                            if cold_stream_bail_enabled
-                                && consecutive_not_found >= consecutive_not_found_cap
-                            {
-                                tracing::debug!(
-                                    stream = %self.stream_name(shard_id),
-                                    consecutive_not_found,
-                                    current_seq,
-                                    "JetStream poll bailing after consecutive NotFounds"
-                                );
-                                break;
-                            }
-                            current_seq += 1;
-                        }
-                        DirectGetErrorKind::InvalidSubject => {
-                            // No more messages or invalid request
-                            break;
-                        }
+                        // NotFound from `direct_get_next_for_subject`
+                        // is definitive: there is no message at or
+                        // after `current_seq` for this subject.
+                        // Pre-fix the per-seq walk needed cold-stream
+                        // bail / consecutive-NotFound counting; with
+                        // next-by-subject, we just exit.
+                        DirectGetErrorKind::NotFound => break,
+                        DirectGetErrorKind::InvalidSubject => break,
                         _ => {
                             // For other errors, check if we have any events
                             if events.is_empty() {
