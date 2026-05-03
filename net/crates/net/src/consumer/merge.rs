@@ -64,6 +64,30 @@ fn split_redis_id(s: &str) -> Option<(u64, u64)> {
     Some((ms.parse().ok()?, seq.parse().ok()?))
 }
 
+/// Coarse classifier for a stream id. Two ids of the same
+/// format compare safely via `compare_stream_ids`; two ids of
+/// different formats fall through to a lex compare that may
+/// wedge the cursor (see `update_from_events`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdFormat {
+    /// Redis Streams `<ms>-<seq>`.
+    Redis,
+    /// Plain numeric (JetStream `seq.to_string()`).
+    Numeric,
+    /// Anything else — assumed lex-comparable.
+    Opaque,
+}
+
+pub(crate) fn id_format(s: &str) -> IdFormat {
+    if split_redis_id(s).is_some() {
+        IdFormat::Redis
+    } else if s.parse::<u128>().is_ok() {
+        IdFormat::Numeric
+    } else {
+        IdFormat::Opaque
+    }
+}
+
 /// Backing type for per-shard cursor positions. `Arc<str>` makes
 /// cursor clones (and internal copies during poll merging) cheap by
 /// reference-counting the id bytes rather than copying them.
@@ -166,13 +190,47 @@ impl CompositeCursor {
         for event in events {
             let new_id = event.id.as_str();
             match self.positions.get(&event.shard_id) {
-                Some(existing)
-                    if compare_stream_ids(existing.as_ref(), new_id) != CmpOrdering::Less =>
-                {
-                    // Don't regress (existing is >= new_id under the
-                    // structured comparator).
+                Some(existing) => {
+                    // Detect a backend-format change before
+                    // calling the comparator. Pre-fix a cursor
+                    // at `"42"` (JetStream numeric) confronted
+                    // with a new `"1700-0"` (Redis) fell through
+                    // both structured branches of
+                    // `compare_stream_ids`, hit the lex fallback
+                    // (`'4' > '1'`), and the CAS guard refused
+                    // to update — silent stall requiring manual
+                    // cursor reset. Detect the mismatch
+                    // explicitly: surface a loud error and
+                    // refuse the update so operators see the
+                    // backend migration in logs and reset the
+                    // cursor deliberately. Keeping the existing
+                    // value (rather than blindly accepting the
+                    // new one) avoids a potential regression in
+                    // the other direction.
+                    let existing_fmt = id_format(existing.as_ref());
+                    let new_fmt = id_format(new_id);
+                    if existing_fmt != new_fmt {
+                        tracing::error!(
+                            shard_id = event.shard_id,
+                            existing = %existing,
+                            new = %new_id,
+                            existing_format = ?existing_fmt,
+                            new_format = ?new_fmt,
+                            "stream id format change detected — likely a \
+                             backend migration (e.g. JetStream → Redis). \
+                             Refusing to advance the cursor; operator must \
+                             explicitly reset to consume from the new \
+                             backend.",
+                        );
+                        continue;
+                    }
+                    if compare_stream_ids(existing.as_ref(), new_id) == CmpOrdering::Less {
+                        self.positions.insert(event.shard_id, Arc::from(new_id));
+                    }
+                    // Existing is >= new_id under the structured
+                    // comparator — don't regress.
                 }
-                _ => {
+                None => {
                     self.positions.insert(event.shard_id, Arc::from(new_id));
                 }
             }
@@ -845,6 +903,85 @@ mod tests {
             cursor.get(0),
             Some("1700000000000-20"),
             "cursor must reach -20; lex compare would wedge at -9"
+        );
+    }
+
+    /// Regression: a backend migration (e.g. JetStream → Redis)
+    /// that lands an id of a different format than the existing
+    /// cursor must NOT silently advance OR silently stall. Pre-
+    /// fix `compare_stream_ids` fell through both structured
+    /// branches and hit the lex fallback: `"42" > "1700-0"` (because
+    /// `'4' > '1'`), so the CAS guard refused to update the
+    /// cursor. Result: the consumer kept seeing `"42"` forever
+    /// while the new Redis backend kept emitting Redis-formatted
+    /// ids, with no surfaced error.
+    ///
+    /// Post-fix: format-mismatch is detected explicitly and
+    /// surfaced via `tracing::error!`. The cursor stays at its
+    /// current value (so we don't regress), and an operator must
+    /// reset the cursor deliberately to consume from the new
+    /// backend. This test pins the "stays at existing value"
+    /// half of the contract; the loud error is observability,
+    /// not behavior, so it isn't asserted here.
+    #[test]
+    fn cursor_refuses_to_advance_across_backend_format_change() {
+        let mut cursor = CompositeCursor::new();
+        // Cursor starts at JetStream-style numeric "42".
+        cursor.update_from_events(&[StoredEvent::from_value(
+            "42".to_string(),
+            json!({}),
+            42,
+            0,
+        )]);
+        assert_eq!(cursor.get(0), Some("42"));
+
+        // A new event arrives in Redis format. Pre-fix this would
+        // hit the lex fallback and the cursor would refuse to
+        // advance silently; post-fix the format mismatch is
+        // detected and the cursor STILL refuses to advance, but
+        // a `tracing::error!` is emitted so operators see the
+        // backend migration.
+        cursor.update_from_events(&[StoredEvent::from_value(
+            "1700000000000-0".to_string(),
+            json!({}),
+            1700000000000,
+            0,
+        )]);
+
+        // Cursor must still be at the original numeric id (not
+        // the new Redis id, which would be a regression-like
+        // jump back in time, AND not unset, which would lose
+        // progress).
+        assert_eq!(
+            cursor.get(0),
+            Some("42"),
+            "regression: cursor must not silently advance through a \
+             backend-format change. The pre-fix lex fallback also \
+             happened to keep the existing value (by `'4' > '1'`), \
+             but only by accident; this test pins the explicit \
+             format-mismatch refusal."
+        );
+
+        // And the reverse direction: a Redis cursor confronted
+        // with a new numeric id must also stay put.
+        let mut cursor = CompositeCursor::new();
+        cursor.update_from_events(&[StoredEvent::from_value(
+            "1700000000000-0".to_string(),
+            json!({}),
+            1700000000000,
+            0,
+        )]);
+        cursor.update_from_events(&[StoredEvent::from_value(
+            "9000".to_string(),
+            json!({}),
+            9000,
+            0,
+        )]);
+        assert_eq!(
+            cursor.get(0),
+            Some("1700000000000-0"),
+            "regression (reverse direction): Redis cursor must not be \
+             silently overwritten by an incoming numeric id"
         );
     }
 
