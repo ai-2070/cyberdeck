@@ -1379,6 +1379,15 @@ impl MigrationOrchestrator {
     }
 
     /// Abort a migration with a caller-supplied structured reason.
+    ///
+    /// Removes the orchestrator's record AND, if wired, also clears
+    /// the matching entry on the local `MigrationSourceHandler`.
+    /// Pre-fix only the orchestrator entry was removed; the source
+    /// handler's `migrations` map retained the entry, so
+    /// `is_migrating()` stayed true forever and `buffer_event` kept
+    /// stuffing the now-undrained buffered_events vector. Subsequent
+    /// retry attempts then tripped `AlreadyMigrating` against a
+    /// migration the orchestrator believed was already aborted.
     pub fn abort_migration_with_reason(
         &self,
         daemon_origin: u32,
@@ -1387,6 +1396,14 @@ impl MigrationOrchestrator {
         self.migrations
             .remove(&daemon_origin)
             .ok_or(MigrationError::DaemonNotFound(daemon_origin))?;
+
+        // Clear the source-side mirror entry. `abort` is a no-op if
+        // the daemon was never tracked there (e.g. remote-source
+        // migration where this node is only the orchestrator), so
+        // calling it unconditionally is safe.
+        if let Some(source) = &self.source_handler {
+            let _ = source.abort(daemon_origin);
+        }
 
         Ok(MigrationMessage::MigrationFailed {
             daemon_origin,
@@ -1803,6 +1820,49 @@ mod tests {
         }
 
         assert!(!orch.is_migrating(origin));
+    }
+
+    /// Regression: pre-fix `abort_migration_with_reason` only
+    /// removed the orchestrator's record. The matching
+    /// `MigrationSourceHandler` entry stayed put, so
+    /// `is_migrating()` on the source remained `true`,
+    /// `buffer_event` kept appending to a never-drained vector,
+    /// and a retry trip-tested `AlreadyMigrating` against a
+    /// migration the orchestrator believed was aborted. The fix
+    /// calls `source.abort` from the orchestrator's abort path.
+    #[test]
+    fn abort_migration_propagates_to_source_handler() {
+        use crate::adapter::net::compute::migration_source::MigrationSourceHandler;
+        let (reg, origin) = setup_registry();
+        let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        let orch = MigrationOrchestrator::new(reg, 0x1111).with_source_handler(source.clone());
+
+        // Stand up the migration end-to-end via the orchestrator's
+        // `start_migration`, which records on BOTH sides (the
+        // orchestrator's record AND the source handler's mirror).
+        // Pre-fix the orchestrator's `abort_migration_with_reason`
+        // only cleared its own record, leaving the source mirror
+        // intact.
+        orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+        assert!(orch.is_migrating(origin), "orchestrator records the migration");
+        assert!(
+            source.is_migrating(origin),
+            "source handler also records the migration via the orchestrator",
+        );
+
+        // Abort. Both sides must clear.
+        orch.abort_migration(origin, "test abort".into()).unwrap();
+        assert!(!orch.is_migrating(origin), "orchestrator must clear its record");
+        assert!(
+            !source.is_migrating(origin),
+            "source handler must also clear its mirror entry on abort",
+        );
+
+        // The decisive sealed property: a fresh
+        // `start_migration` for the same daemon now succeeds.
+        // Pre-fix this would `AlreadyMigrating` because the source
+        // handler still tracked the daemon.
+        orch.start_migration(origin, 0x1111, 0x3333).unwrap();
     }
 
     #[test]
