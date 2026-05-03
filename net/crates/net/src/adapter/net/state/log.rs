@@ -91,7 +91,26 @@ impl EntityLog {
 
         // For genesis on a fresh log, accept without parent validation.
         // All other appends validate chain linkage (parent_hash, sequence, origin).
+        //
+        // Pin a canonical genesis payload of empty bytes:
+        // `CausalChainBuilder::new` constructs the genesis sentinel
+        // with `head_payload = Bytes::new()`, and the first real
+        // event in the chain has `sequence = 1` plus a real
+        // payload. A peer-injected event with `sequence = 0,
+        // parent_hash = 0, payload = <attacker_choice>` is
+        // genesis-shaped on the wire — pre-fix it was accepted
+        // unchecked on a fresh log, seeding the chain with an
+        // attacker-chosen anchor that survived if no successor
+        // ever arrived. Reject non-empty genesis payloads with
+        // `Chain(ParentHashMismatch)` (the closest existing
+        // structural-integrity error variant).
         if self.events.is_empty() && current_head.is_genesis() && event.link.is_genesis() {
+            if !event.payload.is_empty() {
+                return Err(LogError::Chain(ChainError::ParentHashMismatch {
+                    expected: 0,
+                    got: 0,
+                }));
+            }
             // Accept genesis event
         } else {
             validate_chain_link(&current_head, &self.head_payload, &event.link)
@@ -501,6 +520,47 @@ mod tests {
             log.append(genesis).is_err(),
             "duplicate genesis must be rejected after log has events"
         );
+    }
+
+    /// Pin: a fresh `EntityLog` rejects a genesis-shaped event
+    /// (sequence=0, parent_hash=0) whose payload is non-empty.
+    /// Pre-fix the genesis branch in `append` skipped payload
+    /// validation, so a peer-injected genesis with attacker-chosen
+    /// payload would seat in the log and survive until a
+    /// successor event tied to a different anchor arrived (and if
+    /// no successor ever arrived, the junk anchor was permanent).
+    /// The canonical genesis is `payload = empty`.
+    #[test]
+    fn append_rejects_non_empty_genesis_payload_on_fresh_log() {
+        let (_, entity_id) = make_entity();
+        let origin_hash = entity_id.origin_hash();
+        let mut log = EntityLog::new(entity_id);
+
+        // A peer-injected genesis-shaped event with attacker-
+        // chosen payload.
+        let bad_genesis = CausalEvent {
+            link: CausalLink::genesis(origin_hash, 0),
+            payload: Bytes::from_static(b"attacker choice"),
+            received_at: 0,
+        };
+        let err = log
+            .append(bad_genesis)
+            .expect_err("non-empty genesis must be rejected");
+        assert!(
+            matches!(err, LogError::Chain(ChainError::ParentHashMismatch { .. })),
+            "expected Chain(ParentHashMismatch), got {:?}",
+            err,
+        );
+
+        // Empty-payload genesis is the canonical form and must
+        // still be accepted.
+        let good_genesis = CausalEvent {
+            link: CausalLink::genesis(origin_hash, 0),
+            payload: Bytes::new(),
+            received_at: 0,
+        };
+        log.append(good_genesis)
+            .expect("empty-payload genesis must be accepted");
     }
 
     // ========================================================================
