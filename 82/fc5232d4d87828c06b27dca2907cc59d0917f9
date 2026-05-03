@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/identity/token.rs
+  726f3eb25aff9828 422-448,454-455
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "82fc5232d4d87828c06b27dca2907cc59d0917f9",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2347,
+      "total_deletions": 12,
+      "accepted_lines": 399,
+      "overriden_lines": 0
+    }
+  }
+}
