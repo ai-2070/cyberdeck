@@ -132,6 +132,32 @@ fn write_json_out<T: Serialize>(
 }
 
 // =========================================================================
+// Compile-time Send + Sync assertions for FFI handle inner types.
+//
+// These handles are returned to C as `*mut HandleType` and routinely
+// shared across goroutines / Python threads — the docstrings on
+// every "open" / "watch" function advertise this pattern. Soundness
+// rests entirely on the inner type's `Send + Sync` impl; the FFI
+// layer doesn't typecheck `Send + Sync` itself, so a future refactor
+// that adds a `Cell` / `RefCell` / `Rc` / `*mut` field to one of
+// these types would compile cleanly while silently introducing a
+// data race that any threaded caller would trigger.
+//
+// The `const _: fn() = ...` idiom is a compile-time trait check
+// without pulling in `static_assertions` as a dep. If any inner
+// type loses `Send + Sync`, this block fails to compile.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<InnerRedex>();
+    assert_send_sync::<InnerRedexFile>();
+    assert_send_sync::<InnerTasksAdapter>();
+    assert_send_sync::<InnerMemoriesAdapter>();
+    assert_send_sync::<TokioMutex<Option<BoxStream<'static, std::result::Result<RedexEvent, RedexError>>>>>();
+    assert_send_sync::<TokioMutex<Option<BoxStream<'static, Vec<Task>>>>>();
+    assert_send_sync::<TokioMutex<Option<BoxStream<'static, Vec<Memory>>>>>();
+};
+
+// =========================================================================
 // Redex manager
 // =========================================================================
 
