@@ -1238,12 +1238,21 @@ pub extern "C" fn net_free_string(s: *mut c_char) {
 // resolvable on every build configuration. Mirrors the
 // `nat-traversal` cfg pattern in `mesh.rs`.
 
+/// Stub for builds without the `net` feature.
+///
+/// `net.h` declares `net_generate_keypair` unconditionally, so
+/// the symbol must be resolvable on every build configuration.
+/// Returns NULL since keypair generation requires the net feature.
 #[cfg(not(feature = "net"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_generate_keypair() -> *mut c_char {
     ptr::null_mut()
 }
 
+/// Stub for builds without the `net` feature.
+///
+/// Mirrors the always-on signature in `net.h`. Reclaims a
+/// CString-allocated pointer if non-null.
 #[cfg(not(feature = "net"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_free_string(s: *mut c_char) {

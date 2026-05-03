@@ -531,6 +531,17 @@ impl EventBus {
             // detached task can't observe new work and will exit
             // on its next loop iteration.
             let workers = self.batch_workers.lock().remove(&new_id);
+            // `worker_detached` is set when either join times out
+            // — the worker is still running on a leaked
+            // JoinHandle. In that case the `next_sequence` atomic
+            // is no longer a reliable upper bound: the detached
+            // worker may publish a final batch whose msg-ids land
+            // in the same `[next_sequence..N]` range we'd use for
+            // the stranded-flush, producing duplicate XADDs or
+            // JetStream dedup hits. Skip the stranded-flush when
+            // detached and surface the loss explicitly so the
+            // operator sees it.
+            let mut worker_detached = false;
             let final_next_sequence = if let Some(workers) = workers {
                 let bound = self.config.adapter_timeout.saturating_mul(2);
                 match tokio::time::timeout(bound, workers.drain).await {
@@ -548,6 +559,7 @@ impl EventBus {
                             timeout_ms = bound.as_millis() as u64,
                             "drain worker did not exit within timeout on activate-failure rollback; detaching"
                         );
+                        worker_detached = true;
                     }
                 }
                 match tokio::time::timeout(bound, workers.batch).await {
@@ -565,6 +577,7 @@ impl EventBus {
                             timeout_ms = bound.as_millis() as u64,
                             "BatchWorker did not exit within timeout on activate-failure rollback; detaching"
                         );
+                        worker_detached = true;
                     }
                 }
                 workers.next_sequence.load(AtomicOrdering::Acquire)
@@ -575,8 +588,30 @@ impl EventBus {
             // 4. Dispatch any stranded events as a single-shot
             //    batch so they reach durable storage with the
             //    correct sequence-id segment. Identical to the
-            //    `remove_shard_internal` teardown.
-            if !stranded.is_empty() {
+            //    `remove_shard_internal` teardown — but only when
+            //    the worker actually exited. If it timed out and
+            //    is still running on a leaked handle, dispatching
+            //    here would emit msg-ids overlapping the worker's
+            //    final flush; surface the events as dropped
+            //    instead so the duplicate-on-the-wire hazard is
+            //    avoided.
+            if !stranded.is_empty() && worker_detached {
+                let count = stranded.len();
+                self.stats
+                    .events_dropped
+                    .fetch_add(count as u64, AtomicOrdering::Relaxed);
+                self.stats
+                    .shutdown_was_lossy
+                    .store(true, AtomicOrdering::Release);
+                tracing::error!(
+                    shard_id = new_id,
+                    count,
+                    "activate-failure rollback: skipping stranded-flush \
+                     because a worker JoinHandle timed out and may still \
+                     be running; events would collide with the detached \
+                     worker's final batch on the wire. Counted as dropped."
+                );
+            } else if !stranded.is_empty() {
                 let count = stranded.len();
                 let batch = crate::event::Batch::with_nonce(
                     new_id,
