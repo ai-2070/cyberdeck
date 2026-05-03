@@ -617,9 +617,26 @@ impl ProximityGraph {
         // noisy one-way delay; clock-skew-sensitive, but good enough
         // as an equal-hop tiebreaker. EWMA (α = 1/8) smooths
         // successive samples per `(from, to)` pair.
+        //
+        // Throttle the self-edge `(my_id → Z)` update: a hot
+        // pingwave-receive path (one per peer per heartbeat
+        // interval, scaled across N peers) hit the DashMap
+        // entry lock + `Instant::now()` on every receive even
+        // though the liveness signal only needs second-level
+        // freshness. Skip the update when the existing edge is
+        // less than a second old; the multi-hop edge below still
+        // refreshes unconditionally because it carries a fresh
+        // latency sample.
         let now_us = current_time_us();
         let sample_us = now_us.saturating_sub(pw.origin_timestamp_us);
-        self.insert_or_update_edge(self.my_id, from_node, 0);
+        let needs_self_edge_refresh = self
+            .edges
+            .get(&(self.my_id, from_node))
+            .map(|e| e.last_updated.elapsed() >= Duration::from_secs(1))
+            .unwrap_or(true);
+        if needs_self_edge_refresh {
+            self.insert_or_update_edge(self.my_id, from_node, 0);
+        }
         if from_node != pw.origin_id {
             self.insert_or_update_edge(from_node, pw.origin_id, sample_us);
         }
