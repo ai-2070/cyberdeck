@@ -1162,6 +1162,12 @@ unsafe fn collect_payloads(
             }
             return None;
         }
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        // A caller passing a sign-extended `-1` would otherwise
+        // immediately UB before any other validation runs.
+        if len > isize::MAX as usize {
+            return None;
+        }
         let slice = std::slice::from_raw_parts(ptr, len);
         out.push(Bytes::copy_from_slice(slice));
     }
@@ -1680,6 +1686,9 @@ pub extern "C" fn net_mesh_publish(
         Bytes::new()
     } else if payload.is_null() {
         return NetError::NullPointer.into();
+    } else if len > isize::MAX as usize {
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        return NetError::InvalidJson.into();
     } else {
         Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(payload, len) })
     };

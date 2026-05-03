@@ -591,6 +591,15 @@ pub extern "C" fn net_ingest(
         Err(err) => return err,
     };
 
+    // `slice::from_raw_parts` requires `len <= isize::MAX`. A
+    // C caller passing a sign-extended `-1` (or any
+    // `len > isize::MAX as usize`) triggers immediate UB before
+    // any other validation runs. Reject such inputs explicitly
+    // — caller should never see this in practice; surfacing a
+    // typed error is safer than UB.
+    if len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     // Parse event JSON
     let json_bytes = unsafe { std::slice::from_raw_parts(event_json as *const u8, len) };
     let json_str = match std::str::from_utf8(json_bytes) {
@@ -637,6 +646,10 @@ pub extern "C" fn net_ingest_raw(handle: *mut NetHandle, json: *const c_char, le
         Err(err) => return err,
     };
 
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let json_bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
     let json_str = match std::str::from_utf8(json_bytes) {
         Ok(s) => s,
@@ -692,6 +705,11 @@ pub extern "C" fn net_ingest_raw_batch(
             continue;
         }
 
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        // Skip pathological per-entry lengths rather than UB.
+        if len > isize::MAX as usize {
+            continue;
+        }
         let json_bytes = unsafe { std::slice::from_raw_parts(json_ptr as *const u8, len) };
         if let Ok(json_str) = std::str::from_utf8(json_bytes) {
             events.push(RawEvent::from_str(json_str));
@@ -1354,6 +1372,10 @@ pub extern "C" fn net_ingest_raw_ex(
         Err(err) => return err,
     };
 
+    // `slice::from_raw_parts` requires `len <= isize::MAX`.
+    if len > isize::MAX as usize {
+        return NetError::InvalidJson.into();
+    }
     let json_bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
     let json_str = match std::str::from_utf8(json_bytes) {
         Ok(s) => s,
