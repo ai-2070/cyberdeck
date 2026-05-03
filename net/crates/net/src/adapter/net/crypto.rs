@@ -401,7 +401,18 @@ struct ReplayWindow {
 
 impl ReplayWindow {
     const WINDOW_SIZE: u64 = 1024;
-    const MAX_FORWARD: u64 = 65536;
+    /// Maximum forward jump in counter values that this window
+    /// will accept on a single packet. Pre-fix this was 65_536,
+    /// far past `WINDOW_SIZE`. Any jump greater than `WINDOW_SIZE`
+    /// forced the bitmap to be zeroed (since the bitmap has
+    /// `BITMAP_WORDS × 64 = WINDOW_SIZE` bits), erasing the
+    /// "seen" markers for the previous `WINDOW_SIZE - 1` counters
+    /// — those sequence numbers became replayable until the new
+    /// window had been populated. Cap the forward jump at
+    /// `WINDOW_SIZE` so any gap that would discard replay state
+    /// is rejected; the peer must re-handshake to legitimately
+    /// resume past such a gap.
+    const MAX_FORWARD: u64 = Self::WINDOW_SIZE;
     const BITMAP_WORDS: usize = 16;
 
     const fn new() -> Self {
@@ -964,14 +975,67 @@ mod tests {
             "counter far beyond MAX_FORWARD should be rejected"
         );
         // rx_counter is 2001 after update_rx_counter(2000), so
-        // MAX_FORWARD boundary is 2001 + 65536 = 67537
+        // MAX_FORWARD boundary is 2001 + WINDOW_SIZE (1024) = 3025.
+        // Pre-fix MAX_FORWARD was 65_536 (far past WINDOW_SIZE);
+        // any jump > WINDOW_SIZE forced the bitmap to be zeroed,
+        // erasing replay state for the previous 1023 counters.
         assert!(
-            cipher.is_valid_rx_counter(67537),
+            cipher.is_valid_rx_counter(3025),
             "counter at MAX_FORWARD boundary should be accepted"
         );
         assert!(
-            !cipher.is_valid_rx_counter(67538),
+            !cipher.is_valid_rx_counter(3026),
             "counter just past MAX_FORWARD should be rejected"
+        );
+    }
+
+    /// Pin: a forward jump greater than `WINDOW_SIZE` is rejected
+    /// before it can zero the bitmap. Pre-fix `MAX_FORWARD` was
+    /// 65_536 — a single authenticated packet whose counter
+    /// jumped past `rx_counter + WINDOW_SIZE` would clear the
+    /// bitmap, marking the previous 1023 counters as
+    /// "unseen" and replayable.
+    #[test]
+    fn replay_window_rejects_jump_beyond_window_size() {
+        let key = [0x42u8; 32];
+        let cipher = PacketCipher::new(&key, 0xCAFEu64);
+
+        // Burn 100 counters in.
+        for c in 0..100u64 {
+            cipher.update_rx_counter(c);
+        }
+        // rx_counter is now 100. A jump of WINDOW_SIZE = 1024
+        // (target = 100 + 1024 = 1124) is the boundary; one past
+        // (1125) must be rejected.
+        assert!(
+            cipher.is_valid_rx_counter(1124),
+            "counter at WINDOW_SIZE boundary must still be accepted"
+        );
+        assert!(
+            !cipher.is_valid_rx_counter(1125),
+            "counter past WINDOW_SIZE must be rejected — accepting it \
+             would zero the bitmap and re-open the prior {} counters \
+             to replay",
+            1024,
+        );
+
+        // After committing a counter near the boundary, prior
+        // counters in the window are still tracked (not zeroed).
+        cipher.update_rx_counter(1124);
+        // 1124 was just committed; replaying it must fail.
+        assert!(
+            !cipher.is_valid_rx_counter(1124),
+            "just-committed counter must remain non-replayable"
+        );
+        // A counter from before the jump (e.g. 99) is now far
+        // behind rx_counter. With WINDOW_SIZE=1024, age = 1125 -
+        // 1 - 99 = 1025 > 1024, so it's outside the window and
+        // rejected as too-old (correct — these old counters were
+        // already committed before the jump and the bitmap still
+        // tracks them within the window).
+        assert!(
+            !cipher.is_valid_rx_counter(99),
+            "counter from before the jump must reject as too-old"
         );
     }
 
