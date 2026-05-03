@@ -259,6 +259,23 @@ pub struct ConsumeResponse {
     /// invisible to callers. Empty on the happy path; populated
     /// only when a stall was detected and suppressed.
     pub stalled_shards: Vec<u16>,
+    /// Shards whose adapter call returned an error during this
+    /// poll. The merger logs each error at WARN and continues
+    /// with the surviving shards, so the response's `events`
+    /// can come from a strict subset of the configured shards
+    /// and silently miss data the operator expected to see.
+    /// Operators monitoring adapter health need to know WHICH
+    /// shards failed (not just that something logged a warn) so
+    /// they can correlate alerts with specific Redis / JetStream
+    /// nodes.
+    ///
+    /// Pre-fix this signal lived only in the warn log; an
+    /// observer parsing `ConsumeResponse` saw a clean partial-
+    /// shards response with no field indicating *which* shards
+    /// were missing, in contrast to `stalled_shards` which IS
+    /// surfaced. Empty on the happy path; populated only when at
+    /// least one shard's poll errored.
+    pub failed_shards: Vec<u16>,
 }
 
 impl ConsumeResponse {
@@ -270,6 +287,7 @@ impl ConsumeResponse {
             has_more: false,
             truncated_at_per_shard_cap: false,
             stalled_shards: Vec::new(),
+            failed_shards: Vec::new(),
         }
     }
 }
@@ -418,6 +436,14 @@ impl PollMerger {
         // to callers — they saw a clean "no more events" and
         // exited.
         let mut shards_reporting_has_more: Vec<u16> = Vec::new();
+        // Per-shard adapter errors. Pre-fix these were logged at
+        // warn and then dropped on the floor; the response's
+        // `events` was a strict subset of the configured shards
+        // with no field indicating WHICH shards were missing.
+        // Surface the failed shard ids so observers can correlate
+        // alerts with specific Redis / JetStream nodes (parallel
+        // to the existing `stalled_shards` field).
+        let mut failed_shards: Vec<u16> = Vec::new();
         // `new_cursor` (fetched-position tracking) is only consulted on the
         // filter path — building it for unfiltered polls wastes a full
         // HashMap clone plus a `set()` per shard every poll.
@@ -452,6 +478,7 @@ impl PollMerger {
                         error = %e,
                         "Failed to poll shard, skipping"
                     );
+                    failed_shards.push(shard_id);
                     // Continue with other shards
                 }
             }
@@ -694,6 +721,7 @@ impl PollMerger {
             has_more,
             truncated_at_per_shard_cap,
             stalled_shards,
+            failed_shards,
         })
     }
 }
@@ -1313,6 +1341,101 @@ mod tests {
         assert!(response.events.is_empty());
         assert!(response.next_id.is_none());
         assert!(!response.has_more);
+    }
+
+    /// Regression: per-shard adapter errors must surface on
+    /// `ConsumeResponse.failed_shards`, not silently disappear
+    /// after a `tracing::warn!`. Pre-fix the merger logged the
+    /// error and continued; the response carried events from
+    /// the surviving shards with no field indicating WHICH
+    /// shards failed (in contrast to `stalled_shards` which IS
+    /// surfaced). Operators correlating alerts with specific
+    /// Redis / JetStream nodes had to grep logs instead of
+    /// reading a structured response field.
+    #[tokio::test]
+    async fn poll_response_surfaces_failed_shard_ids() {
+        // Mock that fails on a specific shard id.
+        struct FailingShardMock {
+            inner: MockAdapter,
+            fail_shard: u16,
+        }
+
+        #[async_trait]
+        impl Adapter for FailingShardMock {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, _b: Batch) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                shard_id: u16,
+                from_id: Option<&str>,
+                limit: usize,
+            ) -> Result<ShardPollResult, AdapterError> {
+                if shard_id == self.fail_shard {
+                    return Err(AdapterError::Transient(format!(
+                        "synthetic failure on shard {shard_id}"
+                    )));
+                }
+                self.inner.poll_shard(shard_id, from_id, limit).await
+            }
+            fn name(&self) -> &'static str {
+                "failing-mock"
+            }
+        }
+
+        let inner = MockAdapter::new();
+        // Shard 0 has events, shard 1 will fail, shard 2 has events.
+        inner.add_events(
+            0,
+            vec![StoredEvent::from_value(
+                "0-1".to_string(),
+                json!({"shard": 0}),
+                100,
+                0,
+            )],
+        );
+        inner.add_events(
+            2,
+            vec![StoredEvent::from_value(
+                "2-1".to_string(),
+                json!({"shard": 2}),
+                100,
+                2,
+            )],
+        );
+
+        let adapter = Arc::new(FailingShardMock {
+            inner,
+            fail_shard: 1,
+        });
+        let merger = PollMerger::new(adapter, vec![0, 1, 2]);
+
+        let response = merger.poll(ConsumeRequest::new(100)).await.unwrap();
+
+        // Surviving shards' events still come through.
+        assert_eq!(
+            response.events.len(),
+            2,
+            "events from non-failing shards must still be returned"
+        );
+
+        // The failed shard id is surfaced on the response.
+        assert_eq!(
+            response.failed_shards,
+            vec![1],
+            "regression: failed_shards must list the shard whose adapter \
+             errored. Pre-fix this list didn't exist; observers couldn't \
+             tell which shard was missing without log scraping."
+        );
     }
 
     #[tokio::test]
