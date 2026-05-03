@@ -878,8 +878,17 @@ impl RxCreditState {
     /// local view.
     #[inline]
     pub fn outstanding(&self) -> u64 {
-        let g = self.granted.load(Ordering::Acquire);
+        // Read `consumed` first, then `granted`. Paired with the
+        // publication order in `on_bytes_consumed` (granted first,
+        // then consumed), this guarantees `granted >= consumed`:
+        // if our `consumed` load observes a writer's increment, the
+        // writer's earlier `granted` increment is already visible to
+        // our subsequent `granted` load. Pre-fix the loads ran in
+        // the opposite order and `saturating_sub` masked transient
+        // `consumed > granted` to zero, surfacing a false "no
+        // outstanding bytes" reading to metrics during contention.
         let c = self.consumed.load(Ordering::Acquire);
+        let g = self.granted.load(Ordering::Acquire);
         g.saturating_sub(c)
     }
 
@@ -932,8 +941,17 @@ impl RxCreditState {
         // the running cumulative consumed count for the caller to
         // ship as `total_consumed` in an authoritative
         // `StreamWindow` packet.
-        let new_consumed = self.consumed.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        //
+        // Order matters: bump `granted` BEFORE `consumed` so a
+        // concurrent `outstanding()` reader that observes the new
+        // `consumed` is guaranteed to see the matching `granted`
+        // bump as well. With the opposite order, the reader's
+        // computation `granted - consumed` could transiently see
+        // `consumed > granted` (saturated to zero), surfacing a
+        // false "window drained" snapshot to metrics under
+        // contention.
         self.granted.fetch_add(bytes, Ordering::AcqRel);
+        let new_consumed = self.consumed.fetch_add(bytes, Ordering::AcqRel) + bytes;
         Some(new_consumed)
     }
 }
