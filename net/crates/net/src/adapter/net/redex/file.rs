@@ -1097,31 +1097,50 @@ impl RedexFile {
 
         // Disk compaction succeeded (or no disk segment is
         // configured). Now mutate in-memory state to match.
-        state.index.drain(..drop);
-        state.timestamps.drain(..drop);
-        state.segment.evict_prefix_to(dat_base);
-
-        // Renormalize in-memory state to match the new on-disk
-        // format (segment-relative offsets, 0-based segment).
-        // `compact_to` rewrote each surviving entry's
-        // `payload_offset` as `entry.payload_offset - dat_base`;
-        // mirror that here so subsequent appends compute disk
-        // offsets (`segment.base_offset() + live_bytes()`) that
-        // match the new on-disk dat layout. Without this,
-        // post-sweep appends write absolute offsets that index
-        // past the end of the new (compacted) on-disk dat —
-        // torn-tail recovery silently drops them on reopen.
         //
-        // Only relevant when a disk segment is present; for
-        // memory-only files there's no on-disk format to track.
+        // Build the new (renormalized) index in a temp Vec, then
+        // atomically replace `state.index` and `state.timestamps`.
+        // Pre-fix the ordering was: drain prefix, evict segment,
+        // then rebase entries' `payload_offset` in a `for ... iter_mut()`
+        // loop. A panic in the middle of the rebase loop (allocator
+        // failure during a pathological allocation, or an unrelated
+        // hardware-level signal) left the index in a half-rebased
+        // state — some entries with absolute offsets pointing past
+        // the new compacted dat, others with the rebased offsets.
+        // Subsequent reads silently missed.
+        //
+        // Two-phase build-then-swap: phase 1 produces a fresh Vec
+        // and only when it's complete does phase 2 mutate
+        // `state.index` / `state.timestamps`. A panic in phase 1
+        // discards the temp Vec without touching `state`; phase 2
+        // is a single `.assign(...)` which is itself panic-free
+        // for primitive moves.
+        let new_index: Vec<RedexEntry> = state
+            .index
+            .iter()
+            .skip(drop)
+            .map(|entry| {
+                let mut e = *entry;
+                #[cfg(feature = "redex-disk")]
+                {
+                    if !e.is_inline() && self.inner.disk.is_some() {
+                        e.payload_offset =
+                            (e.payload_offset as u64).saturating_sub(dat_base) as u32;
+                    }
+                }
+                e
+            })
+            .collect();
+        let new_timestamps: Vec<u64> = state.timestamps[drop..].to_vec();
+
+        // Phase 2: atomically replace. The two `=` assignments and
+        // the segment mutations below are panic-free against the
+        // primitives they invoke (Vec drop, simple inline arithmetic).
+        state.index = new_index;
+        state.timestamps = new_timestamps;
+        state.segment.evict_prefix_to(dat_base);
         #[cfg(feature = "redex-disk")]
         if self.inner.disk.is_some() {
-            for entry in state.index.iter_mut() {
-                if !entry.is_inline() {
-                    entry.payload_offset =
-                        (entry.payload_offset as u64).saturating_sub(dat_base) as u32;
-                }
-            }
             state.segment.rebase_to_zero();
         }
 
