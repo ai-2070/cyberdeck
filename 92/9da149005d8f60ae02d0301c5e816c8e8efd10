@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/failure.rs
+  726f3eb25aff9828 785-799,803,1284-1366
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "929da149005d8f60ae02d0301c5e816c8e8efd10",
+  "prompts": {
+    "726f3eb25aff9828": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4e24c4d-c0c0-4845-b149-62c90b1fa69d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1537,
+      "total_deletions": 5,
+      "accepted_lines": 99,
+      "overriden_lines": 0
+    }
+  }
+}
