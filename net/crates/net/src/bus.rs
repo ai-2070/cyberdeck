@@ -1004,6 +1004,16 @@ impl EventBus {
         self.shard_manager.stats()
     }
 
+    /// Sum of `len()` across every shard's ring buffer.
+    ///
+    /// Mainly useful in tests and operational diagnostics: a
+    /// non-zero value at the time of `Drop` (without an awaited
+    /// `shutdown()`) would be silently lost, so `Drop` folds this
+    /// into `events_dropped` before the bus disappears.
+    pub fn pending_in_rings(&self) -> u64 {
+        self.shard_manager.total_pending_in_rings()
+    }
+
     /// Flush all pending batches.
     ///
     /// Waits for all shard ring buffers to drain, then for the
@@ -1536,10 +1546,37 @@ impl Drop for EventBus {
         // never started"; an in-progress shutdown is fine because the
         // call site is awaiting it.
         if !self.shutdown_completed.load(AtomicOrdering::Acquire) {
+            // Count events still sitting in shard ring buffers. They
+            // are stranded — the drain workers will see `shutdown =
+            // true` and exit without flushing, the adapter's
+            // `flush()`/`shutdown()` never run, so anything in the
+            // rings at this point is permanently lost. Surface that
+            // loss via `events_dropped` so post-mortem stats reflect
+            // reality (operators alerting on `events_dropped > 0`
+            // would otherwise miss the entire incident), and set
+            // `shutdown_was_lossy` so the boolean view is consistent
+            // with the counter view.
+            //
+            // Events in the BatchWorker mpsc channels or pending
+            // batches are not counted here — those workers may still
+            // observe the shutdown flag and exit, but we have no
+            // synchronous way from Drop to enumerate them. The ring-
+            // buffer count is a lower bound on the stranded total.
+            let stranded_in_rings = self.shard_manager.total_pending_in_rings();
+            if stranded_in_rings > 0 {
+                self.stats
+                    .events_dropped
+                    .fetch_add(stranded_in_rings, AtomicOrdering::Relaxed);
+                self.stats
+                    .shutdown_was_lossy
+                    .store(true, AtomicOrdering::Release);
+            }
+
             let stats = self.shard_manager.stats();
             tracing::warn!(
                 events_ingested = stats.events_ingested,
                 events_dropped = stats.events_dropped,
+                stranded_in_rings,
                 "EventBus dropped without an awaited shutdown(). Any in-flight \
                  events still in the ring buffers or batch channels will be lost \
                  — the adapter's flush()/shutdown() never ran. Call \

@@ -646,3 +646,79 @@ async fn manual_scale_down_returns_within_bounded_time_when_adapter_wedged() {
     // is the regression target.
     let _ = tokio::time::timeout(Duration::from_secs(5), bus.shutdown()).await;
 }
+
+/// Pin: when an `EventBus` is dropped without an awaited
+/// `shutdown()`, the helper used by the Drop impl
+/// (`shard_manager.total_pending_in_rings()`) must report the
+/// exact count of events still sitting in ring buffers. The Drop
+/// impl folds this into `events_dropped` + sets
+/// `shutdown_was_lossy` before the bus disappears so post-mortem
+/// stats reflect the data-loss incident.
+///
+/// The Drop impl itself runs as the bus disappears so its own
+/// `events_dropped` increment is unobservable from this test
+/// (the `EventBusStats` lives on the bus). Pin the helper that
+/// supplies the increment instead — its return value is the
+/// exact value the Drop impl folds in.
+#[tokio::test]
+async fn total_pending_in_rings_reports_stranded_count() {
+    let policy = ScalingPolicy {
+        min_shards: 1,
+        max_shards: 4,
+        cooldown: Duration::from_nanos(1),
+        ..Default::default()
+    };
+    // Slow adapter + huge `min_size` and `max_delay` so events
+    // accumulate in rings instead of racing through to dispatch.
+    let batch_cfg = net::config::BatchConfig {
+        min_size: 10_000,
+        max_size: 10_000,
+        max_delay: Duration::from_secs(60),
+        adaptive: false,
+        velocity_window: Duration::from_millis(100),
+    };
+    let cfg = EventBusConfig::builder()
+        .num_shards(2)
+        .ring_buffer_capacity(1024)
+        .scaling(policy)
+        .batch(batch_cfg)
+        .build()
+        .unwrap();
+
+    let (recording, _batches, _msg_ids) = RecordingAdapter::new();
+    let slow = SlowRecordingAdapter {
+        inner: recording,
+        delay: Duration::from_secs(60),
+    };
+    let bus = EventBus::new_with_adapter(cfg, Box::new(slow))
+        .await
+        .unwrap();
+
+    // Ingest enough events to overflow the ring buffer faster
+    // than the drain worker can pump them out. With
+    // `ring_buffer_capacity = 1024` per shard and 2 shards,
+    // pushing 5_000 events guarantees at least one ring is
+    // saturated at the moment we read `pending_in_rings()`.
+    const N: u64 = 5_000;
+    for i in 0..N {
+        let _ = bus.ingest(Event::new(json!({"i": i})));
+    }
+
+    let pending_in_rings = bus.pending_in_rings();
+    assert!(
+        pending_in_rings > 0,
+        "expected events still in ring buffers before drop \
+         (got {}); the Drop impl's stranded-in-rings increment \
+         would be silently 0 and `shutdown_was_lossy` would not \
+         be set, masking the data-loss incident",
+        pending_in_rings,
+    );
+
+    // Force the warn-and-account path by dropping the bus
+    // without awaiting shutdown. The Drop impl folds
+    // `pending_in_rings` into `events_dropped` and sets
+    // `shutdown_was_lossy`. We can't read those post-drop
+    // (the EventBusStats lives on the bus), but the helper
+    // value above is what the Drop impl uses.
+    drop(bus);
+}

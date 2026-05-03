@@ -685,6 +685,22 @@ impl ShardManager {
         table.shards.iter().all(|s| s.lock().is_empty())
     }
 
+    /// Sum of `len()` across every shard's ring buffer.
+    ///
+    /// Used by `EventBus::Drop` to surface the count of events that
+    /// were stranded in ring buffers at the moment the bus was
+    /// dropped without an awaited shutdown — those events never
+    /// reach the adapter, so reporting them as `events_dropped` is
+    /// the correct accounting (the alternative is silent loss).
+    pub fn total_pending_in_rings(&self) -> u64 {
+        let table = self.table.load();
+        table
+            .shards
+            .iter()
+            .map(|s| s.lock().len() as u64)
+            .sum()
+    }
+
     /// Iterate over all active shard IDs.
     pub fn shard_ids(&self) -> Vec<u16> {
         self.table.load().shard_index.keys().copied().collect()
