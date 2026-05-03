@@ -2504,7 +2504,21 @@ fn gpu_info_from_json(g: GpuJson) -> GpuInfo {
         info = info.with_tensor_cores(saturating_u16_cap(tc));
     }
     if let Some(tf) = g.fp16_tflops_x10 {
-        info = info.with_fp16_tflops(tf as f32 / 10.0);
+        // Saturate at `u16::MAX` before the f32 conversion. Pre-fix
+        // `tf as f32` lost precision for u32 values ≥ 2²⁴ (f32 has
+        // a 24-bit mantissa), so the round-trip
+        // `u32 → f32/10.0 → with_fp16_tflops → *10.0 as u32`
+        // could land a different `fp16_tflops_x10` than the
+        // operator declared. The neighboring `tops_x10` field
+        // already routes through `saturating_u16_cap` for the same
+        // reason; the matching cap here keeps the round-trip exact
+        // (u16::MAX = 65 535 is far below the f32 precision
+        // boundary of 2²⁴ = 16 777 216) and aligns the two fields'
+        // surfaces. The dynamic range loss (2³² → 2¹⁶) is
+        // acceptable: 6 553.5 TFLOPS is far above any current or
+        // near-future GPU's fp16 throughput.
+        let tf_capped = saturating_u16_cap(tf);
+        info = info.with_fp16_tflops(tf_capped as f32 / 10.0);
     }
     info
 }
@@ -3100,6 +3114,54 @@ mod tests {
         assert_eq!(saturating_u16_cap(u16::MAX as u32), u16::MAX);
         assert_eq!(saturating_u16_cap(u16::MAX as u32 + 1), u16::MAX);
         assert_eq!(saturating_u16_cap(u32::MAX), u16::MAX);
+    }
+
+    /// Regression: `gpu_info_from_json` must saturate large
+    /// `fp16_tflops_x10` values at `u16::MAX` before the f32
+    /// conversion. Pre-fix `tf as f32` lost precision for u32
+    /// values above 2²⁴ (f32 has a 24-bit mantissa) — the
+    /// round-trip `u32 → f32/10.0 → with_fp16_tflops → *10.0
+    /// as u32` could land a different `fp16_tflops_x10` than
+    /// the operator declared. The matching saturation aligns
+    /// with the neighboring `tops_x10` field's surface and
+    /// keeps the round-trip exact.
+    #[test]
+    fn gpu_info_from_json_saturates_fp16_tflops_to_u16_max() {
+        // A hostile or just unrealistically large value well
+        // above the f32 precision boundary (2^24 = 16_777_216).
+        let g = GpuJson {
+            vendor: None,
+            model: "test".to_string(),
+            vram_mb: 0,
+            compute_units: None,
+            tensor_cores: None,
+            fp16_tflops_x10: Some(1_000_000_000u32),
+        };
+        let info = gpu_info_from_json(g);
+        // The cap is u16::MAX = 65535; the f32 round-trip back to
+        // x10 storage must reproduce 65_535, NOT some lossily
+        // rounded approximation of 1_000_000_000.
+        assert_eq!(
+            info.fp16_tflops_x10, u16::MAX as u32,
+            "fp16_tflops_x10 must saturate at u16::MAX (65535) instead of \
+             losing precision through the f32 round-trip; got {}",
+            info.fp16_tflops_x10,
+        );
+
+        // Sanity: a small in-range value round-trips exactly.
+        let g_small = GpuJson {
+            vendor: None,
+            model: "test".to_string(),
+            vram_mb: 0,
+            compute_units: None,
+            tensor_cores: None,
+            fp16_tflops_x10: Some(425), // 42.5 TFLOPS
+        };
+        let info_small = gpu_info_from_json(g_small);
+        assert_eq!(
+            info_small.fp16_tflops_x10, 425,
+            "small fp16_tflops_x10 must round-trip exactly"
+        );
     }
 
     /// Regression: `alloc_bytes` used to call `Vec::shrink_to_fit`
