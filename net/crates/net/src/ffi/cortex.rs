@@ -540,6 +540,18 @@ pub extern "C" fn net_redex_tail_next(
         };
         match outcome {
             Some(Ok(ev)) => {
+                // Drop the cursor guard BEFORE the JSON
+                // serialization so concurrent callers on the
+                // same cursor don't stall waiting for our
+                // write_json_out to finish. Pre-fix the
+                // serialization ran inside the TokioMutex
+                // critical section, so a fast event arrival on
+                // a shared cursor under contention serialized
+                // calls behind whichever caller was building
+                // the JSON. The event is owned at this point;
+                // the mutex was only protecting the stream
+                // poll, not the event itself.
+                drop(guard);
                 let js = RedexEventJson::from(ev);
                 write_json_out(&js, out_json, out_len)
             }
