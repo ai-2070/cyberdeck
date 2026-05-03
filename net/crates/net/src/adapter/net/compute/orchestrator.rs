@@ -1128,9 +1128,15 @@ impl MigrationOrchestrator {
         scheduler: &super::Scheduler,
         daemon_filter: &crate::adapter::net::behavior::capability::CapabilityFilter,
     ) -> Result<(u64, Vec<MigrationMessage>), MigrationError> {
+        // Map a scheduler "no candidate" / "index unavailable"
+        // outcome to the typed `NoTargetAvailable` variant. Pre-
+        // fix this used `TargetUnavailable(0)`, surfacing
+        // "target node 0x0 unavailable" to operators — confusing
+        // because no specific node id was ever attempted; the
+        // auto-placement found nobody to attempt against.
         let placement = scheduler
             .place_migration(daemon_filter, source_node)
-            .map_err(|_| MigrationError::TargetUnavailable(0))?;
+            .map_err(|_| MigrationError::NoTargetAvailable)?;
 
         let target_node = placement.node_id;
         let msgs = self.start_migration(daemon_origin, source_node, target_node)?;
@@ -1795,6 +1801,45 @@ mod tests {
         orch.start_migration(origin, 0x1111, 0x2222).unwrap();
         let err = orch.start_migration(origin, 0x1111, 0x3333).unwrap_err();
         assert_eq!(err, MigrationError::AlreadyMigrating(origin));
+    }
+
+    /// Regression: `start_migration_auto` returns
+    /// `MigrationError::NoTargetAvailable` (not
+    /// `TargetUnavailable(0)`) when the scheduler finds no
+    /// candidate satisfying the daemon's capability filter.
+    /// Pre-fix the auto path constructed
+    /// `TargetUnavailable(0)`, surfacing "target node 0x0
+    /// unavailable" to operators — confusing because no
+    /// specific node id was ever attempted; the auto-placement
+    /// found nobody to attempt against.
+    #[test]
+    fn start_migration_auto_returns_no_target_available_when_scheduler_finds_nothing() {
+        use crate::adapter::net::behavior::capability::{
+            CapabilityIndex, CapabilitySet,
+        };
+
+        let (reg, origin) = setup_registry();
+        let orch = MigrationOrchestrator::new(reg, 0x1111);
+
+        // Empty index — no candidate nodes anywhere.
+        let index = Arc::new(CapabilityIndex::new());
+        let scheduler =
+            super::super::Scheduler::new(index, 0x1111, CapabilitySet::default());
+
+        // A filter that nothing in the empty index can satisfy.
+        let filter = CapabilityFilter::default();
+
+        let err = orch
+            .start_migration_auto(origin, 0x1111, &scheduler, &filter)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            MigrationError::NoTargetAvailable,
+            "auto-placement with no candidates must surface as \
+             NoTargetAvailable, not TargetUnavailable(0). The 0 \
+             was a fake node id that pre-fix appeared in operator \
+             error logs as `target node 0x0 unavailable`."
+        );
     }
 
     #[test]

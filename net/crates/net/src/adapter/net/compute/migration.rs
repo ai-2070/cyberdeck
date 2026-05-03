@@ -313,6 +313,14 @@ pub enum MigrationError {
     DaemonNotFound(u32),
     /// Target node unreachable or refused.
     TargetUnavailable(u64),
+    /// Auto-placement found no candidate node satisfying the
+    /// daemon's capability requirements. Distinct from
+    /// `TargetUnavailable(_)` which carries a specific failed
+    /// target — auto-placement never has one to report. Pre-fix
+    /// the auto path constructed `TargetUnavailable(0)`,
+    /// surfacing "target node 0x0 unavailable" to operators when
+    /// no specific node had ever been tried.
+    NoTargetAvailable,
     /// Snapshot/restore failure.
     StateFailed(String),
     /// Migration already in progress for this daemon.
@@ -338,6 +346,9 @@ impl std::fmt::Display for MigrationError {
         match self {
             Self::DaemonNotFound(id) => write!(f, "daemon {:#x} not found", id),
             Self::TargetUnavailable(id) => write!(f, "target node {:#x} unavailable", id),
+            Self::NoTargetAvailable => {
+                write!(f, "no candidate node satisfies the daemon's capability requirements")
+            }
             Self::StateFailed(msg) => write!(f, "state operation failed: {}", msg),
             Self::AlreadyMigrating(id) => write!(f, "daemon {:#x} already migrating", id),
             Self::WrongPhase { expected, got } => {
